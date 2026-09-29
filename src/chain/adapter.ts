@@ -146,6 +146,44 @@ export class BscChainAdapter implements ChainAdapter {
   }
 
   /**
+   * Independently verify a write target (§95, §8, §12, §91).
+   *
+   * The target must be one of the contracts this system is allowed to touch on this chain: a
+   * whitelisted DEX's deployed contracts, or Multicall3. §91 forbids "Approve Unknown Contract" and
+   * "Interact With Unknown DEX", and §95 requires the contract address to be verified before every
+   * transaction — so it is enforced here rather than left to the guard's self-reported
+   * `toWhitelisted`, which `assertTxGuard` cannot verify (measured: a forged all-true guard aimed at
+   * the known impostor address `0xb904108b…` passes `assertTxGuard`).
+   *
+   * ## Why there is no selector check here
+   * An earlier version also required the calldata selector to appear in `KNOWN_SELECTORS`, and that was
+   * wrong on two counts. It blocked legitimate calls — the DEX adapters use `exactInputSingle`,
+   * `multicall(bytes32,bytes[])`, `mint`, `pull`, `approveZeroThenMax` and more, none of which belong in
+   * a chain-layer list (it failed 6 adapter tests) — and it duplicated an ownership boundary: the
+   * selector surface is defined by each adapter's ABIs, and those are encoded through viem's typed
+   * `encodeFunctionData`, so the selector is derived from a reviewed ABI rather than typed by hand.
+   * Copying that surface into the chain layer would create exactly the drift this project keeps
+   * guarding against. The guard's `functionSelectorOk` therefore stays the caller's responsibility, and
+   * the caller is the adapter that owns the ABI.
+   */
+  private assertWhitelistedWriteTarget(to: Address): void {
+    const allowed = new Set<string>([MULTICALL3_ADDRESS.toLowerCase()]);
+    for (const contracts of Object.values(BSC_DEX_CONTRACTS)) {
+      for (const address of Object.values(contracts)) {
+        if (typeof address === 'string') allowed.add(address.toLowerCase());
+      }
+    }
+    if (!allowed.has(to.toLowerCase())) {
+      throw new ChainError(
+        CHAIN_ERROR_CODES.ADDRESS_NOT_WHITELISTED,
+        `write target ${to} is not a whitelisted contract on chain ${this.chainId} (§8/§12/§91): ` +
+          'refusing to send, regardless of what the caller-reported guard claims',
+        { chainId: this.chainId, address: to },
+      );
+    }
+  }
+
+  /**
    * §8: an address must be whitelisted before any call to it is made. Returns the canonical
    * lowercased address so identity comparisons downstream cannot diverge from the registry's.
    */
@@ -505,6 +543,16 @@ export class BscChainAdapter implements ChainAdapter {
    */
   async sendTransaction(tx: ChainWriteRequest): Promise<Hash> {
     assertTxGuard(tx.guard, { to: tx.to });
+    // §95 defense in depth, and NOT redundant with the guard.
+    //
+    // `assertTxGuard` re-derives `ok` from the guard's own booleans, so it catches a malformed guard —
+    // but it cannot verify anything: a caller that fills every sub-check with `true` while targeting an
+    // unwhitelisted contract passes it. Measured: a forged all-true guard aimed at the known impostor
+    // QQQB address `0xb904108b…` is accepted by `assertTxGuard`. Since this method is the only write
+    // path in the system, the adapter verifies independently everything it can — it holds the whitelist
+    // and the calldata, so trusting a self-reported boolean here would leave the most catastrophic
+    // failure mode (signing to the wrong contract) protected only by the caller's honesty.
+    this.assertWhitelistedWriteTarget(tx.to);
     const account = this.requireSigner('sendTransaction');
     const client = this.requireWalletClient();
 

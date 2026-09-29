@@ -219,6 +219,15 @@ export interface DexContracts {
   readonly tickLens: Address;
   readonly permit2: Address;
   readonly universalRouter?: Address;
+  /**
+   * Pancake's SmartRouter — the contract the §42 atomic swap+addLiquidity build targets.
+   *
+   * Present because it is a **write target**: the chain layer refuses to send to any address not listed
+   * here (§8/§12/§91), and omitting it would make the atomic path unrunnable. Source:
+   * `SMART_ROUTER_ADDRESSES[56]` in `@pancakeswap/smart-router` (verified equal to the value below).
+   * Uniswap V3 has no equivalent combined path, so it is absent there.
+   */
+  readonly smartRouter?: Address;
 }
 
 export const BSC_DEX_CONTRACTS: Readonly<Record<string, DexContracts>> = {
@@ -231,6 +240,10 @@ export const BSC_DEX_CONTRACTS: Readonly<Record<string, DexContracts>> = {
     // Pancake's own Permit2 deployment — NOT Uniswap's canonical 0x0000...78BA3.
     permit2: '0x31c2f6fcff4f8759b3bd5bf0e1084a055615c768',
     universalRouter: '0x1a0a18ac4becddbd6389559687d1a73d8927e416',
+    // Verified equal to `SMART_ROUTER_ADDRESSES[56]` from @pancakeswap/smart-router at implementation
+    // time. It is a WRITE TARGET of the §42 atomic build, so it must be in the whitelist the chain layer
+    // checks before sending (a missing entry would refuse the atomic path rather than a wrong address).
+    smartRouter: '0x13f4ea83d0bd40e75c8222255bc855a974568dd4',
   },
   [DEX_IDS.UNISWAP_V3]: {
     factory: '0xdb1d10011ad0ff90774d0c6bb92e5c5c8b4461f7',

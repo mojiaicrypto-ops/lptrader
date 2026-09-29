@@ -205,6 +205,51 @@ describe('§95 pre-flight guard', () => {
     ).rejects.toBeInstanceOf(TxGuardError);
   });
 
+  it('refuses a write target that is not a whitelisted contract, even with a forged all-true guard', async () => {
+    // `assertTxGuard` re-derives `ok` from the guard's own booleans, so it catches a MALFORMED guard but
+    // cannot verify anything: a caller that reports every sub-check as `true` while aiming at an
+    // unwhitelisted contract passes it. This asserts the adapter's own independent check, which is what
+    // stands between a caller bug and a signature to the wrong contract (§8/§12/§91, §95).
+    const { adapter } = readerFor({});
+    const impostor = '0xb904108b7f6d3b27c23128ca2b62738061b8a689' as const;
+    await expect(
+      adapter.sendTransaction({
+        to: impostor,
+        data: '0x095ea7b3',
+        value: 0n,
+        guard: buildTxGuard(allOk),
+      }),
+    ).rejects.toMatchObject({ code: CHAIN_ERROR_CODES.ADDRESS_NOT_WHITELISTED });
+  });
+
+  it('accepts a whitelisted target so the target check is not blocking legitimate writes', async () => {
+    // Negative control for the check above: with a whitelisted target the failure must be the MISSING
+    // SIGNER, not the target. Without this, a check that refused everything would look correct.
+    const { adapter } = readerFor({});
+    await expect(
+      adapter.sendTransaction({
+        to: PANCAKE_MANAGER,
+        data: '0x095ea7b3',
+        value: 0n,
+        guard: buildTxGuard(allOk),
+      }),
+    ).rejects.toMatchObject({ code: CHAIN_ERROR_CODES.INVALID_ARGUMENT });
+  });
+
+  it('runs the target check BEFORE the signer check, so the reason names the real problem', async () => {
+    // Ordering matters for diagnosability: with no signer attached, a non-whitelisted target must report
+    // the whitelist violation rather than the missing signer.
+    const { adapter } = readerFor({});
+    await expect(
+      adapter.sendTransaction({
+        to: '0x1111111111111111111111111111111111111111',
+        data: '0x095ea7b3',
+        value: 0n,
+        guard: buildTxGuard(allOk),
+      }),
+    ).rejects.toMatchObject({ code: CHAIN_ERROR_CODES.ADDRESS_NOT_WHITELISTED });
+  });
+
   it('refuses to send without an attached signer (§94 — no key lives in this layer)', async () => {
     const { adapter } = readerFor({});
     await expect(
