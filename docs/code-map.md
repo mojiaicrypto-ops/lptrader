@@ -5,7 +5,8 @@
 ## 状态
 
 ```text
-代码：已创建（Iteration 1 / D3 T1–T3 + 共享契约层；T4–T12 待实现）
+代码：已创建并全部实现（Iteration 1 / D2，T1–T13 + DEX 适配器）；
+`npm run typecheck` 0 错误，`npm test` 24 文件 / 690 测试全绿。
 ```
 
 ## 已实现（实际文件 → 导出 → 基线章节）
@@ -57,7 +58,7 @@
 - 解密失败**硬失败**：单一 `DECRYPT_FAILED`，无明文回退、无重试、无 legacy 分支；报错文本不含私钥/passphrase 片段（已单测 + 脚本证明）。
 - 每次加密使用全新随机 salt(16B) 与 IV(12B)。
 
-### 共享类型与接口（T4–T12 契约，**已冻结**）
+### 共享类型与接口（**已冻结**）
 
 | 文件 | 导出 |
 |---|---|
@@ -88,45 +89,110 @@
 | `npm run keystore:init` | 生成 `secrets/wallet.enc`（0600），写后回读自检 |
 | 链上只读冒烟 / dry-run 建仓脚本 | 待 T4/T5/T9 交付后登记（`scripts/smoke-read.ts`、`scripts/smoke-scan.ts`、`scripts/dry-run-build.ts`） |
 
-## 待实现（T4–T12，接口已冻结）
+## 已实现（Iteration 1 全部模块：文件 → 用途 → 基线章节）
 
-原计划骨架（模块 → 基线章节）仍然有效，逐项对应如下；已落地者见上表。
+> 每个文件都可 `git ls-files` 确认已入库（曾发生 `.gitignore` 未锚定导致整层未跟踪的事故，故此处显式登记）。
 
-```text
-src/
-  main.ts                     入口：启动口令 → 解密 keystore → 装配服务 → 调度   ← 已落地（Phase A 只读子集）
-  config/                     StrategyConfig（YAML）+ Token/Stablecoin/DEX/Chain 白名单 ← 已落地
-  types/                      共享契约层（T4–T12 接口）                          ← 已落地
-  security/keystore.ts        AES-256-GCM + scrypt（见 AGENTS.md 密钥管理）      ← 已落地
-  chain/                      ChainAdapter（viem）                               T4
-    bsc.ts                    多 RPC 故障切换 + multicall3 批读
-    poolReader.ts             池 slot0/liquidity/fee                             T5
-    tokenReader.ts            余额 + BEP-677 UI 换算（uiMultiplier 运行期读取）    T5
-  dex/                        DexAdapter                                         T9
-    pancakeswapV3.ts          官方 @pancakeswap/v3-sdk + SmartRouter 原子路径
-    uniswapV3.ts              最小自实现（不共享 Pancake SDK 对象）
-  data/
-    poolDataProvider.ts       PoolDataProvider    §83                             T6
-    poolScanner.ts            PoolScanner         §14                             T6
-    poolFilter.ts             PoolFilter          §16                             T6
-    poolRanker.ts             PoolRanker          §21–§26                         T6
-    referencePrice.ts         ReferencePriceProvider §84                         T7
-  strategy/
-    positionPlanner.ts        PositionPlanner     §33–§38                         T8
-    swapPlanner.ts            SwapPlanner         §39–§41                         T9
-    riskManager.ts            RiskManager         §54–§68                         T10
-    stateMachine.ts           StateMachine        §44、§88                        T11
-    benchmark.ts              BenchmarkEngine     §6、§7                          T12
-  execution/
-    swapExecutor.ts           SwapExecutor        §42–§43                         T9
-    liquidityManager.ts       LiquidityManager    §39、§71                        T9
-    txGuard.ts                Transaction Protection §95–§98                     T9
-    portfolio.ts              PortfolioManager    §5                              T12
-    nav.ts                    NAVService          §5                              T12
-  store/
-    sqlite.ts                 StateStore          §74                             T11
-  notify/
-    telegram.ts               NotificationService §78（实现 Notifier 契约）        T12
-```
+### 链访问层 `src/chain/`（§81/§95/§98/§99）
+
+| 文件 | 内容 |
+|---|---|
+| `adapter.ts` | `BscChainAdapter implements ChainAdapter`；多 RPC + §99 cross-check；§95 `assertTxGuard`；§98 交易状态机；`dryRun`；**唯一写路径 `sendTransaction`** |
+| `rpc.ts` | `RpcPool`、`handlerTransport`、`resolveEndpoints`、`CrossCheckError`、`RpcUnavailableError`；**`crossCheck` 固定区块高度**（KI-19 修复） |
+| `tokenReader.ts` | BEP-677 探测（ERC-165）与 `balanceOfUI`/`toUIAmount`/`fromUIAmount`；`uiMultiplier()` **运行期读取** |
+| `poolReader.ts` | `slot0`/`liquidity`/`fee`/`token0`/`token1`/`tickSpacing`、`sqrtPriceX96ToPrice` |
+| `positionReader.ts` | NPM `positions`/`ownerOf`/枚举/`tokensOwed`（未领取 fee）；`liquidityToAmounts` 供 NAV 用 |
+| `txState.ts` | §98 生命周期与 `TxStateUnknownError`（UNKNOWN 不重发） |
+| `abis.ts` / `errors.ts` / `index.ts` | ABI 常量、错误码、barrel |
+
+### DEX 适配层 `src/dex/`（§82/§39–§43）
+
+| 文件 | 内容 |
+|---|---|
+| `index.ts` | **共享且冻结**：`DEX_FEE_TIERS`、`tickSpacingFor(dex, fee)`、`feeTiersFor`、`DEX_PREFERENCE`、`createDexAdapter`、`isNoPool`；`DexAdapterFactoryOptions` 含必需 `chain` |
+| `pancakeV3.ts` | `PancakeV3Adapter`，**`supportsAtomicBuild = true`**；QuoterV2 报价；§42 原子 `swapAndAddCallParameters` 经 SmartRouter（outer `0x1f0464d1`） |
+| `uniswapV3.ts` | `UniswapV3Adapter`，**`supportsAtomicBuild = false`**；`swapForDeficit` 传入即抛（不静默降级）；NPM 无 blockhash deadline 重载 → 明确拒绝 |
+
+### 数据层 `src/data/`（§14–§26/§54–§57/§83/§84）
+
+| 文件 | 内容 |
+|---|---|
+| `poolDataProvider.ts` | 三层 `LayeredPoolDataProvider`（GeckoTerminal / DexPaprika / RPC）；限流 + 429 退避 + 缓存；`stale`/`source` 标注；fees 标为 `derived` |
+| `poolScanner.ts` | `PoolScanner`、`enumerateCandidatePairs`（§14 交叉集）、`POOL_EXISTENCE`/`POOL_EXISTENCE_EVIDENCE`（**区分「已证明不存在」与「无法验证」**）、`onchainVerifiedByPool`、`foundPools`/`describeAbsences` |
+| `poolFilter.ts` | §16 硬性过滤 `evaluatePoolFilters`/`filterPools`；`isOnchainVerified` → 未验证即拒（§96）；`decisive` 区分「数据缺失」与「池不合格」 |
+| `bscOnchainSource.ts` | `BscOnchainPoolStateSource`：`slot0`/`liquidity`/`fee`/`factory.getPool` 的窄接口读取 |
+| `referencePrice.ts` | `BinanceReferencePriceProvider`：index price → spot → 链上 oracle 阶梯；占位值 `price<=0` 判定；§56 市场状态；§57 `usableForHardExit` |
+
+### 策略层 `src/strategy/`（§5–§7/§18–§20/§33–§41/§44–§67）
+
+| 文件 | 内容 |
+|---|---|
+| `positionPlanner.ts` | `planPosition`（§33–§38）：比率→tick 对齐→**以 USD 总量反解 L**→三分支金额→§38 swap；`liquidityToAmounts`、`tickSpacingForFee` |
+| `swapPlanner.ts` | `evaluateSwapQuote`（§40/§41 闸门）、`planSwapIntent`、`computePriceImpact`（**本地自算**）、`classifyRange`、`computeFeeAprFromTotals` |
+| `nav.ts` | `buildPortfolioSnapshot`（§5 NAV）、`buildDrawdownState`（§65–§67，含 `<=` 边界）、`computeBenchmarkMetrics`（§6/§7 IL 与 FeeILRatio） |
+| `riskManager.ts` | §53–§67：脱锚五档（§55）+ 闭市降级（§57）、回撤线（§66）、TVL 崩溃（§59）、reserve（§60）、区间（§49–§51）、9 类 emergency（§58）；`evaluateRisk` 复合报告 |
+| `stateMachine.ts` | §44/§88 `transition`、持久化 `StateMachine`、`WRITE_ACTIONS` 写门（`READ_ONLY_STATES`/`NO_NEW_CAPITAL_STATES`） |
+
+### 执行层 `src/execution/`（§39–§43/§46/§89/§95–§98）
+
+| 文件 | 内容 |
+|---|---|
+| `positionExecutor.ts` | 建仓/退出/收手续费的编排；四道闸门（§95 guard → §44 写门 → §40/§41 报价门 → 确认门）；§42 原子 vs 两笔；§43 partial；§97 幂等 |
+| `portfolioMonitor.ts` | §46 组合监控：读钱包、定价、LP 估值、§65 回撤；`complete=false` 表示估值不完整（§96） |
+| `scheduler.ts` | §89 调度：按 cadence 触发、**不重叠**、失败上报且不杀循环 |
+| `approvalGate.ts` | `ApprovalGate`（`gate`/`request`/`awaitDecision`）、SQLite/内存 store、§77 审计 sink；`BUILD_POSITION`/`SWITCH_POOL` 唯一放行路径 |
+| `approvalMigration.ts` | 向 `StateStore` 注册 version 100 迁移（`approval_requests`） |
+
+### 存储层 `src/store/`（§74–§77/§97/§98）
+
+| 文件 | 内容 |
+|---|---|
+| `db.ts` | `node:sqlite` 连接 + WAL + 开放迁移注册表（`registerMigration`/`applyMigrations`）；**内存库不共享**（KI-16 修复） |
+| `stateStore.ts` | `positions`/`swap_records`/`decision_logs`（§75–§77）+ `RuntimeStateStore`（当前 bot 状态） |
+| `txStore.ts` | §98 `tx_records`、§97 幂等键、`findUnresolved`、`applyChainObservation`、`planUnresolvedRecovery` |
+
+### 通知层 `src/notify/`
+
+| 文件 | 内容 |
+|---|---|
+| `telegram.ts` | `TelegramNotifier implements Notifier`、`createNotifierFromConfig`（无 token/禁用 → `noopNotifier`，**永不放行**）、长轮询、内联 Approve/Reject、`QueryHandlers`、用户白名单鉴权 |
+
+### 装配与工具
+
+| 文件 | 内容 |
+|---|---|
+| `src/runtime.ts` | 组合根：白名单校验 → store/state → signer（可选，无则只读）→ 构造**全部白名单 DEX 适配器（共用同一 chain 实例）**→ monitor/scanner/executor；`buildCadences` |
+| `src/main.ts` | Phase A 只读入口：`loadStartupSummary` 配置/白名单自检，不连链不发交易 |
+| `src/util/decimal.ts` | `toFloat`/`fromFloat`/`applyFloorRatio`（bigint↔float，无精度溢出；floor 方向为签名安全方向） |
+| `src/security/keystore.ts` | AES-256-GCM + scrypt（显式 `maxmem`）、版本化信封、AAD 绑定 chainId+地址 |
+
+## 脚本（可运行证据入口）
+
+| 命令 | 作用 | 是否需要 key |
+|---|---|---|
+| `npm run dev` | Phase A 配置/白名单自检（只读） | 否 |
+| `npm run keystore:init` | 生成 `secrets/wallet.enc`（0600） | 否（交互输入口令） |
+| `npm run smoke:read` | 链上只读冒烟：池状态/余额/`uiMultiplier` | 否 |
+| `npm run smoke:scan` | 真实三层扫描 + §16 过滤 | 否（约 4 分钟，6s 节流） |
+| `npm run smoke:quote` | 真实 QuoterV2 报价 + §40 闸门 | 否 |
+| `npm run dry-run:build [capital]` | **完整决策链，不签名不发送** | 否 |
+| `npm run telegram:check` | Telegram 通道自检（fail-closed 验证） | 是 |
+
+## 测试入口
+
+| 命令 | 覆盖 |
+|---|---|
+| `npm run typecheck` | 全仓 `tsc --noEmit`（当前 **0 错误**）+ 类型级契约断言 |
+| `npm test` | **24 文件 / 690 测试**全绿 |
+| `npm run test:approval` | 确认门 + Telegram 专项（55） |
+
+## 证据文件（`docs/research/`）
+
+| 文件 | 内容 |
+|---|---|
+| `evidence-smoke-read-20260929.txt` | 只读冒烟真实输出（含 8 个 bStock 的 `uiMultiplier()` 实测值与 `toUIAmount` 一致） |
+| `evidence-smoke-scan-20260929-t6.txt` | 真实扫描输出（2 池通过 §16，27+ 条 proven-absent，0 unverifiable） |
+| `evidence-pool-scanner-filter-20260929.md` | 同上的分析记录 + §16 结果解读 |
+| `evidence-dry-run-build-20260929.txt` | **完整建仓决策链**（计划/报价/闸门/资金校验），不发送 |
 
 金额单位、身份规则与 Fail Closed 三条约定见 `src/types/index.ts` 顶部注释；下游实现必须遵守。
