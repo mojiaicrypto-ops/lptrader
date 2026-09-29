@@ -23,3 +23,8 @@ coverage/
 .vitest/
 .DS_Store
 *.log
+
+# Throwaway probes / scratch (never commit; see AGENTS.md Settlement rule 3)
+scratch-*.mjs
+scratch-*.ts
+.tmp/
