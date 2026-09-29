@@ -25,3 +25,270 @@ scan
 --------------------
 scanning 5 stock tokens × 2 stablecoins × 2 DEXes — throttled, expect a few minutes…
   …still scanning (15s elapsed)
+  …still scanning (30s elapsed)
+  …still scanning (45s elapsed)
+  …still scanning (60s elapsed)
+  …still scanning (75s elapsed)
+  …still scanning (90s elapsed)
+  …still scanning (105s elapsed)
+  …still scanning (120s elapsed)
+  …still scanning (135s elapsed)
+  …still scanning (150s elapsed)
+  …still scanning (165s elapsed)
+  scanned at               2026-09-29T15:13:38.775Z
+  elapsed                  168.3s
+  probes                   70
+  pools discovered         11
+  scheduler                geckoterminal=23 req / 7×429   dexpaprika=6 req / 0×429
+  complete                 true
+
+candidate pools + §16 verdict
+-----------------------------
+
+  56:pancakeswap-v3:0x2fd993203194ae9477dd56ef31856ed9e083746d
+  dex / feeTier            pancakeswap-v3 / 10000
+  legs                     0x1a4b499833a79a09ad7cf1d42d7dacf71e92eb00 / 0x55d398326f99059ff775485246999027b3197955 (0x1a4b4998…/0x55d39832…)
+  tvlUSD                   $4.79 [geckoterminal]
+  volume24h                $0 [geckoterminal]
+  volume7d                 unavailable (!)
+  fees24h (derived)        $0 [derived]
+  fees7d (derived)         unavailable (!)
+  poolAgeDays              60.557d
+  tokenNAVDeviation        12.3853% [derived]
+  swapImpact3500USD        unavailable [unavailable, stale]
+  currentTick / activeLiquidity 56309 / 0
+  sqrtPriceX96             1322979874644318296151912930589
+  estimatedAPR7d           unavailable
+  §16 filter               REJECT
+      [TVL_BELOW_MINIMUM] tvlUSD $4.79 >= $500,000 → FAIL
+      [VOLUME_7D_UNAVAILABLE] 7D volume unavailable (source=unavailable, stale=true) — §96 fail closed, no verdict
+      [NAV_DEVIATION_EXCEEDED] tokenNAVDeviation 12.3853% < 1.0000% → FAIL
+      [SWAP_IMPACT_UNAVAILABLE] swapImpact3500USD unavailable (source=unavailable, stale=true) — no on-chain quote, so the §16 impact gate cannot be satisfied
+      (rejection involved unreadable data — a data problem, not a pool problem)
+
+  56:uniswap-v3:0x36c0fc3159eb8662a2e1b84a4df518d916bce0e1
+  dex / feeTier            uniswap-v3 / 500
+  legs                     0x431a3bee82e2ca41e49895cbece5bb0f76a89b7a / 0x55d398326f99059ff775485246999027b3197955 (0x431a3bee…/0x55d39832…)
+  tvlUSD                   $107,663.25 [geckoterminal]
+  volume24h                $273,030.85 [geckoterminal]
+  volume7d                 $2,345,241.81 [dexpaprika]
+  fees24h (derived)        $136.52 [derived]
+  fees7d (derived)         $1,172.62 [derived]
+  poolAgeDays              60.334d
+  tokenNAVDeviation        0.2370% [derived]
+  swapImpact3500USD        0.6228% [onchain]
+  currentTick / activeLiquidity 58068 / 89644994053987784268301
+  sqrtPriceX96             1444644832519761834710187288087
+  estimatedAPR7d           0.57 [derived]
+  §16 filter               REJECT
+      [TVL_BELOW_MINIMUM] tvlUSD $107,663.25 >= $500,000 → FAIL
+      [SWAP_IMPACT_EXCEEDED] $3500 swap price impact 0.6228% < 0.5000% → FAIL
+
+  56:pancakeswap-v3:0x5018b018ceb7645c927c5cf246786f89ebcbe7ea
+  dex / feeTier            pancakeswap-v3 / 2500
+  legs                     0x55d398326f99059ff775485246999027b3197955 / 0x80106cb3ead06659a5ad19df39d9b4733863b9b0 (0x55d39832…/0x80106cb3…)
+  tvlUSD                   $293,379.24 [geckoterminal]
+  volume24h                $105,831.29 [geckoterminal]
+  volume7d                 $614,750.55 [dexpaprika]
+  fees24h (derived)        $264.58 [derived]
+  fees7d (derived)         $1,536.88 [derived]
+  poolAgeDays              70.936d
+  tokenNAVDeviation        0.0664% [derived]
+  swapImpact3500USD        0.4811% [onchain]
+  currentTick / activeLiquidity -62351 / 206904433907683081559582
+  sqrtPriceX96             3507704890314659694850932151
+  estimatedAPR7d           0.27 [derived]
+  §16 filter               REJECT
+      [TVL_BELOW_MINIMUM] tvlUSD $293,379.24 >= $500,000 → FAIL
+      [VOLUME_7D_BELOW_MINIMUM] avg daily volume 7D $87,821.51 (7D total $614,750.55 ÷ 7) >= $250,000 → FAIL
+
+  56:pancakeswap-v3:0x58e44c2e5b17ef40915b4b3ae8451b6b87285b44
+  dex / feeTier            pancakeswap-v3 / 10000
+  legs                     0x55d398326f99059ff775485246999027b3197955 / 0x80106cb3ead06659a5ad19df39d9b4733863b9b0 (0x55d39832…/0x80106cb3…)
+  tvlUSD                   $60,623.53 [geckoterminal]
+  volume24h                $6,439.73 [geckoterminal]
+  volume7d                 $39,237.76 [dexpaprika]
+  fees24h (derived)        $64.4 [derived]
+  fees7d (derived)         $392.38 [derived]
+  poolAgeDays              60.488d
+  tokenNAVDeviation        0.8639% [derived]
+  swapImpact3500USD        3.1538% [onchain]
+  currentTick / activeLiquidity -62369 / 18943098523558207532411
+  sqrtPriceX96             3504625146974283297622242996
+  estimatedAPR7d           0.34 [derived]
+  §16 filter               REJECT
+      [TVL_BELOW_MINIMUM] tvlUSD $60,623.53 >= $500,000 → FAIL
+      [VOLUME_7D_BELOW_MINIMUM] avg daily volume 7D $5,605.39 (7D total $39,237.76 ÷ 7) >= $250,000 → FAIL
+      [SWAP_IMPACT_EXCEEDED] $3500 swap price impact 3.1538% < 0.5000% → FAIL
+
+  56:pancakeswap-v3:0x7530beb7bde5843f668cf31b996fa1f748c9b6b1
+  dex / feeTier            pancakeswap-v3 / 2500
+  legs                     0x1a4b499833a79a09ad7cf1d42d7dacf71e92eb00 / 0x55d398326f99059ff775485246999027b3197955 (0x1a4b4998…/0x55d39832…)
+  tvlUSD                   $239,380.42 [geckoterminal]
+  volume24h                $153,784.82 [geckoterminal]
+  volume7d                 $1,009,457.57 [dexpaprika]
+  fees24h (derived)        $384.46 [derived]
+  fees7d (derived)         $2,523.64 [derived]
+  poolAgeDays              57.344d
+  tokenNAVDeviation        0.0140% [derived]
+  swapImpact3500USD        0.4716% [onchain]
+  currentTick / activeLiquidity 55077 / 150362176065184237197855
+  sqrtPriceX96             1243993144263717254705870006897
+  estimatedAPR7d           0.55 [derived]
+  §16 filter               REJECT
+      [TVL_BELOW_MINIMUM] tvlUSD $239,380.42 >= $500,000 → FAIL
+      [VOLUME_7D_BELOW_MINIMUM] avg daily volume 7D $144,208.22 (7D total $1,009,457.57 ÷ 7) >= $250,000 → FAIL
+
+  56:uniswap-v3:0x84cbd08021c40fcea28f3389721ffefc73291340
+  dex / feeTier            uniswap-v3 / 3000
+  legs                     0x1a4b499833a79a09ad7cf1d42d7dacf71e92eb00 / 0x55d398326f99059ff775485246999027b3197955 (0x1a4b4998…/0x55d39832…)
+  tvlUSD                   $13,318.63 [geckoterminal]
+  volume24h                $1,879.92 [geckoterminal]
+  volume7d                 $20,144.45 [dexpaprika]
+  fees24h (derived)        $5.64 [derived]
+  fees7d (derived)         $60.43 [derived]
+  poolAgeDays              50.402d
+  tokenNAVDeviation        0.0073% [derived]
+  swapImpact3500USD        1.9703% [onchain]
+  currentTick / activeLiquidity 55091 / 15501452612650937839025
+  sqrtPriceX96             1244826724789840248839822074077
+  estimatedAPR7d           0.24 [derived]
+  §16 filter               REJECT
+      [TVL_BELOW_MINIMUM] tvlUSD $13,318.63 >= $500,000 → FAIL
+      [VOLUME_7D_BELOW_MINIMUM] avg daily volume 7D $2,877.78 (7D total $20,144.45 ÷ 7) >= $250,000 → FAIL
+      [SWAP_IMPACT_EXCEEDED] $3500 swap price impact 1.9703% < 0.5000% → FAIL
+
+  56:uniswap-v3:0xc03347c0076d72993d1ac0d5e7ed311f13e2613d
+  dex / feeTier            uniswap-v3 / 500
+  legs                     0x1a4b499833a79a09ad7cf1d42d7dacf71e92eb00 / 0x55d398326f99059ff775485246999027b3197955 (0x1a4b4998…/0x55d39832…)
+  tvlUSD                   $0.07 [geckoterminal]
+  volume24h                $0 [geckoterminal]
+  volume7d                 unavailable (!)
+  fees24h (derived)        $0 [derived]
+  fees7d (derived)         unavailable (!)
+  poolAgeDays              47.219d
+  tokenNAVDeviation        7.8125% [derived]
+  swapImpact3500USD        unavailable [unavailable, stale]
+  currentTick / activeLiquidity 55838 / 0
+  sqrtPriceX96             1292215062667047408324217740552
+  estimatedAPR7d           unavailable
+  §16 filter               REJECT
+      [TVL_BELOW_MINIMUM] tvlUSD $0.07 >= $500,000 → FAIL
+      [VOLUME_7D_UNAVAILABLE] 7D volume unavailable (source=unavailable, stale=true) — §96 fail closed, no verdict
+      [NAV_DEVIATION_EXCEEDED] tokenNAVDeviation 7.8125% < 1.0000% → FAIL
+      [SWAP_IMPACT_UNAVAILABLE] swapImpact3500USD unavailable (source=unavailable, stale=true) — no on-chain quote, so the §16 impact gate cannot be satisfied
+      (rejection involved unreadable data — a data problem, not a pool problem)
+
+  56:pancakeswap-v3:0xc2151a561e928d16576d75ea88544543ac63d80b
+  dex / feeTier            pancakeswap-v3 / 2500
+  legs                     0x55d398326f99059ff775485246999027b3197955 / 0x7425889fe94f9d693e8daefe88bcced6acfef4c0 (0x55d39832…/0x7425889f…)
+  tvlUSD                   $207,300.28 [geckoterminal]
+  volume24h                $327,318.03 [geckoterminal]
+  volume7d                 $3,058,016.02 [dexpaprika]
+  fees24h (derived)        $818.3 [derived]
+  fees7d (derived)         $7,645.04 [derived]
+  poolAgeDays              68.221d
+  tokenNAVDeviation        0.1277% [derived]
+  swapImpact3500USD        0.5361% [onchain]
+  currentTick / activeLiquidity -65828 / 61126474981064803546853
+  sqrtPriceX96             2947910978133575311434063943
+  estimatedAPR7d           1.92 [derived]
+  §16 filter               REJECT
+      [TVL_BELOW_MINIMUM] tvlUSD $207,300.28 >= $500,000 → FAIL
+      [SWAP_IMPACT_EXCEEDED] $3500 swap price impact 0.5361% < 0.5000% → FAIL
+
+  56:pancakeswap-v3:0xe531fcb1f5a195de7608b9f4f9518544c2cdb693
+  dex / feeTier            pancakeswap-v3 / 100
+  legs                     0x205812cdbed920aff76c6580abd681a46d11efc7 / 0x55d398326f99059ff775485246999027b3197955 (0x205812cd…/0x55d39832…)
+  tvlUSD                   $624,876.08 [geckoterminal]
+  volume24h                $6,695,377.72 [geckoterminal]
+  volume7d                 $37,378,021.19 [dexpaprika]
+  fees24h (derived)        $669.54 [derived]
+  fees7d (derived)         $3,737.8 [derived]
+  poolAgeDays              81.337d
+  tokenNAVDeviation        0.2869% [derived]
+  swapImpact3500USD        0.3763% [onchain]
+  currentTick / activeLiquidity 66051 / 1590471713947969349114565
+  sqrtPriceX96             2153306793771256246830456223588
+  estimatedAPR7d           0.31 [derived]
+  §16 filter               PASS
+
+  56:pancakeswap-v3:0xe9b9998b2ec5430d2246c7f1f8d9f298c97d7365
+  dex / feeTier            pancakeswap-v3 / 2500
+  legs                     0x431a3bee82e2ca41e49895cbece5bb0f76a89b7a / 0x55d398326f99059ff775485246999027b3197955 (0x431a3bee…/0x55d39832…)
+  tvlUSD                   $535,625.96 [geckoterminal]
+  volume24h                $774,838.31 [geckoterminal]
+  volume7d                 $5,769,320.45 [dexpaprika]
+  fees24h (derived)        $1,937.1 [derived]
+  fees7d (derived)         $14,423.3 [derived]
+  poolAgeDays              61.422d
+  tokenNAVDeviation        0.4036% [derived]
+  swapImpact3500USD        0.9396% [onchain]
+  currentTick / activeLiquidity 58075 / 1111786279524534909828731
+  sqrtPriceX96             1445136903901644131265819261356
+  estimatedAPR7d           1.4 [derived]
+  §16 filter               REJECT
+      [SWAP_IMPACT_EXCEEDED] $3500 swap price impact 0.9396% < 0.5000% → FAIL
+
+  56:uniswap-v3:0xfc4e77248b76fefc27c4cac7151a2ee5b5cc590e
+  dex / feeTier            uniswap-v3 / 3000
+  legs                     0x205812cdbed920aff76c6580abd681a46d11efc7 / 0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d (0x205812cd…/0x8ac76a51…)
+  tvlUSD                   $1,804,923.02 [geckoterminal]
+  volume24h                $1,324,803.47 [geckoterminal]
+  volume7d                 $2,903,988.48 [dexpaprika]
+  fees24h (derived)        $3,974.41 [derived]
+  fees7d (derived)         $8,711.97 [derived]
+  poolAgeDays              53.235d
+  tokenNAVDeviation        0.3272% [derived]
+  swapImpact3500USD        0.0941% [onchain]
+  currentTick / activeLiquidity 66053 / 1663521333347132489771327
+  sqrtPriceX96             2153452688399102740628386764864
+  estimatedAPR7d           0.25 [derived]
+  §16 filter               PASS
+
+§16 summary
+--------------------
+  passed                   2
+  rejected                 9
+  decisive                 false (false = a rejection came from missing data)
+
+proven absences (factory answered the zero address)
+---------------------------------------------------
+  uniswap-v3 0x80106cb3ead06659a5ad19df39d9b4733863b9b0/0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d fee 500: proven absent: factory.getPool returned the zero address for fee 500
+  uniswap-v3 0x80106cb3ead06659a5ad19df39d9b4733863b9b0/0x55d398326f99059ff775485246999027b3197955 fee 500: proven absent: factory.getPool returned the zero address for fee 500
+  uniswap-v3 0x431a3bee82e2ca41e49895cbece5bb0f76a89b7a/0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d fee 500: proven absent: factory.getPool returned the zero address for fee 500
+  uniswap-v3 0x1a4b499833a79a09ad7cf1d42d7dacf71e92eb00/0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d fee 500: proven absent: factory.getPool returned the zero address for fee 500
+  uniswap-v3 0x7425889fe94f9d693e8daefe88bcced6acfef4c0/0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d fee 500: proven absent: factory.getPool returned the zero address for fee 500
+  uniswap-v3 0x7425889fe94f9d693e8daefe88bcced6acfef4c0/0x55d398326f99059ff775485246999027b3197955 fee 500: proven absent: factory.getPool returned the zero address for fee 500
+  uniswap-v3 0x80106cb3ead06659a5ad19df39d9b4733863b9b0/0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d fee 3000: proven absent: factory.getPool returned the zero address for fee 3000
+  uniswap-v3 0x80106cb3ead06659a5ad19df39d9b4733863b9b0/0x55d398326f99059ff775485246999027b3197955 fee 3000: proven absent: factory.getPool returned the zero address for fee 3000
+  uniswap-v3 0x431a3bee82e2ca41e49895cbece5bb0f76a89b7a/0x55d398326f99059ff775485246999027b3197955 fee 3000: proven absent: factory.getPool returned the zero address for fee 3000
+  uniswap-v3 0x1a4b499833a79a09ad7cf1d42d7dacf71e92eb00/0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d fee 3000: proven absent: factory.getPool returned the zero address for fee 3000
+  uniswap-v3 0x7425889fe94f9d693e8daefe88bcced6acfef4c0/0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d fee 3000: proven absent: factory.getPool returned the zero address for fee 3000
+  uniswap-v3 0x7425889fe94f9d693e8daefe88bcced6acfef4c0/0x55d398326f99059ff775485246999027b3197955 fee 3000: proven absent: factory.getPool returned the zero address for fee 3000
+  uniswap-v3 0x205812cdbed920aff76c6580abd681a46d11efc7/0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d fee 10000: proven absent: factory.getPool returned the zero address for fee 10000
+  uniswap-v3 0x205812cdbed920aff76c6580abd681a46d11efc7/0x55d398326f99059ff775485246999027b3197955 fee 10000: proven absent: factory.getPool returned the zero address for fee 10000
+  uniswap-v3 0x80106cb3ead06659a5ad19df39d9b4733863b9b0/0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d fee 10000: proven absent: factory.getPool returned the zero address for fee 10000
+  uniswap-v3 0x80106cb3ead06659a5ad19df39d9b4733863b9b0/0x55d398326f99059ff775485246999027b3197955 fee 10000: proven absent: factory.getPool returned the zero address for fee 10000
+  uniswap-v3 0x431a3bee82e2ca41e49895cbece5bb0f76a89b7a/0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d fee 10000: proven absent: factory.getPool returned the zero address for fee 10000
+  uniswap-v3 0x431a3bee82e2ca41e49895cbece5bb0f76a89b7a/0x55d398326f99059ff775485246999027b3197955 fee 10000: proven absent: factory.getPool returned the zero address for fee 10000
+  uniswap-v3 0x1a4b499833a79a09ad7cf1d42d7dacf71e92eb00/0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d fee 10000: proven absent: factory.getPool returned the zero address for fee 10000
+  uniswap-v3 0x1a4b499833a79a09ad7cf1d42d7dacf71e92eb00/0x55d398326f99059ff775485246999027b3197955 fee 10000: proven absent: factory.getPool returned the zero address for fee 10000
+  … 27 more
+
+unverifiable probes (these make a scan incomplete)
+--------------------------------------------------
+  none
+
+source failures
+--------------------
+  [degraded] dexpaprika/enrichment: dexpaprika pool search for 0x205812cdbed920aff76c6580abd681a46d11efc7 was truncated after 2 page(s); a low-liquidity pool may lack 7d/30d volume
+
+sanity check vs research §4.1
+-----------------------------
+  OK    QQQB/USDC @ uniswap-v3: feeTier 3000 (research: 3000), tvl $1,804,923.02 (research: QQQB/USDC 0.3% (TVL ~$1.77M as of 2026-09-29))
+  OK    QQQB/USDT @ pancakeswap-v3: feeTier 100 (research: 100), tvl $624,876.08 (research: QQQB/USDT 0.01% (TVL ~$0.62M))
+  SKIP  QQQB/WBNB @ pancakeswap-v3 fee 500 (0x47bc06722295ac316a569eef87ac32faa455f441) — outside the §14 cross set (a leg is neither a whitelisted stock token nor a whitelisted stablecoin)
+
+SCAN COMPLETE: 0 blocker(s)
+exit=0

@@ -11,13 +11,13 @@
 | 项 | 值 |
 |---|---|
 | 迭代 | Iteration 1 — 单池实盘（Phase 3） |
-| 阶段 | **Reviewing**（Plan 已批准，Develop 完成；Plan: `docs/archive/tasks/2026-09-29-D2/plan.md`） |
+| 阶段 | **Settling**（Plan 批准 → Develop → 独立 Review → Test 均已完成；Plan: `docs/archive/tasks/2026-09-29-D2/plan.md`） |
 | 技术栈 | TypeScript / Node（viem 2.37.13 + PancakeSwap 官方 V3 SDK） |
 | 链 | BNB Chain（chainId 56） |
 | DEX | PancakeSwap V3 + Uniswap V3（白名单） |
 | 首期标的 | QQQB ×（USDC/USDT），池由 Scanner 自动发现 |
 | 初始资金示例 | 10,000 USDC（LP 上限 70%，Reserve 30%） |
-| 代码 | 已实现（49 源文件 / 25 测试文件 / 4 脚本）；`npm run typecheck` 0 错误，`npm test` **690 测试全绿** |
+| 代码 | 已实现（49 源文件 / 25 测试文件 / 6 脚本）；`npm run typecheck` 0 错误，`npm test` **701 测试全绿** |
 
 ## 范围（Iteration 1）
 
@@ -51,6 +51,19 @@ npm run dry-run:build -- 7000   # 完整建仓决策链，不签名不发送
 npm run keystore:init      # 生成加密私钥（0600）
 npm run telegram:check     # Telegram 通道 fail-closed 自检
 ```
+
+## 已完成的验证（证据可复现）
+
+| 阶段 | 结果 | 证据 |
+|---|---|---|
+| Plan | 已批准（含用户裁定 D3/D4/C1/C3） | `docs/archive/tasks/2026-09-29-D2/plan.md` |
+| Develop | 完成 | `implementation-summary.md` |
+| 独立 Review（L3） | **发现 4 个 blocking，全部已修复并回归** | `review-report.md` |
+| 独立 Test | passed | `test-report.md` |
+| 链上只读 | 8 个 bStock `uiMultiplier()` 实测 + 换算与合约 MATCH | `docs/research/evidence-smoke-read-20260929.txt` |
+| 池扫描 + §16 | `complete=true`，2 池通过，0 blocker | `docs/research/evidence-smoke-scan-20260929-t6.txt` |
+| 报价 | 1000 USDT → 1.353115 QQQB，impact 0.0123% | `npm run smoke:quote` |
+| **dry-run 建仓** | 价值总和 4900.00 精确、tick 对齐、§35 反证 4.38%、impact 独立复算 exact、原子单笔 | `docs/research/evidence-dry-run-build-20260929.txt` |
 
 ## 当前可执行性（实测，2026-09-29）
 
