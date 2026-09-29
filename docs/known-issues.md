@@ -22,6 +22,8 @@
 | KI-16 | P1 | **resolved** | **`src/store/db.ts` 的 `:memory:` 未隔离**：注释称内存库绕过 singleton map，实际 lookup 发生在 in-memory 判断之前且仍写入 map → 两次 `openDatabase(':memory:')` 返回**同一连接**（实测第二个句柄能看到第一个写入的行）。影响范围超出测试：任何以为拿到独立内存库的调用方（dry-run / paper 模式）会与其它组件共享状态。**已修复**：`openDatabase` 对内存库跳过 map 查找与写入（新增 `isMemoryDatabase()` 导出）；`closeDatabase` 改为幂等。owner 提供 red-before 证据（临时回退后 1 failed）与回归测试。 | 实现期发现（executor 测试串味） | §74 / T11 |
 | KI-17 | P2 | open | **Notifier 返回不匹配的 `requestId` 时确认门会挂到 TTL 才拒绝**：`settle()` 检测到 id 不符只记日志并 return，waiter 因此等到 `expiresAt`。行为本身是 fail closed（最终拒绝），但会把 executor 挂住整个 TTL（实测 30 分钟级）。建议：id 不符时立即以拒绝结算。 | 实现期发现（executor 测试） | §96 / T13 |
 | KI-18 | P2 | open | **`PoolSnapshot.currentTick` / `sqrtPriceX96` / `activeLiquidity` 无可用性位**：三者是冻结的裸类型（非 `Sourced`），RPC 不可达时 provider 写 `0 / 0n / 0n`。`activeLiquidity = 0n` 是合法值（流动性全出区间），`currentTick = 0` 是**合法 tick**，下游无法与真实数据区分。缓解：filter 增加 `onchainVerified !== true` → 拒绝（§96「无法验证即拒绝」），使哨兵值不可达；但该保护依赖所有消费者都走 filter。 | DataTests 发现（D2） | §15 / §16 / §34 |
+| KI-19 | P2 | **resolved** | ~~§99 cross-check 在未固定区块高度时对区块可变值（`slot0`/余额/feeGrowth）逐字段全等比较，导致**每一次**真实读取都可能失败~~。**实测**：两个端点返回的 `sqrtPriceX96` 在第 9 位有效数字上不同、`tick` 相同 —— 即一个区块的正常价格波动，却被判为不一致而拒绝。**已修复**：`crossCheck` 先解析并固定一个区块高度，所有观测都在该高度读取；无法固定高度则 fail closed（不退回未固定读取）。回归测试锁定「两次 `eth_call` 带同一非空 block tag」与「两端点均无法报块高 → `RPC_UNAVAILABLE`」。 | 集成期独立验证发现（活链复现） | §99 / §98 |
+| KI-20 | P3 | open | **同一次快照内的多字段读取未共享区块高度**：`PoolReader.readPool` 用 `Promise.all` 发起 6 个独立 `readContract`，每个各自固定一个（可能不同的）高度。窗口极小（BSC ~0.75s/块），但理论上会出现 `slot0` 来自块 N、`liquidity` 来自块 N+1 的不自洽快照。彻底修复需支持「一次 crossCheck 内批量多调用」。 | 集成期发现（同 KI-19 的修复引入的观察） | §15 / §99 |
 
 ## 已登记待处理（Onboarding 阶段产生）
 
