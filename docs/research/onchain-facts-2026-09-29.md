@@ -103,9 +103,50 @@ UI price  = rawPrice × 1e18 / uiMultiplier   ← 仅当价格源以 raw token �
 
 **BSC 上 Uniswap V3 合约地址** `[官方]`：Factory `0xdB1d10011AD0Ff90774D0C6Bb92e5C5c8b4461F7`、NonfungiblePositionManager `0x7b8A01B39D58278b5DE7e48c8449c9f4F5170613`、SwapRouter02 `0xB971eF87ede563556b2ED4b1C0b0019111Dd85d2`、QuoterV2 `0x78D78E420Da98ad378D7799bE8f4AF69033EB077`、TickLens `0xD9270014D396281579760619CCf4c3af0501A47C`、Permit2 `0x000000000022D473030F116dDEE9F6B43aC78BA3`、UniversalRouter `0x1906c1d672b88cd1b9ac7593301ca990f94eae07`。
 
-**PancakeSwap V3 合约地址** `[官方]`：Factory `0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865`、NonfungiblePositionManager `0x46A15B0b27311cedF172AB29E4f4766fbE7F4364`（另见 §5 的 SmartRouter 地址）。
+**PancakeSwap V3 合约地址** `[官方]`：
 
-### 4.2 数据源分层（`[实测]`）
+| 合约 | 地址 | 包常量 |
+|---|---|---|
+| PancakeV3Factory | `0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865` | `FACTORY_ADDRESSES[56]` |
+| PancakeV3PoolDeployer | `0x41ff9AA7e16B8B1a8a8dc4f0eFacd93D02d071c9` | `DEPLOYER_ADDRESSES[56]` |
+| NonfungiblePositionManager | `0x46A15B0b27311cedF172AB29E4f4766fbE7F4364` | `NFT_POSITION_MANAGER_ADDRESSES[56]` |
+| SwapRouter (v3) | `0x1b81D678ffb9C0263b24A97847620C99d213eB14` | **无导出常量** |
+| SmartRouter | `0x13f4EA83D0bd40E75C8222255bc855a974568Dd4` | `SMART_ROUTER_ADDRESSES[ChainId.BSC]` |
+| QuoterV2 | `0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997` | `V3_QUOTER_ADDRESSES[56]` |
+| TickLens | `0x9a489505a00cE272eAa5e07Dba6491314CaE3796` | `V3_TICK_LENS_ADDRESSES[56]` |
+| TickQueryHelper | `0x5BF1597ebfB079c3D47918b1B77eaE2475803D7A` | `TICK_QUERY_HELPER_ADDRESSES[56]` |
+| PancakeInterfaceMulticall | `0xac1cE734566f390A94b00eb9bf561c2625BF44ea` | 无 |
+| MixedRouteQuoterV1 | `0x678Aa4bF4E210cf2166753e054d5b7c31cc7fa86` | 无 |
+| Universal Router (v3, NFT-capable) | `0x1A0A18AC4BECDDbd6389559687d1A73d8927E416` | 无 |
+| **Permit2（Pancake 自有部署）** | `0x31c2F6fcFf4F8759b3Bd5Bf0e1084A055615c768` | 无 |
+| Multicall3 | `0xcA11bde05977b3631167028862bE2a173976CA11` | `viem/chains` |
+
+> ⚠️ Pancake 的 Permit2 **不是** Uniswap canonical `0x000000000022D473030F116dDEE9F6B43aC78BA3`。
+> ⚠️ `@pancakeswap/chains@0.10.0` 的 chain 56 条目**无 `contracts` 块**（`getChainConfig(56).contracts === undefined`）→ 地址必须从 v3-sdk 常量映射 + smart-router 常量取。
+
+### 4.2 原子 swap + addLiquidity 路径（`swapAndAddCallParameters`）`[官方]`
+
+```ts
+SwapRouter.swapAndAddCallParameters(
+  trade: SmartRouterTrade, position: Position, addLiquidityOptions: AddLiquidityOptions,
+  tokenInApprovalType: ApprovalTypes, tokenOutApprovalType: ApprovalTypes,
+): MethodParameters   // { calldata: Hex; value: Hex }
+// SwapAndAddOptions = { slippageTolerance: Percent; recipient?; deadlineOrPreviousBlockhash?: Validation; ...permit options }
+```
+
+- **单笔交易发往 SmartRouter**（`to = 0x13f4EA83…`，native 腿走 `value`）。
+- swap 输出如何进入 addLiquidity：`encodeSwaps(..., isSwapAndAdd=true)` 强制 `routerMustCustody=true`，每条 swap 腿 `recipient = ADDRESS_THIS`；随后 router `pull` 用户缺少的 position token → 链上 approve position manager → `callPositionManager` → NPM `mint`/`increaseLiquidity`，剩余以 `sweepToken(amountMinimum=0)` 退回。
+- **slippage 可在原子调用内强制**：`options.slippageTolerance` 转成每条 swap 腿的 `amountOutMinimum`/`amountInMaximum`，同时为 addLiquidity 生成 `amount0Min`/`amount1Min`（经 `minimalPosition`）。**0.3% slippage 上限可落地。**
+- **price impact 不可在调用内强制**：SDK 无该参数，只在内部用于决定是否追加 `refundETH`（`SwapRouter.riskOfPartialFill`）。**0.5% price impact 上限必须由调用方在编码前用 QuoterV2 / trade 的 input-amount vs pool mid price 自算出并 abort。**
+- 候选池与报价的**无 key 路径**：`InfinityRouter.getV3CandidatePools({ clientProvider, currencyA, currencyB })` + `InfinityRouter.getBestTrade(amount, to, TradeType.EXACT_INPUT, { gasPriceWei, candidatePools })`（链上读池 + 链下算价，不依赖 subgraph）。**legacy `SmartRouter` 路径才需要 Graph key。**
+- 机器人专用要点：原子性**仅 SmartRouter 具备**（v3 SwapRouter / NPM 的 `multicall` 是 self-delegatecall，不能 swap）；`deadlineOrPreviousBlockhash` 支持 `bytes32 previousBlockhash` 变体（无人值守首选，避免时钟偏移 revert）；BSC USDT 用 `ApprovalTypes.ZERO_THEN_MAX`（approve-from-nonzero 保护）；native 腿需断言 `WNATIVE[56] === WBNB`；**无写路径 gas 助手**（`multicallByGasLimit` 只服务读/quote 路径）→ 自行 `estimateGas`，并把 `gasPriceWei` 传给 `getBestTrade` 让路由 gas-aware；需 surfacing 的 revert：`TOKEN_IN_DIFF`/`TOKEN_OUT_DIFF`/`TRADE_TYPE_DIFF`（同批 trade 必须同 input/output currency）、`NON_TOKEN_PERMIT_OUTPUT`、`ZERO_LIQUIDITY`、`TICK_ORDER`/`TICK_LOWER`/`TICK_UPPER`。
+
+### 4.3 池子存在的 Uniswap V3 侧接口 `[官方]`
+
+Factory `0xdB1d10011AD0Ff90774D0C6Bb92e5C5c8b4461F7`、NonfungiblePositionManager `0x7b8A01B39D58278b5DE7e48c8449c9f4F5170613`、SwapRouter02 `0xB971eF87ede563556b2ED4b1C0b0019111Dd85d2`、QuoterV2 `0x78D78E420Da98ad378D7799bE8f4AF69033EB077`、TickLens `0xD9270014D396281579760619CCf4c3af0501A47C`、Permit2 `0x000000000022D473030F116dDEE9F6B43aC78BA3`、UniversalRouter `0x1906c1d672b88cd1b9ac7593301ca990f94eae07`。
+**对应 SDK 侧用 viem 自实现最小数学**（不引入 `@uniswap/v3-sdk`，理由见 §5）。
+
+### 4.4 数据源分层（`[实测]`）
 
 | 层 | 源 | 覆盖 | 限制 |
 |---|---|---|---|

@@ -7,6 +7,8 @@
 | `docs/product/stock-lp-auto-strategy-v1.md` | 产品基线 | L2 | **canonical**：对象、边界、能力、验收模型、配置 |
 | `docs/iterations/iteration-1.md` | 迭代 | L3 | Iteration 1 范围、阶段、风险、状态 |
 | `docs/decisions/D1-scope-and-stack.md` | 决策 | L3 | D1：首期范围、技术栈、密钥方案、编号路径约定 |
+| `docs/research/onchain-facts-2026-09-29.md` | 调研 | L2 | 链上事实：bStocks 地址、BEP-677、参考价源、池子实况、数据源、SDK 事实 |
+| `docs/product/scope-corrections.md` | 澄清 | L2 | 基线「不改语义」的读法澄清（池组合、symbol、RangeProgress 等） |
 | `docs/code-map.md` | 索引 | L1 | 代码入口、模块、测试位置 |
 | `docs/known-issues.md` | 登记 | L1 | 遗留问题与已知保留 |
 | `docs/archive/tasks/` | 归档 | L4 | 各任务的 Plan / Implementation / Review / Test / Settlement |

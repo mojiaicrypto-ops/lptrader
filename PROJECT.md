@@ -11,12 +11,13 @@
 | 项 | 值 |
 |---|---|
 | 迭代 | Iteration 1 — 单池实盘（Phase 3） |
-| 阶段 | Onboarding / Planning |
-| 技术栈 | TypeScript / Node |
+| 阶段 | **Awaiting Plan Confirmation**（Plan: `docs/archive/tasks/2026-09-29-D2/plan.md`） |
+| 技术栈 | TypeScript / Node（viem 2.37.13 + PancakeSwap 官方 V3 SDK） |
 | 链 | BNB Chain（chainId 56） |
-| DEX | PancakeSwap V3（白名单另含 Uniswap V3） |
-| 首期标的 | QQQB / USDC |
+| DEX | PancakeSwap V3 + Uniswap V3（白名单） |
+| 首期标的 | QQQB ×（USDC/USDT），池由 Scanner 自动发现 |
 | 初始资金示例 | 10,000 USDC（LP 上限 70%，Reserve 30%） |
+| 代码 | 尚未创建（Planning） |
 
 ## 范围（Iteration 1）
 
