@@ -6,6 +6,7 @@
 | `AGENTS.md` | 规则 | L0 | 项目级执行参数、领域硬性约束、门禁分级 |
 | `docs/product/stock-lp-auto-strategy-v1.md` | 产品基线 | L2 | **canonical**：对象、边界、能力、验收模型、配置 |
 | `docs/iterations/iteration-1.md` | 迭代 | L3 | Iteration 1 范围、阶段、风险、状态 |
+| `docs/iterations/iteration-1-acceptance.md` | 验收 | L3 | §108 验收项 → 实现 → 证据形式 → 状态映射 |
 | `docs/decisions/D1-scope-and-stack.md` | 决策 | L3 | D1：首期范围、技术栈、密钥方案、编号路径约定 |
 | `docs/decisions/D2-execution-and-approvals.md` | 决策 | L3 | D2：执行授权（Mode 1 实盘）、确认闸门（建仓/换池）、Telegram 双向机器人 |
 | `docs/research/onchain-facts-2026-09-29.md` | 调研 | L2 | 链上事实：bStocks 地址、BEP-677、参考价源、池子实况、数据源、SDK 事实 |

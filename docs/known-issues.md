@@ -14,6 +14,10 @@
 | KI-8 | P2 | open | **闭市期间参考价口径**：无发行方 NAV API；Binance `/fapi/v1/constituents` 仅在部分时段有效且可能返回 `price<=0`/`"-1"` 占位值 → 必须有无效值判定与回退，否则按 §57 降级为仅报警。 | 调研 §3 | §56 / §57 |
 | KI-9 | P3 | open | **`AAPLB` / `AMZNB` 无 APRO 链上 feed**；`PLTR` 无 Chainlink feed → 这些符号在首期若要用，只能走 Binance 指数价路径。 | 调研 §3 | §84 |
 | KI-10 | P3 | open | **bStocks 合约 ABI 未实证**（Sourcify/Blockscout 404、BscScan 403）：blacklist / upgradeable 权限函数存在性未确认 → 安全评审需补链上 `eth_getCode`/`supportsInterface()` 探测。 | 调研 §6 | §58 |
+| KI-11 | P2 | open | **§108 Switching 组部分不在 Iteration 1 范围**：`Search Alternative` / `Compare APR` / `Calculate Switching Cost` / `Break Even Days` 属基线 Phase 5（自动换池）。Iteration 1 只交付确认门 + cooldown 存储。属**经用户确认的范围裁剪**（`docs/decisions/D1-scope-and-stack.md` 第 3 行）。 | §108 vs D1 | §108 / §69–§73 |
+| KI-12 | P2 | open | **§101 Backtest / §102 Paper Trading 未实现**：用户选择直接 Phase 3 实盘。§102 的"不发交易"价值子集由 dry-run 建仓脚本部分覆盖，但无 14–30 天 paper 运行期。 | D1（用户选择） | §101 / §102 |
+| KI-13 | P2 | open | **§103 Mainnet Rollout 逐步放量未实现**：用户选择 Mode 1 直接实盘且未设 `$500 → $2000 → …` 金额阶梯。风险补偿为 Telegram 确认门 + 白名单非空校验；无程序化金额上限。 | D2（用户裁定） | §103 |
+| KI-14 | P1 | open | **Telegram 确认门本身成为单点**：若用户长时间不响应，`BUILD_POSITION` / `SWITCH_POOL` 将永久 pending（fail closed 的正确行为），但**风控退出不受影响**（自动）。需要 TTL 过期后的明确告警与状态可见性。 | D2 设计 | §96 / T13 |
 
 ## 已登记待处理（Onboarding 阶段产生）
 
