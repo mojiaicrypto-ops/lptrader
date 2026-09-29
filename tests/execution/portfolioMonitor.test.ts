@@ -6,7 +6,7 @@ import { createWhitelist } from '../../src/config/index.ts';
 import type { ReferencePriceProvider, LpPositionView } from '../../src/types/adapters.ts';
 import type { LpPositionRead } from '../../src/chain/positionReader.ts';
 import type { PoolSnapshot, Sourced } from '../../src/types/market.ts';
-import type { TokenAmount } from '../../src/types/token.ts';
+import type { TokenAmount, TokenMeta } from '../../src/types/token.ts';
 import { DEX_IDS, type Address, type TokenId } from '../../src/types/primitives.ts';
 import { fromFloat } from '../../src/util/decimal.ts';
 
@@ -102,6 +102,11 @@ function position(over: Partial<LpPositionView> = {}): LpPositionRead {
 }
 
 /** A reference provider whose answers the test dictates; every price/degradation case uses it. */
+/**
+ * A stock reference provider that also answers for stablecoins by default, so the many valuation tests
+ * below exercise the SUCCESS path. The dedicated tests above set `stablecoin: null` to reproduce the
+ * real composition, where the stock provider knows nothing about USDC.
+ */
 function referencePrices(
   options: { readonly stock?: number | null; readonly stablecoin?: number | null; readonly stale?: boolean } = {},
 ): ReferencePriceProvider {
@@ -136,6 +141,7 @@ function monitorWith(
     readonly balances?: readonly TokenAmount[];
     readonly native?: bigint;
     readonly positions?: LpPositionView | null;
+    readonly stablecoinPrice?: (token: TokenMeta) => Promise<Sourced<number | null>>;
   } = {},
 ) {
   const balances = overrides.balances ?? [amountOf(USDC, fromFloat(3_000, 18), 10n ** 18n)];
@@ -155,6 +161,9 @@ function monitorWith(
     tokenReader: tokenReader as never,
     positionReader: positionReader as never,
     referencePrice: overrides.referencePrice ?? referencePrices(),
+    ...(overrides.stablecoinPrice === undefined
+      ? {}
+      : { stablecoinPrice: overrides.stablecoinPrice as never }),
     whitelist,
     maxDrawdown: 0.15,
     windowSeconds: 300,
@@ -252,6 +261,70 @@ describe('PortfolioMonitor price table', () => {
   });
 });
 
+describe('PortfolioMonitor drawdown assessability (§65/§96)', () => {
+  it('reports NO drawdown verdict when the valuation is incomplete', async () => {
+    // The bug this pins (found in independent review): with an unpriced stablecoin the reserve valued to
+    // zero, totalNAV collapsed to 0, and the §66 line reported `breached: true` for a HEALTHY portfolio —
+    // the bot would have halted on a fabricated total loss. An incomplete valuation must yield `null`,
+    // which is neither "safe" nor "breached", so no caller can act on it.
+    const { monitor } = monitorWith({
+      referencePrice: referencePrices({ stablecoin: null }),
+      balances: [amountOf(USDC, fromFloat(3_000, 18), 10n ** 18n)],
+    });
+    const result = await monitor.monitor(inputs());
+
+    expect(result.complete).toBe(false);
+    expect(result.drawdown).toBeNull();
+    // The snapshot is still produced (and its totalNAV is a floor), it just carries no verdict.
+    expect(result.snapshot.totalNAV).toBe(0);
+    expect(result.problems.join(' ')).toMatch(/USDC: no usable reference price/);
+  });
+
+  it('prices stablecoins from the dedicated source, not the stock reference provider', async () => {
+    // A stablecoin price source is what makes the reserve count toward NAV at all.
+    const { monitor } = monitorWith({
+      referencePrice: referencePrices({ stablecoin: null }),
+      stablecoinPrice: async () => sourced(0.9995),
+      balances: [amountOf(USDC, fromFloat(3_000, 18), 10n ** 18n)],
+    });
+    const result = await monitor.monitor(inputs());
+
+    expect(result.snapshot.walletStablecoinValue).toBeCloseTo(2_998.5, 3);
+    // Complete valuation ⇒ a verdict IS produced. (A reserve-only 2,998 portfolio is genuinely below the
+    // 8,500 line, so this asserts assessability, not safety — the point is that a priced portfolio gets a
+    // real answer instead of `null`.)
+    expect(result.complete).toBe(true);
+    expect(result.drawdown).not.toBeNull();
+  });
+
+  it('never assumes a stablecoin is worth 1.0 when its own source is unavailable', async () => {
+    // Assuming par is what would hide a stablecoin depeg (§58), so an unavailable stablecoin price must
+    // degrade the valuation instead of silently normalising to 1.
+    const { monitor } = monitorWith({
+      referencePrice: referencePrices({ stablecoin: null }),
+      stablecoinPrice: async () => sourced(null, true),
+      balances: [amountOf(USDC, fromFloat(3_000, 18), 10n ** 18n)],
+    });
+    const result = await monitor.monitor(inputs());
+
+    expect(result.complete).toBe(false);
+    expect(result.snapshot.walletStablecoinValue).toBe(0);
+    expect(result.drawdown).toBeNull();
+  });
+
+  it('still reports a genuine breach on a complete valuation', async () => {
+    // Negative control: the assessability gate must not suppress a real drawdown.
+    const { monitor } = monitorWith({
+      stablecoinPrice: async () => sourced(1),
+      balances: [amountOf(USDC, fromFloat(8_400, 18), 10n ** 18n)],
+    });
+    const result = await monitor.monitor(inputs({ priorPeakNAV: 10_000 }));
+
+    expect(result.complete).toBe(true);
+    expect(result.drawdown?.breached).toBe(true);
+  });
+});
+
 describe('PortfolioMonitor valuation', () => {
   it('values a flat portfolio from the wallet alone and reports it complete', async () => {
     const { monitor } = monitorWith();
@@ -330,10 +403,11 @@ describe('PortfolioMonitor valuation', () => {
     });
     const result = await monitor.monitor(inputs({ priorPeakNAV: 10_000 }));
 
-    expect(result.drawdown.riskOffLineNAV).toBeCloseTo(8_500, 6);
+    expect(result.drawdown).not.toBeNull();
+    expect(result.drawdown?.riskOffLineNAV).toBeCloseTo(8_500, 6);
     // 8,400 is below the §66 line, so the strategy must stop.
-    expect(result.drawdown.breached).toBe(true);
-    expect(result.drawdown.windowSeconds).toBe(300);
+    expect(result.drawdown?.breached).toBe(true);
+    expect(result.drawdown?.windowSeconds).toBe(300);
   });
 
   it('reports peak NAV as a high-water mark so a recovery does not re-arm the risk line', async () => {

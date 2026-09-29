@@ -20,7 +20,7 @@
 import type { BscChainAdapter } from '../chain/adapter.ts';
 import type { LpPositionRead, PositionReader } from '../chain/positionReader.ts';
 import type { TokenReader } from '../chain/tokenReader.ts';
-import type { PoolSnapshot } from '../types/market.ts';
+import type { PoolSnapshot, Sourced } from '../types/market.ts';
 import type { DrawdownState, PortfolioSnapshot } from '../types/portfolio.ts';
 import type {
   Address,
@@ -66,7 +66,17 @@ export interface MonitorInputs {
 
 export interface MonitorResult {
   readonly snapshot: PortfolioSnapshot;
-  readonly drawdown: DrawdownState;
+  /**
+   * §65 drawdown, or `null` when the valuation was incomplete.
+   *
+   * `null` is the honest answer and it is deliberately NOT `{ breached: false }`: with an unpriced leg
+   * the snapshot's `totalNAV` is a *floor*, not the portfolio value, so neither "safe" nor "breached" can
+   * be concluded. Measured failure this prevents: with no stablecoin price source the reserve valued to
+   * zero, `totalNAV` became `0`, and the §66 line reported `breached: true` for a perfectly healthy
+   * portfolio — the bot would have halted on a fabricated total loss. A caller that needs a verdict must
+   * first make the valuation complete.
+   */
+  readonly drawdown: DrawdownState | null;
   /** `false` when any leg was unreadable or unpriced — consumers must not act on an incomplete NAV. */
   readonly complete: boolean;
   readonly problems: readonly string[];
@@ -92,6 +102,18 @@ export interface PortfolioMonitorOptions {
    * would trade from.
    */
   readonly watchAddress?: Address;
+  /**
+   * USD price for a **stablecoin**.
+   *
+   * Separate from `referencePrice`, which answers for the *stock* leg: the reference provider's job is
+   * the stock token's NAV versus the underlying equity, so asking it about USDC is a category error and
+   * it correctly returns nothing. Without this, the entire reserve prices to zero and NAV collapses to
+   * the LP leg only (measured: `totalNAV = 0` for a healthy wallet, which then tripped §66).
+   *
+   * Absent ⇒ stablecoins are treated as unpriced and the valuation is reported incomplete, which is the
+   * honest outcome rather than assuming 1.0. Assuming 1.0 is what would hide a depeg (§58).
+   */
+  readonly stablecoinPrice?: (token: TokenMeta) => Promise<Sourced<PriceUsd | null>>;
   /** §46 monitoring cadence, recorded as the observation window on each drawdown reading. */
   readonly windowSeconds?: UnixSeconds;
 }
@@ -138,17 +160,42 @@ export class PortfolioMonitor {
    * Returns the problems it found rather than throwing: an unpriced leg is a degraded valuation the
    * caller must see, not a crash — the monitor is also what powers the critical alerts.
    */
-  async buildPriceTable(pool: PoolSnapshot | null): Promise<{
+  async buildPriceTable(
+    pool: PoolSnapshot | null,
+    held: ReadonlySet<TokenId> = new Set(),
+  ): Promise<{
     readonly prices: PriceTable;
     readonly problems: readonly string[];
   }> {
     const problems: string[] = [];
     const prices = new Map<TokenId, PriceUsd>();
+    // A missing price only matters for a token the wallet actually holds: with a zero balance there is
+    // nothing for the absent price to understate. Without this distinction the monitor reported the whole
+    // whitelist as a problem and every valuation looked incomplete, which in turn suppressed the §65
+    // verdict even for a perfectly priceable portfolio.
+    const matters = (id: TokenId): boolean => held.size === 0 || held.has(id);
 
     for (const meta of this.options.whitelist.registry.list()) {
       // Wrapped native is not a strategy leg and has no wired USD source. Skipping it is correct; a
       // held wrapped-native balance still surfaces through the held-but-unpriced check.
       if (meta.kind === 'wrapped-native') continue;
+
+      // A stablecoin is priced by the stablecoin source, never by the stock reference provider: the
+      // latter answers the stock leg's NAV-versus-equity question and knows nothing about USDC.
+      if (meta.kind === 'stablecoin' && this.options.stablecoinPrice !== undefined) {
+        const stable = await this.options.stablecoinPrice(meta);
+        if (!stable.stale && stable.value !== null) {
+          prices.set(meta.id, stable.value);
+          continue;
+        }
+        if (matters(meta.id)) {
+          problems.push(
+            `${meta.symbol}: stablecoin price unavailable (${stable.source}) — NAV would exclude this ` +
+              'holding, so the valuation is incomplete rather than assuming 1.0',
+          );
+        }
+        continue;
+      }
 
       const reference = await this.options.referencePrice.getStockReferencePrice(meta.address);
       if (!reference.stale && reference.value !== null) {
@@ -161,14 +208,18 @@ export class PortfolioMonitor {
       // its depeg is precisely what must stay visible.
       const fallback = meta.isStockToken ? this.poolStockPrice(pool, meta) : null;
       if (fallback === null) {
-        problems.push(
-          `${meta.symbol}: no usable reference price (${reference.source}); a non-zero balance of it would understate NAV`,
-        );
+        if (matters(meta.id)) {
+          problems.push(
+            `${meta.symbol}: no usable reference price (${reference.source}); a non-zero balance of it would understate NAV`,
+          );
+        }
         continue;
       }
-      problems.push(
-        `${meta.symbol}: reference price unusable (${reference.source}); valued at the pool price $${fallback.toFixed(4)} instead`,
-      );
+      if (matters(meta.id)) {
+        problems.push(
+          `${meta.symbol}: reference price unusable (${reference.source}); valued at the pool price $${fallback.toFixed(4)} instead`,
+        );
+      }
       prices.set(meta.id, fallback);
     }
 
@@ -240,9 +291,15 @@ export class PortfolioMonitor {
    * incomplete NAV as unusable for decisions rather than as merely a smaller NAV.
    */
   async monitor(inputs: MonitorInputs): Promise<MonitorResult> {
-    const { prices, problems: priceProblems } = await this.buildPriceTable(inputs.pool);
-    const problems: string[] = [...priceProblems];
     const { balances, nativeBalanceWei } = await this.readWallet();
+    // Which tokens actually have a balance decides which missing prices matter, so the wallet is read
+    // first and the held set is passed into pricing.
+    const held = new Set<TokenId>();
+    for (const balance of balances) {
+      if (balance.ui !== 0n) held.add(balance.tokenId);
+    }
+    const { prices, problems: priceProblems } = await this.buildPriceTable(inputs.pool, held);
+    const problems: string[] = [...priceProblems];
 
     for (const balance of balances) {
       if (balance.ui !== 0n && !prices.has(balance.tokenId)) {
@@ -314,12 +371,17 @@ export class PortfolioMonitor {
 
     return {
       snapshot: result.snapshot,
-      drawdown: buildDrawdownState(
-        result.snapshot,
-        this.options.maxDrawdown,
-        inputs.now,
-        this.options.windowSeconds ?? 300,
-      ),
+      // §65 is only assessed on a COMPLETE valuation: an unpriced leg makes `totalNAV` a floor, so a
+      // breach verdict derived from it would be a claim about a number we know is wrong.
+      drawdown:
+        problems.length === 0
+          ? buildDrawdownState(
+              result.snapshot,
+              this.options.maxDrawdown,
+              inputs.now,
+              this.options.windowSeconds ?? 300,
+            )
+          : null,
       complete: problems.length === 0,
       problems: dedupe(problems),
     };

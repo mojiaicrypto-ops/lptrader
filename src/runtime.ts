@@ -193,6 +193,10 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
     positionReader,
     referencePrice,
     whitelist: config.whitelist,
+    // Stablecoins are priced from Binance's own stablecoin pair (e.g. `USDCUSDT`), NOT from the stock
+    // reference provider — that provider answers the stock leg's NAV-versus-equity question and returns
+    // nothing for USDC, which previously zeroed the whole reserve and tripped §66 on a healthy wallet.
+    stablecoinPrice: createStablecoinPricer(env),
     maxDrawdown: config.risk.maxDrawdown,
     windowSeconds: config.monitor.portfolioIntervalMinutes * 60,
     ...(env['STRATEGY_WALLET_ADDRESS'] === undefined || env['STRATEGY_WALLET_ADDRESS'] === ''
@@ -349,3 +353,56 @@ export function renderStatus(runtime: StrategyRuntime, at: IsoTimestamp): string
 export async function inspectKeystore(path: string): Promise<void> {
   await readKeystoreFile(path);
 }
+
+/**
+ * USD price for a stablecoin, from Binance's `SYMBOLUSDT` spot ticker.
+ *
+ * `/api/v3/ticker/price?symbol=USDCUSDT` is the natural source: same venue as the stock leg, no key, and
+ * it prices the peg against USDT rather than assuming par. USDT is the quote currency of every pair, so
+ * its own value follows from the quoting convention rather than from an assumption about the peg.
+ *
+ * A failure returns `stale`, so the valuation is reported incomplete instead of quietly treating an
+ * unpriced stablecoin as par — assuming par is exactly what would hide a depeg (§58).
+ */
+export function createStablecoinPricer(env: NodeJS.ProcessEnv = process.env) {
+  const base = env['BINANCE_SPOT_BASE_URL'] ?? 'https://api.binance.com';
+  return async (token: { readonly symbol: string }): Promise<{
+    readonly value: number | null;
+    readonly source: 'binance-spot' | 'unavailable';
+    readonly asOf: string;
+    readonly stale: boolean;
+  }> => {
+    const symbols = USD_STABLECOIN_PAIRS[token.symbol.toUpperCase()];
+    const asOf = new Date().toISOString();
+    if (symbols === undefined) {
+      return { value: null, source: 'unavailable', asOf, stale: true };
+    }
+    if (symbols.length === 0) {
+      // USDT is the quote side of every pair, so its USD value is 1 by construction of the convention.
+      return { value: 1, source: 'binance-spot', asOf, stale: false };
+    }
+    for (const symbol of symbols) {
+      try {
+        const response = await fetch(`${base}/api/v3/ticker/price?symbol=${symbol}`);
+        if (!response.ok) continue;
+        const body = (await response.json()) as { price?: string };
+        const price = Number(body.price);
+        if (Number.isFinite(price) && price > 0) {
+          return { value: price, source: 'binance-spot', asOf, stale: false };
+        }
+      } catch {
+        // Fall through to the next candidate symbol; a network failure must never become a price.
+      }
+    }
+    return { value: null, source: 'unavailable', asOf, stale: true };
+  };
+}
+
+/**
+ * Stablecoin → Binance pairs that price it against USDT. An empty list means the token IS the quote
+ * currency (USDT), so its USD value follows from the quoting convention.
+ */
+const USD_STABLECOIN_PAIRS: Readonly<Record<string, readonly string[]>> = {
+  USDC: ['USDCUSDT'],
+  USDT: [],
+};

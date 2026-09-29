@@ -29,6 +29,9 @@
 | KI-22 | P1 | **resolved** | ~~§42 原子建仓路径把真实 txHash 记在派生的 `key#add` 行上，**主行的 `idempotencyKey` 永远停在 `CREATED` 且无 hash**~~。后果：① `findUnresolved()` 永久返回一条**无法用链上查询解决**的幽灵记录（没有 hash 可查）；② 审计轨迹声称「建仓未发出」，而实际交易已确认；③ 主行的 `tx_hash` 因 UNIQUE 约束永远无法补记。**已修复**：原子路径（一笔交易）把 hash 记在**主键**上（`markSubmitted(primaryKey, hash)`），两笔路径的 swap 记主键、mint 记 `addKey()` 派生键；`addKey()` 收敛为唯一派生点。回归测试：原子建仓后主行 `SUBMITTED` + hash 正确 + `findUnresolved()` 为空 + 链上观测可解决。 | 独立评审（ReviewCorrectness 探针） | §42 / §98 |
 | KI-23 | P1 | **resolved** | ~~§98 重试路径不可用：intent 一律以 `attempt: 1` 记录，而 `TxStore.record` 对重复 `(key, attempt)` **返回既有行不变** → REVERTED 后的重试其新交易**无处记录**，随后 `markSubmitted` 因该行已是 REVERTED（非 CREATED/UNKNOWN）而抛 `invalid_transition`。~~ **已修复**：新增 `recordIntent()`，`attempt` 由 store 推导（首次 1，确定性失败后 `latest.attempt + 1`）；第二腿同理。回归测试：REVERTED 后重试 → attempts `[1,2]`、attempt 2 带新 hash 且为 `SUBMITTED`；同时**保留**「前次未解决时拒绝开新 attempt」（边界负向测试，防止修复破坏幂等）。 | 独立评审（ReviewCorrectness 探针） | §97 / §98 |
 
+| KI-24 | P1 | **resolved** | ~~组合监控用**股票**参考价源给**稳定币**定价（类别错误：`ReferencePriceProvider` 只认 bStock ticker，对 USDC/USDT 必然返回不可用）→ 预留资金计价为 0 → `totalNAV = 0` → §66 风控线判定 `breached: true` → **健康组合被当成全额亏损而立即 GLOBAL_RISK_OFF 停机**~~。且 `buildPriceTable` 对**白名单每一个**未定价 token 都记问题（与持仓无关）→ 任何组合都永远 `complete=false`。**实测**：修复前 `complete=false / totalNAV=0 / breached=true`。**已修复**：① 新增 `PortfolioMonitor` 的 `stablecoinPrice` 依赖（runtime 接 Binance `USDCUSDT` spot，USDT 因是报价币按约定为 1）；② **估值不完整时 `drawdown` 返回 `null`**（既非 safe 也非 breached，因为此时 `totalNAV` 只是下界）；③ 未定价问题只对**实际持仓非零**的 token 报告。修复后同一场景：`complete=true / totalNAV=3001.11 / problems=[]`。回归测试 4 条（不完整 → `drawdown` 为 null；稳定币专用源计价；源不可用不假设 1.0；完整估值仍能报出真实 breach）。 | 独立评审（ReviewFailClosed 探针） | §5 / §65 / §96 |
+| KI-25 | P1 | **resolved** | ~~实测缺陷：原子建仓把 hash 记在派生键（KI-22）与重试 attempt 固定为 1（KI-23）—— 见上两条。~~ | 独立评审 | §42 / §97 / §98 |
+
 ## 已登记待处理（Onboarding 阶段产生）
 
 > 以下为待 Phase 3 实现前必须收敛的**已知缺口**，不是缺陷：
