@@ -122,18 +122,24 @@ plan:
   approval: pending
 ```
 
-## 本 Plan 需要用户显式确认的点
+## 本 Plan 的确认结论（2026-09-29，用户裁定）
 
-**产品行为 / 范围类（必须显式确认）：**
+| # | 议题 | 裁定 | 影响 |
+|---|---|---|---|
+| D3 | 执行授权模式 | **Mode 1：代码写好后直接实盘**（不做 Phase A/B 拆分） | 安全护栏不因此放松：白名单为空拒绝建仓；每笔交易前 §95 校验；Fail Closed 保持。首次真实建仓仍走人工确认（见 D4） |
+| D4 | 资金规模与人工闸门 | **首次将资金放入池子（BUILD_POSITION）需确认；换池（SWITCH_POOL）需确认；其余自动操作（collect / 风控退出 / 暂停）不需确认。确认与推送通过真实 Telegram 机器人完成，且机器人需支持查询。** | 新增 **T13：Approval Gate + Telegram 双向机器人**；`Notifier` 成为硬依赖 |
+| C3 | `RangeProgress` 口径 | **按基线 §49 字面公式**（`(Current−Lower)/(Upper−Lower)`），**仅驱动 BOUNDARY_WATCH 告警，不参与任何交易决策** | 无需改基线；对称口径的计算不实现 |
+| C1 | 池选择 | **扫描白名单安全交叉集**；实际候选为 Uniswap V3 QQQB/USDC 与 PancakeSwap V3 QQQB/USDT，由硬性过滤 + 排序决定 | 不写死单一组合；Registry 与 Scanner 按 §13 唯一标识 |
 
-1. **D3 — 授权模式**：基线 §91 允许自动 `Add Liquidity` / `Remove Liquidity` / `Collect Fees` / `Switch Approved Pool`。
-   本迭代采用 **Mode 2 分阶段**：Phase A 全只读+dry-run（本 Plan 的 T1–T12 全部可交付），**主网真实发送交易**在 Phase B 单独开关、需显式确认、且有金额上限与 dry-run 前置。请确认此分阶段是否接受。
-2. **D4 — 首期仓位规模与人工闸门**：建议主网首笔按基线 §103 Stage 1 的 **$500** 起步（而非一次 $7,000），并要求每笔真实交易前人工确认。请确认金额与"每笔确认 vs 首次确认后自动"。
-3. **C3 — `RangeProgress` 口径**（见 `docs/product/scope-corrections.md`）：采用基线 §49 字面公式（仅告警）还是改用对称比例口径（同时用于告警与 Dashboard）。基线未明确，需裁定。
-4. **C1 — 池组合**：确认按「扫描白名单安全交叉集」执行（即可能选中 QQQB/USDT @ PancakeSwap V3 `0xe531fcb1…`，而非写死 QQQB/USDC），而非只在 Uniswap V3 的 QQQB/USDC 上跑。
+**范围澄清（不需用户再确认，按基线执行）**：用户提到"自动调仓不需要确认"—— 这是**确认策略**（哪些动作要人工点头），不是**范围授权**。基线 §48 明确禁止 V1 的 Mid-Range Rebalance，§31 把仓位调整限定在换池与风险退出路径。因此："不需确认的自动操作" = `Collect Fees`、`Remove Liquidity`（风险/出界路径）、`GLOBAL_RISK_OFF` 相关动作；**不包含**"价格偏离中心就重新居中"。若确需放开 §48，属产品范围变更，需另行显式确认。
 
-**纯技术执行类（一轮无异议即确认）：**
-T1–T12 的技术选型（viem 2.37.13 对齐、Pancake 官方 SDK + Uniswap 侧自实现数学、三层数据源、SQLite、vitest）。
+## 新增任务 T13（因 D4）
+
+| id | owner | change | paths | verify |
+|---|---|---|---|---|
+| T13 | dev | **Approval Gate + Telegram 双向机器人**：① `ApprovalGate`（SQLite 持久化的 pending 队列、TTL 过期、approved/rejected 状态机、幂等键绑定执行动作）；② Telegram bot 长轮询（`getUpdates`），支持 `/status`、`/position`、`/pools`、`/nav`、`/risk` 查询命令，以及内联按钮 **Approve / Reject**；③ `Notifier` 实现（三级告警推送）；④ 只允许 `TELEGRAM_ALLOWED_USER_IDS` 白名单内的用户确认，其余拒绝；⑤ 落 `DecisionLog`。**默认 `TELEGRAM_ENABLED=false`（fail closed）：未配置 token 时 BUILD_POSITION / SWITCH_POOL 一律不执行。** | `src/notify/telegram.ts`, `src/execution/approvalGate.ts`, `tests/notify/**`, `tests/execution/approvalGate.test.ts` | `npm test -- approvalGate`, `wiring: 无 token 时建仓被拒`（真实 TG 联调由用户提供 token 后单独验证） |
+
+**为什么 T13 的 fail-closed 是必须的**：D4 把"建仓/换池"的执行条件绑定到 Telegram 确认。若 Telegram 不可达而系统仍能建仓，则等于承认一个可被沉默绕过的确认门 → 与 §96 Fail Closed 冲突。因此"Telegram 不可用时 = 不建仓、不换池"，而不是"降级为自动执行"。
 
 ## 附：为什么首期覆盖 §108 全清单而不是先做 Phase 1
 

@@ -9,7 +9,7 @@
 |---|---|---|---|
 | 1 | 风险面 | 链上资金 / 签名交易；密钥以启动口令派生密钥加密存储 | 用户作答 |
 | 2 | 技术栈 | TypeScript / Node（viem + Uniswap/Pancake V3 SDK 生态） | 用户作答；与基线 §81–§84 的 TS 接口定义一致 |
-| 3 | 首期范围 | **直接 Phase 3 起**：单池实盘 QQQB / USDC | 用户作答（偏离基线 §109 的 Phase 1→2→3 推荐顺序） |
+| 3 | 首期范围 | **直接 Phase 3 起**：单池实盘 QQQB / USDC | 用户作答（偏离基线 §109 的 Phase 1→2→3 推荐顺序）。**执行授权与确认闸门见 `D2-execution-and-approvals.md`**（后续补充：Mode 1 直接实盘 + Telegram 确认门）。 |
 | 4 | Plan 确认节奏 | 技术执行一轮无异议即确认；产品/规则/范围变更显式确认 | 用户作答（skill 默认） |
 | 5 | 密钥方案 | 启动时输入 passphrase，私钥 AES 加密落盘；私钥生成加密用该 key | 用户作答 |
 | 6 | 编号 / 归档 | `D<序号>`；`docs/archive/tasks/<date>-D<n>/` | onboarding 默认 |
