@@ -1,44 +1,103 @@
 # Iteration 1 验收映射（§108 → 实现 → 证据）
 
-> §108 的每一条必须在 **Test 阶段以运行证据** 关闭，不以"代码写了"替代。
-> 状态列：`pending` / `passed` / `not-covered`（须登记 known-issues）/ `blocked`。
+> §108 的每一条必须以 **运行证据** 关闭，不以"代码写了"替代。
+> 状态：`passed` = 有可复现的运行证据；`partial` = 部分有证据；`not-covered`（须登记 known-issues）/ `blocked`。
+> 证据文件在 `docs/research/evidence-*.txt|md`；测试用 `npx vitest run <path>` 复现。
 
-| §108 分组 | 验收项 | 实现位置 | 证据形式 | 状态 |
-|---|---|---|---|---|
-| Portfolio | 正确读取钱包余额 | T4/T5 | 只读冒烟脚本输出 vs 链上/浏览器 | pending |
-| Portfolio | 正确读取 LP Position | T5 | 只读冒烟：`positions(tokenId)` + `balanceOf` | pending |
-| Portfolio | 正确读取未领取 Fee | T5 | 只读冒烟：`positions()` 的 tokensOwed | pending |
-| Portfolio | 正确计算 NAV | T12 | 单测 + 冒烟：总和 = 钱包 + LP 估值 + 未领取 fee + realized | pending |
-| Portfolio | 正确计算 Reserve Ratio | T12 | 单测（边界：恰好 30% / 25% / 20%） | pending |
-| Pool Scanner | 正确读取池 TVL | T6 | 三层数据源交叉 + RPC reserve 校验 | pending |
-| Pool Scanner | 正确读取 24h Volume | T6 | GeckoTerminal 实测 | pending |
-| Pool Scanner | 正确读取 7D Volume | T6 | DexPaprika `volume_usd_7d` | pending |
-| Pool Scanner | 正确读取 Fee Tier | T6 | RPC `fee()` 为真值（DexPaprika `fee` 为 null） | pending |
-| Pool Scanner | 正确读取 Active Liquidity | T5/T6 | RPC `liquidity()`（无免费 API 可替代） | pending |
-| Pool Filter | TVL / Volume / Token 白名单 / Stablecoin 白名单 / DEX 白名单 / NAV Deviation | T6 | 单测：各过滤器单独 + 组合；边界值（== 阈值） | pending |
-| Position Planning | 正确计算 Upper / Lower | T8 | 单测：`×0.85 / ×1.16` 精确值 | pending |
-| Position Planning | Tick 对齐 | T8 | 单测：非对齐输入 → 对齐到 `tickSpacing` 整数倍；断言 `Position` 不抛 | pending |
-| Position Planning | 正确计算 Token0 / Token1 Optimal Ratio | T8 | 单测：与 Pancake SDK `Position.fromAmounts` 交叉对账（同输入同输出） | pending |
-| Position Planning | 正确计算 Swap Amount | T8 | 单测：**反例断言** —— 固定 50/50 会偏离最优（证明不采用 §35 错误方案） | pending |
-| Swap | Quote | T9 | QuoterV2 只读调用 | pending |
-| Swap | Slippage Check | T9 | 单测：超 0.3% 拒绝 | pending |
-| Swap | Price Impact Check | T9 | 单测：超 0.5% 拒绝建仓；超 1% 标记 Liquidity Risk | pending |
-| Swap | Deadline | T9 | calldata 含 deadline/previousBlockhash 断言 | pending |
-| Swap | Balance Verification | T9 | 单测 + 冒烟：swap 前后余额差 == amountOut | pending |
-| LP | Add Liquidity / Position Verification | T9 | dry-run calldata 断言 + 主网确认后链上验证 | pending |
-| LP | Collect Fee | T9 | 单测条件触发（≥$100 或 30 天） | pending |
-| LP | Remove Liquidity | T9 | dry-run calldata 断言 | pending |
-| Risk | Peg Warning | T10 | 单测：0.99/1.01/1.02/1.03/1.05 边界五档 | pending |
-| Risk | Global Drawdown | T10 | 单测：NAV 恰好 = 85% 时触发（含 `<=` 边界） | pending |
-| Risk | TVL Collapse | T10 | 单测：50% / 70% 两级 | pending |
-| Risk | Out Of Range | T10 | 单测：`price >= upper` / `price <= lower` / 边界相等 | pending |
-| Risk | Emergency Pause | T10 | 单测：8 类 emergency 条件各触发 | pending |
-| Switching | Detect Underperformance | — | **out of scope（Phase 5）** → known-issues | pending |
-| Switching | Search Alternative / Compare APR / Calculate Switching Cost / Break Even Days / Cooldown Enforcement | T13 的门 + T10 | **部分**：确认门与 cooldown 状态存储在本迭代；换池决策逻辑属 Phase 5 | pending |
-| （补充）| Telegram 确认门 fail-closed（无 token → 不建仓） | T13 | 单测 | pending |
-| （补充）| 密钥：错误 passphrase 硬失败、密文不落日志 | T3 | 单测 | pending |
-| （补充）| 交易状态 UNKNOWN 不自动重发 | T11 | 单测：UNKNOWN 状态下 re-execute 被拒 | pending |
+## Portfolio（§108）
 
-## 说明
+| 验收项 | 实现 | 证据 | 状态 |
+|---|---|---|---|
+| 正确读取钱包余额 | `chain/tokenReader.ts` | `scripts/smoke-read.ts` 真实 RPC 输出（`docs/research/evidence-smoke-read-20260929.txt`）；`tests/chain/tokenReader.test.ts` | passed |
+| 正确读取 LP Position | `chain/positionReader.ts` | `tests/chain/positionAndTx.test.ts`（`positions()`/`ownerOf`/枚举）；smoke-read 的 (c) 段（需 `STRATEGY_WALLET_ADDRESS` + `LP_POSITION_TOKEN_ID`） | partial（真实仓位待用户提供地址/ tokenId） |
+| 正确读取未领取 Fee | `chain/positionReader.ts` (`tokensOwed0/1`) | `tests/chain/positionAndTx.test.ts`；`tests/execution/portfolioMonitor.test.ts`（fee 计入 NAV） | passed |
+| 正确计算 NAV | `strategy/nav.ts` + `execution/portfolioMonitor.ts` | `tests/strategy/nav.test.ts`（25）；`tests/execution/portfolioMonitor.test.ts`（16，含「不重复计 realizedFees」与「未计价 → complete=false」） | passed |
+| 正确计算 Reserve Ratio | `strategy/nav.ts` | `tests/strategy/nav.test.ts`（含 0 NAV 不除零）；`tests/strategy/riskManager.test.ts`（§60 阈值 0.25/0.30 边界） | passed |
 
-- **Switching 组**在 §108 中要求完整换池能力，但用户在 D1 选择 Iteration 1 = Phase 3（单池），自动换池属基线 Phase 5。本迭代只交付 **确认门 + cooldown 存储**，不交付换池决策。这是**经用户确认的范围裁剪**（D1 表格第 3 行），不是静默缩小。剩余条目已登记 `docs/known-issues.md`。
+## Pool Scanner（§108）
+
+| 验收项 | 实现 | 证据 | 状态 |
+|---|---|---|---|
+| 正确读取池 TVL | `data/poolDataProvider.ts` | 真实扫描：QQQB/USDC $1,783,477.88、QQQB/USDT $623,813.64，与调研 §4.1 一致（sanity check 两行 OK） | passed |
+| 正确读取 24h Volume | 同上 | 同上（QQQB/USDT $6,305,798.33） | passed |
+| 正确读取 7D Volume | 同上（DexPaprika） | 同上（QQQB/USDT $35,549,575.5 @ dexpaprika） | passed |
+| 正确读取 Fee Tier | `data/poolScanner.ts` + RPC 真值 | 真实扫描 fee 100/2500/3000 与调研一致；DexPaprika `fee: null` 不误判（`tests/data/poolScanner.test.ts`） | passed |
+| 正确读取 Active Liquidity | `chain/poolReader.ts`（RPC） | 真实扫描 `activeLiquidity 1511306225692084162659627`；无免费 API 可替代（KI-4） | passed |
+| **额外**：区分「不存在」与「读不到」 | `data/poolScanner.ts` | 真实扫描 27+ 条 proven-absent、0 条 unverifiable；`tests/data/poolScanner.test.ts` 覆盖 HTTP 500 ≠ absent | passed |
+
+## Pool Filter（§108）
+
+| 验收项 | 实现 | 证据 | 状态 |
+|---|---|---|---|
+| TVL Filter | `data/poolFilter.ts` | `tests/data/poolFilter.test.ts`（40 tests，每条含**恰好等于阈值**用例） | passed |
+| Volume Filter | 同上 | 同上（关键：用 **7D 均日量**而非 7D 总量，已专测） | passed |
+| Token Whitelist | 同上（地址层） | 同上（同名冒充地址 `0xb904108b…` 被拒） | passed |
+| Stablecoin Whitelist | 同上 | 同上 | passed |
+| DEX Whitelist | 同上 | 同上（仅白名单 Uniswap 时 Pancake 池被拒） | passed |
+| NAV Deviation Filter | 同上 | 同上（**严格小于**：恰好 0.01 淘汰） | passed |
+| **额外**：fail closed | 同上 | stale/unavailable 字段各自 `*_UNAVAILABLE` 且无 `*_BELOW_MINIMUM`；`decisive=false` 上报 | passed |
+
+## Position Planning（§108）
+
+| 验收项 | 实现 | 证据 | 状态 |
+|---|---|---|---|
+| 正确计算 Upper / Lower | `strategy/positionPlanner.ts` | `tests/strategy/positionPlanner.test.ts`（36；`700×0.85=595` / `×1.16=812`，并从 config 读比率） | passed |
+| Tick 对齐 | 同上 | 同上（Pancake 1/10/50/200、Uniswap 含 60；断言 `%spacing===0`；跨表混用被拒） | passed |
+| 正确计算 Token0/Token1 Optimal Ratio | 同上 | 同上（**与 SDK `Position.amount0/amount1` 逐 wei 相等，diff 0**；L 相对差 1.94e-19 且不超过 SDK） | passed |
+| 正确计算 Swap Amount | 同上 + `strategy/swapPlanner.ts` | 同上（反例：默认区间下最优 $3346.14 vs 固定 50/50 $3500，偏差 4.60%；更宽区间 15.35%）；`tests/strategy/swapPlanner.test.ts` | passed |
+
+## Swap（§108）
+
+| 验收项 | 实现 | 证据 | 状态 |
+|---|---|---|---|
+| Quote | `dex/pancakeV3.ts`、`dex/uniswapV3.ts` | `scripts/smoke-quote.ts`（真实 QuoterV2） | blocked（适配器在飞行中） |
+| Slippage Check | `strategy/swapPlanner.ts` | `tests/strategy/swapPlanner.test.ts`（>0.3% 拒绝；恰好 0.3% 通过） | passed |
+| Price Impact Check | `strategy/swapPlanner.ts`（**本地自算**） | 同上（>0.5% 拒绝；恰好 0.5% 通过；>1% 标记 liquidity risk；池方向反转正确） | passed |
+| Deadline | `dex/*`（calldata 断言） | 待适配器 | blocked |
+| Balance Verification | `dex/*` + `execution/positionExecutor.ts` | 待适配器 | blocked |
+
+## LP（§108）
+
+| 验收项 | 实现 | 证据 | 状态 |
+|---|---|---|---|
+| Add Liquidity / Position Verification | `dex/*` + `positionExecutor.ts` | `tests/execution/positionExecutor.test.ts`（22）验证执行编排；calldata 待适配器 | partial |
+| Collect Fee | `positionExecutor.ts` | 同上（条件触发、无需人工确认、halted 时被拒） | partial |
+| Remove Liquidity | 同上 | 同上（RISK_REVIEW 下自动退出） | partial |
+
+## Risk（§108）
+
+| 验收项 | 实现 | 证据 | 状态 |
+|---|---|---|---|
+| Peg Warning | `strategy/riskManager.ts` | `tests/strategy/riskManager.test.ts`（78；五档边界精确：0.01/0.02/0.03/0.05） | passed |
+| Global Drawdown | 同上 | 同上（NAV 恰好 8500 → breached，含 `<=`；8500.01 不触发） | passed |
+| TVL Collapse | 同上 | 同上（50%/70% 两级；无历史 → `insufficient-data` 而非默认安全） | passed |
+| Out Of Range | 同上 | 同上（`>=upper` / `<=lower` 边界相等） | passed |
+| Emergency Pause | 同上 | 同上（9 类条件逐个可触发） | passed |
+| **额外**：闭市脱锚只报警 | 同上（§57） | 同上（`closed` + 6%/20%/90% deviation → 仅 critical 告警，`hardExitPermitted=false`） | passed |
+| **额外**：下跌但 NAV 同步 → HOLD | 同上（§53） | 同上 | passed |
+
+## Switching（§108）
+
+| 验收项 | 状态 |
+|---|---|
+| Detect Underperformance / Search Alternative / Compare APR / Calculate Switching Cost / Break Even Days | **not-covered**（基线 Phase 5，Iteration 1 范围外 —— 经用户确认的裁剪，见 KI-11） |
+| **额外**：Cooldown 字段持久化 + 确认门 | partial（`Position.cooldownUntil` 与 `ApprovalGate` 已实现；换池决策不在本迭代） |
+
+## 安全与执行（非 §108 但为硬要求）
+
+| 验收项 | 证据 | 状态 |
+|---|---|---|
+| §95 交易前置校验 | `tests/chain/positionAndTx.test.ts`；`tests/execution/positionExecutor.test.ts`（guard.ok=false → 零编码零发送，且**先于**征求人工确认） | passed |
+| §96 Fail Closed | 执行器 + 过滤器 + 参考价 + 扫描器各自 fail-closed 专测 | passed |
+| §97 幂等 | `tests/execution/positionExecutor.test.ts`（同 key 第二次 → `ALREADY_EXECUTED`，adapter 不再被调用）；`tests/store/store.test.ts` | passed |
+| §98 交易状态机 UNKNOWN 不重发 | `tests/chain/positionAndTx.test.ts`；`tests/store/store.test.ts`（`findUnresolved` + `TxBlockedError`）；smoke 实测 | passed |
+| 私钥不入源码/日志/git | `tests/security/keystore.test.ts`（19；错误 passphrase 硬失败且异常不含密钥/passphrase 片段） | passed |
+| Telegram 确认门 fail-closed | `tests/notify/telegram.test.ts`（26）+ `tests/execution/approvalGate.test.ts`（29）；无 token → `noopNotifier` → build/switch 不可能 | passed |
+| §42 原子建仓全有或全无 | `tests/execution/positionExecutor.test.ts`（atomic 路径恰好 1 笔发送；atomic 抛错**不**回退两笔） | passed（编码待适配器） |
+| 调度不重叠 | `tests/execution/scheduler.test.ts`（13） | passed |
+
+## 未关闭项汇总
+
+- **Swap/LP 组的 calldata 级证据**等 `src/dex/**` 落地（当前 `blocked`，非失败）。
+- **真实 LP 仓位读数**需用户提供 `STRATEGY_WALLET_ADDRESS` + `LP_POSITION_TOKEN_ID`（当前无实盘仓位，属正常）。
+- Switching 组按 D1 范围裁剪，已登记 KI-11。
