@@ -2,7 +2,7 @@
   "name": "lptrader",
   "version": "0.1.0",
   "private": true,
-  "description": "Tokenized Stock LP Auto Strategy \u2014 BNB Chain CLMM LP automation (Phase 3: single pool)",
+  "description": "Tokenized Stock LP Auto Strategy — BNB Chain CLMM LP automation (Phase 3: single pool)",
   "type": "module",
   "engines": {
     "node": ">=22.6.0"
@@ -14,7 +14,11 @@
     "test:watch": "vitest",
     "dev": "node --experimental-strip-types --env-file-if-exists=.env src/main.ts",
     "keystore:init": "node --experimental-strip-types --env-file-if-exists=.env scripts/keystore-init.ts",
-    "telegram:check": "node --experimental-strip-types --env-file-if-exists=.env scripts/telegram-check.ts"
+    "telegram:check": "node --experimental-strip-types --env-file-if-exists=.env scripts/telegram-check.ts",
+    "smoke:read": "node --experimental-strip-types --env-file-if-exists=.env scripts/smoke-read.ts",
+    "smoke:scan": "node --experimental-strip-types --env-file-if-exists=.env scripts/smoke-scan.ts",
+    "smoke:quote": "node --experimental-strip-types --env-file-if-exists=.env scripts/smoke-quote.ts",
+    "dry-run:build": "node --experimental-strip-types --env-file-if-exists=.env scripts/dry-run-build.ts"
   },
   "dependencies": {
     "@pancakeswap/chains": "0.10.0",

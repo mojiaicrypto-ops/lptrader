@@ -164,8 +164,15 @@ for (const entry of candidates) {
   const token1 = config.whitelist.registry.requireTokenByAddress(56, pool.token1);
 
   heading('  position plan (§33-§38)');
+  // ONE price read, reused by the plan and by the independent impact cross-check below.
+  //
+  // Re-reading it would compare two different blocks: BSC produces a block every ~0.75s, the pool mid
+  // moves, and the "agreement" check would report a spurious difference caused by the script rather
+  // than by either implementation — the same class of mistake as KI-19. The adapter's own quote and a
+  // recomputation from THIS snapshot are the only pair that can legitimately be compared.
+  const poolPrice = await adapter.getPoolPrice(pool.poolAddress);
   const plan = planPosition({
-    pool: await adapter.getPoolPrice(pool.poolAddress),
+    pool: poolPrice,
     token0,
     token1,
     capitalUsd: capitalUsd * config.capital.maxLpRatio,
@@ -214,7 +221,7 @@ for (const entry of candidates) {
   // Independent recomputation. Two implementations that disagree mean one is wrong, which is precisely
   // the case the §40 gate must not be trusting.
   const independent = computePriceImpact({
-    pool: await adapter.getPoolPrice(pool.poolAddress),
+    pool: poolPrice,
     tokenIn: quote.tokenIn,
     tokenOut: quote.tokenOut,
     amountInRaw: quote.amountInRaw,
@@ -243,13 +250,22 @@ for (const entry of candidates) {
   out('signable amountIn', intent.amountInRaw);
   out('signable amountOutMinimum', intent.amountOutMinimumRaw);
 
-  // The swap output must cover the token0 the position requires, or the mint under-funds. This is the
-  // check that catches a mis-scaled optimal-ratio solve before any money moves.
-  const produced = quote.tokenOut === token0.address ? quote.amountOutRaw : '';
-  if (produced !== '') {
-    const shortfall = plan.amount0 - quote.amountOutRaw;
-    out('position funding', shortfall > 0n ? `SHORT by ${shortfall} raw` : `covered (+${-shortfall} raw)`);
-  }
+  // Funding check: how the swap output compares with what the position needs.
+  //
+  // A SMALL shortfall is expected and harmless: the plan solves at the pool mid price, while the real
+  // swap pays the fee and moves the price, so the mint receives marginally less. The mint takes
+  // `L = min(L0, L1)` and does not require the full desired amount (§33). What would NOT be harmless is
+  // a large shortfall (a mis-scaled solve) or a large surplus (an over-sized swap), so both are
+  // reported as a percentage of the planned amount rather than as a bare number.
+  const boughtToken0 = quote.tokenOut.toLowerCase() === token0.address.toLowerCase();
+  const plannedRaw = boughtToken0 ? plan.amount0 : plan.amount1;
+  const plannedSymbol = boughtToken0 ? token0.symbol : token1.symbol;
+  const deltaRaw = quote.amountOutRaw - plannedRaw;
+  const fundingDeltaPct = Number((deltaRaw * 10_000n) / (plannedRaw === 0n ? 1n : plannedRaw)) / 100;
+  out(`shortfall/surplus (${plannedSymbol})`, `${fundingDeltaPct >= 0 ? '+' : ''}${fundingDeltaPct.toFixed(4)}% (${deltaRaw} raw)`);
+  out('funding verdict', Math.abs(fundingDeltaPct) <= 1
+    ? 'within 1% of the plan — expected (mid-price solve vs fee-paying swap)'
+    : 'OUTSIDE 1% — investigate the optimal-ratio solve before building');
 
   out('RESULT', gate.ok ? 'PASS — a live build would proceed to the approval gate' : 'REJECTED by the §40 gate');
   out('atomicity (§42)', adapter.supportsAtomicBuild

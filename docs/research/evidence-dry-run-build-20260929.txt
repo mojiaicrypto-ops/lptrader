@@ -1,0 +1,13 @@
+
+lptrader — dry-run build (nothing is signed or sent)
+----------------------------------------------------
+  config                           /Users/huyaohua/huyh/work/lptrader/config/strategy.yaml
+  capital (USD)                    7000.00
+  LP capital (max)                 4900.00
+  range ratios (§33)               0.85 → 1.16
+  max slippage (§40)               0.30%
+  max price impact (§40)           0.50%
+  signer attached                  no (read-only run)
+
+pool discovery + §16 hard filter (live data)
+--------------------------------------------
