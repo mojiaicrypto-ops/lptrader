@@ -14,6 +14,7 @@
  * Doing the `assertWhitelisted()` in the factory means a non-whitelisted DEX cannot be constructed at
  * all, rather than being caught later by whichever call happened to remember (§12).
  */
+import type { BscChainAdapter } from '../chain/adapter.ts';
 import type { DexAdapter } from '../types/adapters.ts';
 import type { ChainId, DexId } from '../types/primitives.ts';
 import type { Whitelist } from '../types/registry.ts';
@@ -51,6 +52,19 @@ export function feeTiersFor(dex: DexId): readonly number[] {
 export interface DexAdapterFactoryOptions {
   readonly chainId: ChainId;
   readonly whitelist: Whitelist;
+  /**
+   * The chain layer the adapter reads and writes through.
+   *
+   * Required, and deliberately NOT optional: every read and the one write path go through
+   * `src/chain/**`, and the swap recipient comes from `chain.getSignerAddress()`. An adapter that
+   * constructed its own `BscChainAdapter` would silently be signer-less in production while looking
+   * correct in tests — so the chain is injected once, by the runtime, and never re-created.
+   */
+  readonly chain: BscChainAdapter;
+  /** §40 slippage tolerance for quotes this adapter produces; defaults to the §40 value. */
+  readonly slippageTolerance?: number;
+  /** Injectable clock so `expiresAt` and quote freshness are deterministic under test. */
+  readonly now?: () => Date;
 }
 
 /**
