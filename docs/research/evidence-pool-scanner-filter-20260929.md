@@ -84,3 +84,33 @@ SCAN COMPLETE: 0 blocker(s)
    **非零 tick/liquidity/真实价格**，与「Uniswap 选择器」一致 → `[INFERENCE]` 该文档注释很可能写反了；
    但结论仍需 T4/T5 拥有者做独立 selector 核对，未据此改动任何代码。
 2. `FetchHttpTransport` 原先无请求超时，会让 60 分钟 cadence 静默永久阻塞（已修，见 `DEFAULT_HTTP_TIMEOUT_MS`）。
+
+## 关键发现：§16 过滤在今日真实市场下的结果（2026-09-29）
+
+扫描白名单交叉集（5 个 auto-trade 股票代币 × 2 稳定币 × 2 DEX × 各自 fee tiers），**通过 §16 硬性过滤的只有 2 个池**：
+
+| 通过 | 池 | fee | TVL | $3500 impact | 7D 均日量 |
+|---|---|---|---|---|---|
+| ✅ | QQQB/USDT @ PancakeSwap V3 `0xe531fcb1…` | 100 | $623,814 | 0.4201% | $5.08M |
+| ✅ | AAPLB/USDT @ PancakeSwap V3 `0xe9b9998b…` | 2500 | $597,259 | 0.3653% | $784k |
+
+**而此前记录的 QQQB/USDC @ Uniswap V3 `0xfc4e7724…` 被淘汰**：
+
+```
+[SWAP_IMPACT_EXCEEDED] $3500 swap price impact 0.6649% < 0.5000% → FAIL
+```
+
+TVL（$1.78M）与成交量均达标，**唯一淘汰原因是 §16 的 `$3500 换手价格影响 < 0.5%` 硬门槛**。
+
+### 为什么这值得记录（而非视为缺陷）
+
+- §16 的 `swapImpact3500USD` 门槛与 §110 的 `$7,000 LP / ~$3,180–3,500 建仓 swap` **尺度一致**——它测的正是本策略实际要下的一笔单。0.5% 的上限是 §40 的设计意图，不是抬得过高的偶然。
+- 因此「Uniswap 的 QQQB/USDC 池在 $7,000 规模下**无法在不超限滑点的情况下建仓**」是一个**真实的风险信号**：该池流动性相对 §16 的要求偏薄（0.3% fee tier 的池子深度不足以承受这个单量）。
+- 结论：**在 §110 的资金规模下，可执行的 QQQB 池只有 PancakeSwap V3 的 QQQB/USDT（fee 100）**。这加强了「PancakeSwap 必需」而非可选——它同时还是唯一支持 §42 原子建仓的 DEX。
+- 若用户希望把 Uniswap 池纳入，需放宽 §110 的资金规模或 §16/$40 的 impact 门槛，两者都是**产品参数变更**，须显式确认。
+
+### 扫描完整性
+
+- `complete: true`，0 blocker；`decisive: false`（部分淘汰来自数据缺失，非池子本身不合格）→ runtime 会据此发 warning，符合 §96。
+- 「已证明不存在」（factory 返回零地址）与「无法验证」（数据源失败）被明确区分，共 27+ 条 proven-absent，0 条 unverifiable。
+- 一处 degraded：DexPaprika 对 QQQB 的池搜索在 2 页后被截断，可能缺少低流动性池的 7d/30d 量。
