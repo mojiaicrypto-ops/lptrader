@@ -11,3 +11,60 @@ lptrader — dry-run build (nothing is signed or sent)
 
 pool discovery + §16 hard filter (live data)
 --------------------------------------------
+  scan complete                    true
+  pools discovered                 11
+  passed §16                       2
+  rejected                         9
+  decisive                         false (false ⇒ some rejection came from missing data)
+    PASS                           56:pancakeswap-v3:0xe531fcb1f5a195de7608b9f4f9518544c2cdb693 tvl $622933 impact 0.2289%
+    PASS                           56:pancakeswap-v3:0xe9b9998b2ec5430d2246c7f1f8d9f298c97d7365 tvl $538389 impact 0.2948%
+
+candidate 56:pancakeswap-v3:0xe531fcb1f5a195de7608b9f4f9518544c2cdb693
+----------------------------------------------------------------------
+  dex / feeTier                    pancakeswap-v3 / 100
+  tvl / vol24h                     $622933 / $6308706
+  tick / tickSpacing               66057 / 1
+  activeLiquidity                  1556463151563366171503721
+  price (§15)                      737.46624622
+  supportsAtomicBuild (§42)        true
+
+  position plan (§33-§38)
+-------------------------
+  lowerPrice / upperPrice          627.9203 / 856.9266
+  lowerTick / upperTick            64427 / 67536
+  ticks aligned (§34)              true
+  liquidity (L)                    1205910565605136539138
+  amount0 / amount1 (raw)          3171512133632417126 / 2558567887505407887430
+  value token0 USD                 2342.19
+  value token1 USD                 2557.81
+  value sum USD                    4900.00
+  rangeProgress (§49)              0.483871
+  optimal vs fixed 50/50           4.400% (2342.19 vs 2450.00)
+  swap needed (§38)                2342890563370248834912 raw
+
+  quote + §40/§41 gates
+------------------------
+  amountOutRaw                     3171019381893381966
+  amountInUsd                      2342.89
+  priceImpact (adapter)            0.015539%
+  slippageTolerance                0.3000%
+  amountOutMinimumRaw              3161506323747701820
+  ttl (s)                          30
+  route                            USDT/QQQB 0.01%
+  priceImpact (independent)        0.015539%
+  impact agreement                 exact
+  §40 gate ok                      true
+  signable amountIn                2342890563370248834912
+  signable amountOutMinimum        3161506323747701820
+  shortfall/surplus (QQQB)         -0.0100% (-492751739035160 raw)
+  funding verdict                  within 1% of the plan — expected (mid-price solve vs fee-paying swap)
+  RESULT                           PASS — a live build would proceed to the approval gate
+  atomicity (§42)                  single transaction (swap + mint combined)
+
+RESULT
+------------------------
+Nothing was signed, sent, or approved. A live build additionally requires:
+  1. an approved BUILD_POSITION request (D2), which needs Telegram reachable and a human answer;
+  2. a signer (keystore passphrase at startup);
+  3. the current bot state to permit a capital-committing write (§44/§66).
+exit=0

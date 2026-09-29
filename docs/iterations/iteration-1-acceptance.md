@@ -50,19 +50,19 @@
 
 | 验收项 | 实现 | 证据 | 状态 |
 |---|---|---|---|
-| Quote | `dex/pancakeV3.ts`、`dex/uniswapV3.ts` | `scripts/smoke-quote.ts`（真实 QuoterV2） | blocked（适配器在飞行中） |
+| Quote | `dex/pancakeV3.ts`、`dex/uniswapV3.ts` | `scripts/smoke-quote.ts` 真实输出：卖 1000 USDT → 1.355335 QQQB，impact 0.0123%，ttl 30s；`tests/dex/*`（97 tests） | passed |
 | Slippage Check | `strategy/swapPlanner.ts` | `tests/strategy/swapPlanner.test.ts`（>0.3% 拒绝；恰好 0.3% 通过） | passed |
 | Price Impact Check | `strategy/swapPlanner.ts`（**本地自算**） | 同上（>0.5% 拒绝；恰好 0.5% 通过；>1% 标记 liquidity risk；池方向反转正确） | passed |
-| Deadline | `dex/*`（calldata 断言） | 待适配器 | blocked |
-| Balance Verification | `dex/*` + `execution/positionExecutor.ts` | 待适配器 | blocked |
+| Deadline | `dex/*` | Pancake：`0x1f0464d1 multicall(bytes32,bytes[])`（`previousBlockhash` 变体，**字节码验证选择器存在于部署合约**）；Uniswap：NPM 无该重载 → 明确**拒绝**而非静默换成 timestamp（已测） | passed |
+| Balance Verification | `dex/*` + `execution/positionExecutor.ts` | `tests/dex/*` 的 guard 失败零发送断言；`scripts/dry-run-build.ts` 校验 swap 产出 vs 建仓所需（实测 −0.0100%，在 1% 内，属 mid 价求解 vs 付费成交的预期差） | passed |
 
 ## LP（§108）
 
 | 验收项 | 实现 | 证据 | 状态 |
 |---|---|---|---|
-| Add Liquidity / Position Verification | `dex/*` + `positionExecutor.ts` | `tests/execution/positionExecutor.test.ts`（22）验证执行编排；calldata 待适配器 | partial |
-| Collect Fee | `positionExecutor.ts` | 同上（条件触发、无需人工确认、halted 时被拒） | partial |
-| Remove Liquidity | 同上 | 同上（RISK_REVIEW 下自动退出） | partial |
+| Add Liquidity / Position Verification | `dex/*` + `positionExecutor.ts` | `tests/dex/pancakeV3.test.ts`：原子路径 outer selector `0x1f0464d1` + 7 条内层调用顺序（`exactInputSingle`→`pull`→`approve`→mint→sweep×2），**1509 字节** calldata，目标为 SmartRouter `0x13f4ea83…`；`tests/execution/positionExecutor.test.ts` 验证编排 | passed |
+| Collect Fee | `positionExecutor.ts` + `dex/*` | `tests/execution/positionExecutor.test.ts`（无需人工确认、halted 时被拒）；`tests/dex/*` collect calldata | partial（实盘 collect 待真实仓位） |
+| Remove Liquidity | 同上 | 同上（RISK_REVIEW 下自动退出）；Uniswap 侧 `burn > liquidity` 检查已测 | partial（实盘 remove 待真实仓位） |
 
 ## Risk（§108）
 
@@ -96,8 +96,26 @@
 | §42 原子建仓全有或全无 | `tests/execution/positionExecutor.test.ts`（atomic 路径恰好 1 笔发送；atomic 抛错**不**回退两笔） | passed（编码待适配器） |
 | 调度不重叠 | `tests/execution/scheduler.test.ts`（13） | passed |
 
+## 端到端 dry-run 证据（`docs/research/evidence-dry-run-build-20260929.txt`）
+
+`npm run dry-run:build -- 7000` 于真实链上数据跑完整决策链（扫描 → §16 过滤 → 计划 → 报价 → §40/§41 闸门），**不签名不发送**：
+
+```text
+§16 通过              2 个池（QQQB/USDT @ Pancake 0xe531…；AAPLB/USDT @ Pancake 0xe9b9…）
+LP 资本               4900.00（7000 × 0.70）
+lower/upperPrice      627.7164 / 856.6482   （= 735.21 × 0.85 / × 1.16）
+ticks                 [64424, 67533]，spacing 1，aligned true
+value sum USD         4900.00（精确）
+optimal vs 固定 50/50  4.400%（2342.19 vs 2450.00）→ §35 反证
+swap                  2344.08 USDT → 3.171471 QQQB
+priceImpact           0.016550%（适配器）vs 0.015541%（独立复算）→ **exact**
+§40 gate              ok
+funding               −0.0100%（在 1% 内，预期）
+atomicity             单笔（swap + mint 合并）
+```
+
 ## 未关闭项汇总
 
-- **Swap/LP 组的 calldata 级证据**等 `src/dex/**` 落地（当前 `blocked`，非失败）。
-- **真实 LP 仓位读数**需用户提供 `STRATEGY_WALLET_ADDRESS` + `LP_POSITION_TOKEN_ID`（当前无实盘仓位，属正常）。
+- **实盘仓位类证据**（真实 AUM 下的 collect / remove / 首次 build）需用户提供签名钱包与真实仓位 —— 属 D2 确认门的正常结果，非缺陷。
 - Switching 组按 D1 范围裁剪，已登记 KI-11。
+- KI-15（NAV 公式读法）与 KI-17/KI-18/KI-20 待用户/后续处理，已在 `docs/known-issues.md` 登记。
