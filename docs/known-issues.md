@@ -26,6 +26,9 @@
 | KI-20 | P3 | open | **同一次快照内的多字段读取未共享区块高度**：`PoolReader.readPool` 用 `Promise.all` 发起 6 个独立 `readContract`，每个各自固定一个（可能不同的）高度。窗口极小（BSC ~0.75s/块），但理论上会出现 `slot0` 来自块 N、`liquidity` 来自块 N+1 的不自洽快照。彻底修复需支持「一次 crossCheck 内批量多调用」。 | 集成期发现（同 KI-19 的修复引入的观察） | §15 / §99 |
 | KI-21 | P1 | **resolved** | ~~`TxGuardChecks` 是调用方自报的布尔值，`assertTxGuard` 只**重新推导** `ok`、不验证任何事实 → 一个把所有子项填 `true` 的伪造 guard 指向**非白名单地址**可以通过检查~~。**实测**：伪造的 all-true guard 指向已知冒充地址 `0xb904108b…` 被 `assertTxGuard` 接受。由于 `sendTransaction` 是全系统唯一写路径，这使「签给错误合约」这个最致命的失败模式仅依赖调用方诚实。**已修复**：`BscChainAdapter.sendTransaction` 在广播前**独立**校验 `tx.to` 必须属于本链白名单 DEX 合约或 Multicall3；回归测试 3 条（伪造 guard + 冒充地址 → 拒；伪造 guard + 任意地址 → 拒；白名单目标 → 负向对照，失败原因须为「缺 signer」而非「目标」）。**该检查立即发现 Pancake SmartRouter（§42 原子建仓的目标合约）不在白名单中** → 已补入 `BSC_DEX_CONTRACTS`。 | 独立评审（ReviewSafety 提出的问题）+ 集成期实测确认 | §95 / §91 / §8 |
 
+| KI-22 | P1 | **resolved** | ~~§42 原子建仓路径把真实 txHash 记在派生的 `key#add` 行上，**主行的 `idempotencyKey` 永远停在 `CREATED` 且无 hash**~~。后果：① `findUnresolved()` 永久返回一条**无法用链上查询解决**的幽灵记录（没有 hash 可查）；② 审计轨迹声称「建仓未发出」，而实际交易已确认；③ 主行的 `tx_hash` 因 UNIQUE 约束永远无法补记。**已修复**：原子路径（一笔交易）把 hash 记在**主键**上（`markSubmitted(primaryKey, hash)`），两笔路径的 swap 记主键、mint 记 `addKey()` 派生键；`addKey()` 收敛为唯一派生点。回归测试：原子建仓后主行 `SUBMITTED` + hash 正确 + `findUnresolved()` 为空 + 链上观测可解决。 | 独立评审（ReviewCorrectness 探针） | §42 / §98 |
+| KI-23 | P1 | **resolved** | ~~§98 重试路径不可用：intent 一律以 `attempt: 1` 记录，而 `TxStore.record` 对重复 `(key, attempt)` **返回既有行不变** → REVERTED 后的重试其新交易**无处记录**，随后 `markSubmitted` 因该行已是 REVERTED（非 CREATED/UNKNOWN）而抛 `invalid_transition`。~~ **已修复**：新增 `recordIntent()`，`attempt` 由 store 推导（首次 1，确定性失败后 `latest.attempt + 1`）；第二腿同理。回归测试：REVERTED 后重试 → attempts `[1,2]`、attempt 2 带新 hash 且为 `SUBMITTED`；同时**保留**「前次未解决时拒绝开新 attempt」（边界负向测试，防止修复破坏幂等）。 | 独立评审（ReviewCorrectness 探针） | §97 / §98 |
+
 ## 已登记待处理（Onboarding 阶段产生）
 
 > 以下为待 Phase 3 实现前必须收敛的**已知缺口**，不是缺陷：

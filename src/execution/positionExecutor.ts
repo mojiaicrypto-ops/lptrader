@@ -324,23 +324,11 @@ export class PositionExecutor {
     const refusal = this.checkIdempotencyKey(input.idempotencyKey);
     if (refusal !== null) return refusal;
 
-    this.deps.txStore.recordIntended(
-      {
-        idempotencyKey: input.idempotencyKey,
-        chainId: this.deps.dex.chainId,
-        purpose: this.deps.dex.supportsAtomicBuild ? TX_PURPOSES.ATOMIC_BUILD : TX_PURPOSES.SWAP,
-        rawTx: JSON.stringify({
-          kind: 'buildPosition',
-          poolId: input.pool.poolId,
-          atomic: this.deps.dex.supportsAtomicBuild,
-          capitalUsd: input.capitalUsd,
-          amount0Raw: input.plan.amount0.toString(),
-          amount1Raw: input.plan.amount1.toString(),
-        }),
-        rawTxFormat: RAW_TX_FORMATS.CALL_REQUEST,
-      },
-      input.guard,
-    );
+    // The intent is recorded against the attempt it actually represents. A retry after a definite
+    // failure (§98 FAILED/REVERTED) opens attempt N+1; recording it as attempt 1 again would return the
+    // old row unchanged, so the new transaction would have nowhere to be recorded and `markSubmitted`
+    // would then refuse the REVERTED row — i.e. the documented retry path would be broken.
+    this.recordIntent(input);
 
     return this.deps.dex.supportsAtomicBuild
       ? this.runAtomicBuild(input)
@@ -373,6 +361,14 @@ export class PositionExecutor {
    * makes combining mandatory, so a venue that cannot must throw rather than quietly return to the
    * two-step path (which the executor would then misinterpret as a completed atomic build).
    */
+  /**
+   * §42 atomic: exactly ONE adapter send, and that send IS the primary intent's transaction.
+   *
+   * The record is updated on the PRIMARY key rather than a derived `#add` key. That matters for §98
+   * recovery: a derived row would leave the primary sitting in `CREATED` with no hash, so `findUnresolved`
+   * would report a transaction that can never be resolved by a chain query (there is no hash to query),
+   * and the audit trail would claim the build never went out while a transaction had confirmed.
+   */
   private async runAtomicBuild(input: BuildPositionInput): Promise<ExecutionOutcome> {
     try {
       const result = await this.deps.dex.addLiquidity({
@@ -380,7 +376,8 @@ export class PositionExecutor {
         swapForDeficit: { quote: input.quote, atomic: true },
       });
 
-      this.recordSubmitted(`${input.idempotencyKey}#add`, result.txHash, TX_PURPOSES.ADD_LIQUIDITY);
+      // The single transaction is both the swap and the mint, so it belongs to the primary intent.
+      this.deps.txStore.markSubmitted(input.idempotencyKey, result.txHash);
 
       if (result.partial !== undefined) {
         return this.partialOutcome('atomic build', result.txHash, result.partial);
@@ -396,8 +393,8 @@ export class PositionExecutor {
       };
     } catch (error) {
       // Deliberately NOT retried on the two-step path: a venue advertising atomic support that then
-      // fails is an unexpected-state condition, and silently splitting the build would send a swap
-      // the operator never approved under this shape.
+      // fails is an unexpected-state condition, and silently splitting the build would send a swap the
+      // operator never approved under that shape.
       return this.adapterFailure(input.idempotencyKey, error);
     }
   }
@@ -434,7 +431,7 @@ export class PositionExecutor {
 
     try {
       const liquidity = await this.deps.dex.addLiquidity(this.addLiquidityRequest(input));
-      this.recordSubmitted(`${input.idempotencyKey}#add`, liquidity.txHash, TX_PURPOSES.ADD_LIQUIDITY);
+      this.recordSubmitted(addKey(input.idempotencyKey), liquidity.txHash, TX_PURPOSES.ADD_LIQUIDITY);
 
       if (liquidity.partial !== undefined) {
         return this.partialOutcome(
@@ -490,8 +487,45 @@ export class PositionExecutor {
     };
   }
 
-  /** §98 bookkeeping for the second leg. The added leg's key is derived, not reused. */
+  /**
+   * Record the build intent for the attempt it represents (§97/§98).
+   *
+   * The attempt number is derived from the store rather than assumed: a first build is attempt 1, and a
+   * deliberate retry after FAILED/REVERTED is the next one. `record` returns the existing row unchanged
+   * for a repeated `(key, attempt)`, so hardcoding 1 would silently discard the retry's own record.
+   * `checkIdempotencyKey` has already established that opening a new attempt is allowed here.
+   */
+  private recordIntent(input: BuildPositionInput): void {
+    const latest = this.deps.txStore.latestAttempt(input.idempotencyKey);
+    const attempt = latest === null ? 1 : latest.attempt + 1;
+    this.deps.txStore.recordIntended(
+      {
+        idempotencyKey: input.idempotencyKey,
+        chainId: this.deps.dex.chainId,
+        purpose: this.deps.dex.supportsAtomicBuild ? TX_PURPOSES.ATOMIC_BUILD : TX_PURPOSES.SWAP,
+        rawTx: JSON.stringify({
+          kind: 'buildPosition',
+          poolId: input.pool.poolId,
+          atomic: this.deps.dex.supportsAtomicBuild,
+          capitalUsd: input.capitalUsd,
+          amount0Raw: input.plan.amount0.toString(),
+          amount1Raw: input.plan.amount1.toString(),
+        }),
+        rawTxFormat: RAW_TX_FORMATS.CALL_REQUEST,
+        attempt,
+      },
+      input.guard,
+    );
+  }
+
+  /**
+   * §98 bookkeeping for the second leg of a two-transaction build.
+   *
+   * The added leg gets its own key (it is a different transaction). It is recorded as the next attempt
+   * for that key, so a retried build records the retry's mint rather than colliding with the first one.
+   */
   private recordSubmitted(idempotencyKey: string, txHash: Hash, purpose: (typeof TX_PURPOSES)[keyof typeof TX_PURPOSES]): void {
+    const latest = this.deps.txStore.latestAttempt(idempotencyKey);
     this.deps.txStore.record({
       idempotencyKey,
       chainId: this.deps.dex.chainId,
@@ -499,7 +533,7 @@ export class PositionExecutor {
       rawTx: JSON.stringify({ txHash }),
       rawTxFormat: RAW_TX_FORMATS.CALL_REQUEST,
       txHash,
-      attempt: 1,
+      attempt: latest === null ? 1 : latest.attempt + 1,
     });
   }
 
@@ -520,7 +554,7 @@ export class PositionExecutor {
       amount1MinRaw: input.amount1MinRaw,
       recipient: input.walletAddress,
       deadline: input.deadline,
-      idempotencyKey: `${input.idempotencyKey}#add`,
+      idempotencyKey: addKey(input.idempotencyKey),
       guard: input.guard,
     };
   }
@@ -583,4 +617,15 @@ export class PositionExecutor {
       `slippage ${(input.quote.slippageTolerance * 100).toFixed(2)}%`,
     ].join('\n');
   }
+}
+
+/**
+ * Key for the second (mint) transaction of a two-transaction build.
+ *
+ * One function so the executor and the adapters cannot disagree about the derived key: the adapter
+ * stamps its request with it and the executor records the resulting hash under it. A mismatch there
+ * would leave the mint unrecorded and the build looking like a §43 partial.
+ */
+export function addKey(buildKey: string): string {
+  return `${buildKey}#add`;
 }

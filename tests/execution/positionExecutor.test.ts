@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { PositionExecutor, BUILD_REFUSALS } from '../../src/execution/positionExecutor.ts';
+import { PositionExecutor, BUILD_REFUSALS, addKey } from '../../src/execution/positionExecutor.ts';
 import { ApprovalGate } from '../../src/execution/approvalGate.ts';
 import { InMemoryApprovalStore } from '../../src/execution/approvalGate.ts';
 import { TxStore } from '../../src/store/txStore.ts';
@@ -143,6 +143,14 @@ class RecordingDex implements DexAdapter {
   readonly dex = DEX_IDS.PANCAKESWAP_V3;
   readonly chainId = 56;
 
+  /** A distinct hash per send per leg: a real retry changes nonce/gas and therefore the hash. */
+  readonly #sends = new Map<string, number>();
+  nextHash(prefix: string): Hash {
+    const next = (this.#sends.get(prefix) ?? 0) + 1;
+    this.#sends.set(prefix, next);
+    return `0x${prefix}${next}` as Hash;
+  }
+
   readonly calls: string[] = [];
   readonly addRequests: AddLiquidityRequest[] = [];
   readonly swapRequests: SwapExecutionRequest[] = [];
@@ -192,14 +200,14 @@ class RecordingDex implements DexAdapter {
     this.swapRequests.push(request);
     const behaviour = this.behaviour.swap;
     if (behaviour instanceof Error) throw behaviour;
-    return behaviour ?? { txHash: '0xswap' as Hash, state: 'CONFIRMED', amountInRaw: 1n, amountOutRaw: 2n };
+    return behaviour ?? { txHash: this.nextHash('swap'), state: 'CONFIRMED', amountInRaw: 1n, amountOutRaw: 2n };
   }
   async addLiquidity(request: AddLiquidityRequest): Promise<LiquidityExecutionResult> {
     this.calls.push('addLiquidity');
     this.addRequests.push(request);
     const behaviour = this.behaviour.add;
     if (behaviour instanceof Error) throw behaviour;
-    return behaviour ?? { txHash: '0xadd' as Hash, state: 'CONFIRMED', positionTokenId: 4242n };
+    return behaviour ?? { txHash: this.nextHash('add'), state: 'CONFIRMED', positionTokenId: 4242n };
   }
   async removeLiquidity(request: RemoveLiquidityRequest): Promise<LiquidityExecutionResult> {
     this.calls.push('removeLiquidity');
@@ -420,7 +428,7 @@ describe('§42/§43 two-transaction build', () => {
     expect(outcome.partial).toBeDefined();
     expect(outcome.partial?.completedSteps).toEqual(['swap']);
     expect(outcome.partial?.failedStep).toBe('addLiquidity');
-    expect(outcome.swapTxHash).toBe('0xswap');
+    expect(outcome.swapTxHash).toBe('0xswap1');
     // Exactly one swap and one attempted mint — no retry.
     expect(dex.calls).toEqual(['executeSwap', 'addLiquidity']);
   });
@@ -442,6 +450,82 @@ describe('§42/§43 two-transaction build', () => {
     expect(outcome.ok).toBe(false);
     expect(dex.calls).toEqual(['executeSwap']);
     expect(outcome.partial?.failedStep).toBe('swap');
+  });
+});
+
+describe('§98 the recorded transaction reflects what actually went out', () => {
+  it('records the atomic build on the PRIMARY key, so recovery can resolve it', async () => {
+    // A bug found in independent review: the atomic path recorded the hash under a derived `#add` key and
+    // left the primary row in CREATED with no hash. Consequences: `findUnresolved` reported a transaction
+    // that can never be resolved by a chain query (there is no hash to query), and the audit trail claimed
+    // the build never went out while a transaction had confirmed.
+    const dex = new RecordingDex(true);
+    const h = harness({ dex });
+
+    const outcome = await h.executor.buildPosition(buildInput());
+    expect(outcome.ok).toBe(true);
+
+    const primary = h.txStore.latestAttempt('build-1');
+    expect(primary?.state).toBe('SUBMITTED');
+    expect(primary?.txHash).toBe('0xadd1');
+    expect(primary?.purpose).toBe('atomic_build');
+
+    // The recorded hash resolves the record, and nothing is left claiming to be in flight.
+    h.txStore.applyChainObservation('0xadd1' as Hash, { state: 'CONFIRMED', reason: 'mined' });
+    expect(h.txStore.latestAttempt('build-1')?.state).toBe('CONFIRMED');
+    expect(h.txStore.findUnresolved()).toEqual([]);
+  });
+
+  it('records BOTH legs of a two-transaction build, each with its own hash', async () => {
+    const dex = new RecordingDex(false);
+    const h = harness({ dex });
+
+    const outcome = await h.executor.buildPosition(buildInput());
+    expect(outcome.ok).toBe(true);
+
+    expect(h.txStore.latestAttempt('build-1')?.txHash).toBe('0xswap1');
+    expect(h.txStore.latestAttempt(addKey('build-1'))?.txHash).toBe('0xadd1');
+  });
+
+  it('records a deliberate retry after REVERTED as a NEW attempt with the new hash', async () => {
+    // The second bug from review: the intent was recorded with attempt 1 unconditionally, so after a
+    // REVERTED observation the retry's row was the OLD one (returned unchanged) and `markSubmitted` then
+    // refused the REVERTED row — the documented §98 retry path was unusable.
+    //
+    // Tested on the atomic venue, where one build is one transaction on one key, so this isolates the
+    // attempt-numbering fix. (For a two-transaction build the mint has its own key, and a retry while that
+    // key's previous attempt is unresolved is separately refused — see the test below.)
+    const dex = new RecordingDex(true);
+    const h = harness({ dex });
+
+    const first = await h.executor.buildPosition(buildInput());
+    expect(first.ok).toBe(true);
+    expect(h.txStore.latestAttempt('build-1')?.txHash).toBe('0xadd1');
+
+    h.txStore.applyChainObservation('0xadd1' as Hash, { state: 'REVERTED', reason: 'reverted on chain' });
+    expect(h.txStore.latestAttempt('build-1')?.state).toBe('REVERTED');
+
+    const retry = await h.executor.buildPosition(buildInput());
+    expect(retry.ok).toBe(true);
+
+    const attempts = h.txStore.listAttempts('build-1');
+    expect(attempts.map((record) => record.attempt)).toEqual([1, 2]);
+    expect(attempts[1]?.txHash).toBe('0xadd2');
+    expect(attempts[1]?.state).toBe('SUBMITTED');
+  });
+
+  it('refuses to open a new attempt while the previous one is still unresolved (§96)', async () => {
+    // The boundary of the fix above: a new attempt is only legitimate after a DEFINITE failure. While the
+    // prior attempt is SUBMITTED, the store refuses — because re-sending could double-execute.
+    const dex = new RecordingDex(true);
+    const h = harness({ dex });
+
+    await h.executor.buildPosition(buildInput());
+    const second = await h.executor.buildPosition(buildInput());
+
+    expect(second.ok).toBe(false);
+    expect(second.refusal).toBe(BUILD_REFUSALS.ALREADY_EXECUTED);
+    expect(dex.calls).toEqual(['addLiquidity']);
   });
 });
 
