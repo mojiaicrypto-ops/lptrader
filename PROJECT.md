@@ -11,7 +11,7 @@
 | 项 | 值 |
 |---|---|
 | 迭代 | Iteration 1 — 单池实盘（Phase 3） |
-| 阶段 | **Settling**（Plan 批准 → Develop → 独立 Review → Test 均已完成；Plan: `docs/archive/tasks/2026-09-29-D2/plan.md`） |
+| 阶段 | **Completed**（D2：Plan → Develop → 独立 Review（4 blocking 全修）→ Test → Settlement；归档见 `docs/archive/tasks/2026-09-29-D2/`） |
 | 技术栈 | TypeScript / Node（viem 2.37.13 + PancakeSwap 官方 V3 SDK） |
 | 链 | BNB Chain（chainId 56） |
 | DEX | PancakeSwap V3 + Uniswap V3（白名单） |

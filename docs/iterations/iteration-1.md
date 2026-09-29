@@ -1,6 +1,6 @@
 # Iteration 1 — 单池实盘（Phase 3）
 
-**状态**：Settling（Develop / 独立 Review / 独立 Test 均完成）
+**状态**：**Completed**（D2 已结算，归档见 `docs/archive/tasks/2026-09-29-D2/`）
 **对应产品基线**：`docs/product/stock-lp-auto-strategy-v1.md` §109 Phase 3
 
 ## 范围

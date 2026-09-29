@@ -13,7 +13,8 @@
 | `docs/product/scope-corrections.md` | 澄清 | L2 | 基线「不改语义」的读法澄清（池组合、symbol、RangeProgress 等） |
 | `docs/code-map.md` | 索引 | L1 | 代码入口、模块、测试位置 |
 | `docs/known-issues.md` | 登记 | L1 | 遗留问题与已知保留 |
-| `docs/archive/tasks/` | 归档 | L4 | 各任务的 Plan / Implementation / Review / Test / Settlement |
+| **D2 任务归档** | 归档 | L4 | `docs/archive/tasks/2026-09-29-D2/`：`plan.md`、`implementation-summary.md`、`review-report.md`、`test-report.md`、`settlement-report.md` |
+| `docs/research/evidence-*.{txt,md}` | 证据 | L4 | 可复现的运行证据：链上只读冒烟、池扫描、dry-run 建仓 |
 
 ## 产品基线章节地图（`docs/product/stock-lp-auto-strategy-v1.md`）
 
