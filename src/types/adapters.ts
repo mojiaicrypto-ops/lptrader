@@ -166,9 +166,9 @@ export interface PoolRefView {
 }
 
 /**
- * Raw CLMM pool state. `sqrtPriceX96`/`liquidity` are the on-chain integers; `priceToken1PerToken0`
- * is the human price derived from them (raw price, i.e. in whole-token terms after decimals)
- * and `priceUsd` is only populated when a reference price for one leg is known.
+ * Raw CLMM pool state. `sqrtPriceX96`/`liquidity` are the on-chain integers; the derived prices are
+ * UI-denominated (see the field docs) and `priceUsd` is only populated when a reference price for
+ * one leg is known.
  */
 export interface PoolPriceView {
   readonly poolId: PoolId;
@@ -177,8 +177,16 @@ export interface PoolPriceView {
   readonly liquidity: bigint;
   readonly feeTier: FeeTier;
   readonly tickSpacing: number;
-  /** `token1` per 1 `token0`, adjusted for decimals. */
+  /**
+   * `token1` per one whole (UI) `token0` — decimal-adjusted, i.e.
+   * `(sqrtPriceX96/2^96)^2 * 10^(decimals0 - decimals1)`. NOT raw base units and NOT USD; the raw
+   * base-unit variant is `sqrtPriceX96ToRawPrice` in the chain layer. Consumers compare it against
+   * rates derived from whole-token amounts (`toFloat(raw, decimals)`), so the two must stay in the
+   * same denomination — a raw-denominated value here would misprice every impact figure by
+   * `10^(decimals0 - decimals1)`, which is a no-op on two 18-decimal tokens and therefore silent.
+   */
   readonly priceToken1PerToken0: number;
+  /** USD per one whole (UI) token — `PriceUsd` units, never per raw base unit. */
   readonly priceUsd?: PriceUsd;
   /** Source of the price (`onchain` unless a reference price was folded in). */
   readonly asOf: IsoTimestamp;

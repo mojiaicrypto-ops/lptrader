@@ -1,0 +1,322 @@
+/**
+ * Composition root: assemble the live strategy from configuration, then run the §89 cadences.
+ *
+ * ## What this file is allowed to do
+ * Wiring only. Every rule lives in the module that owns it — the executor gates writes, the risk
+ * manager decides severity, the approval gate releases builds. A decision appearing here would be in
+ * the wrong place.
+ *
+ * ## Collaborators are required parameters, never fabricated
+ * `dex` and `provider` are injected by the caller. This file deliberately contains no stub, no
+ * placeholder and no `as`-cast to satisfy a dependency: a runtime assembled without a real DEX adapter
+ * must fail to compile rather than look functional and throw at the first write. That is the same
+ * fail-closed rule the rest of the system follows, applied to the assembly itself.
+ *
+ * ## The startup order is the safety property
+ * Each step is a precondition for the next, and the whole thing fails closed:
+ *
+ *   1. **Config + whitelist** — an empty whitelist or a non-whitelisted DEX/chain stops the process
+ *      before a single RPC is opened (§96).
+ *   2. **Unresolved transactions** (§98) — any `CREATED`/`SUBMITTED`/`UNKNOWN` record from a previous
+ *      run is surfaced for a chain query, never re-sent. A crash mid-build must not become a double
+ *      build.
+ *   3. **Signer** — optional. Without it the runtime is a **read-only monitor**: no wallet client is
+ *      attached, `getSignerAddress()` returns `null`, and `executor` is `null` so no code path can
+ *      reach a write (§92/§94). Read-only is a structural property here, not a flag.
+ *   4. **Approval channel** — with Telegram disabled the notifier is the contract's `noopNotifier`,
+ *      which can never approve, so `BUILD_POSITION`/`SWITCH_POOL` are impossible (D2) while the
+ *      automatic paths (collect, risk exit) keep working.
+ *
+ * ## Failure mode worth stating plainly
+ * With `TELEGRAM_ENABLED=false` the bot can monitor, alert, collect fees and exit a position on risk,
+ * but it **cannot open or switch a position**. That is the intended direction: silence must never be
+ * read as consent.
+ */
+import type { Account } from 'viem';
+import type { BscChainAdapter } from './chain/adapter.ts';
+import { BscChainAdapter as BscAdapter } from './chain/adapter.ts';
+import type { PositionReader } from './chain/positionReader.ts';
+import { PositionReader as PositionReaderImpl } from './chain/positionReader.ts';
+import type { TokenRegistry } from './types/registry.ts';
+import type { TokenReader } from './chain/tokenReader.ts';
+import { TokenReader as TokenReaderImpl } from './chain/tokenReader.ts';
+import type { DexAdapter, PoolDataProvider, ReferencePriceProvider } from './types/adapters.ts';
+import type { StrategyConfig } from './types/config.ts';
+import type { IsoTimestamp, UsdAmount } from './types/primitives.ts';
+import type { PoolSnapshot } from './types/market.ts';
+import { ALERT_SEVERITIES, type Notifier } from './types/notifier.ts';
+import type { DecryptedPrivateKey } from './security/keystore.ts';
+import { openDatabase } from './store/db.ts';
+import { StateStore } from './store/stateStore.ts';
+import { TxStore } from './store/txStore.ts';
+import { StateMachine } from './strategy/stateMachine.ts';
+import {
+  createSqliteApprovalGate,
+  stateStoreDecisionLogSink,
+  type ApprovalGate,
+} from './execution/approvalGate.ts';
+import { PositionExecutor } from './execution/positionExecutor.ts';
+import { PortfolioMonitor } from './execution/portfolioMonitor.ts';
+import { PoolScanner, foundPools } from './data/poolScanner.ts';
+import { filterPools } from './data/poolFilter.ts';
+import { createReferencePriceProvider } from './data/referencePrice.ts';
+import { createNotifierFromConfig } from './notify/telegram.ts';
+import { type SchedulerCadence } from './execution/scheduler.ts';
+import { readKeystoreFile } from './security/keystore.ts';
+
+/** Everything the cadences share; built once so no cadence rebuilds a client or a store. */
+export interface StrategyRuntime {
+  readonly config: StrategyConfig;
+  readonly chain: BscChainAdapter;
+  readonly tokenReader: TokenReader;
+  readonly positionReader: PositionReader;
+  readonly referencePrice: ReferencePriceProvider;
+  readonly dex: DexAdapter;
+  readonly provider: PoolDataProvider;
+  readonly scanner: PoolScanner;
+  readonly monitor: PortfolioMonitor;
+  readonly notifier: Notifier;
+  readonly approvals: ApprovalGate;
+  readonly txStore: TxStore;
+  readonly stateStore: StateStore;
+  readonly stateMachine: StateMachine;
+  /** `null` in read-only mode — the entire write path is unreachable without it. */
+  readonly executor: PositionExecutor | null;
+  readonly readOnly: boolean;
+}
+
+/** The signer material, already decrypted. Never a raw key string, never logged. */
+export interface RuntimeSigner {
+  readonly privateKey: DecryptedPrivateKey;
+  /** viem account built from the decrypted key by the caller (keeps viem out of this module). */
+  readonly account: Account;
+}
+
+export interface BuildRuntimeOptions {
+  readonly config: StrategyConfig;
+  /** §82 DEX implementation. Required: without it a build could not be encoded. */
+  readonly dex: DexAdapter;
+  /** §83 market-data source. Required: without it no pool can be discovered. */
+  readonly provider: PoolDataProvider;
+  /** §84 reference prices. Omitted ⇒ a Binance-backed provider is constructed for the chain. */
+  readonly referencePrice?: ReferencePriceProvider;
+  /** Decrypted signer; omitted ⇒ read-only runtime (no wallet client is ever constructed). */
+  readonly signer?: RuntimeSigner;
+  readonly env?: NodeJS.ProcessEnv;
+}
+
+/**
+ * Build the live runtime.
+ *
+ * A missing `signer` produces a monitor-only runtime rather than an error: monitoring a wallet that no
+ * one can trade from is a legitimate and useful mode, and it is the safe default before a keystore has
+ * been created.
+ */
+export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
+  const env = options.env ?? process.env;
+  const config = options.config;
+
+  // §96: whitelist checks run before any network object exists.
+  config.whitelist.assertWhitelistNonEmpty();
+  for (const entry of config.whitelist.dexes) {
+    config.whitelist.assertWhitelistedChain(entry.chainId);
+    config.whitelist.assertWhitelistedDex(entry.chainId, entry.dex);
+  }
+
+  const chainId = config.whitelist.chains[0];
+  if (chainId === undefined) {
+    throw new Error('no whitelisted chain: refusing to start (§11)');
+  }
+  // §12: the injected DEX must be one this chain is allowed to use, or the whole runtime is suspect.
+  config.whitelist.assertWhitelistedDex(chainId, options.dex.dex);
+
+  const db = openDatabase(env['LP_DB_PATH'] ?? 'data/lptrader.db');
+  const stateStore = new StateStore(db);
+  const txStore = new TxStore(db);
+  const stateMachine = StateMachine.open(db);
+
+  // §98: surface anything left in flight by a previous run. This is reported, never silently re-sent —
+  // the recovery pass is the caller's job because it needs chain access to resolve a hash.
+  const unresolved = txStore.findUnresolved({ chainId });
+
+  const chain = new BscAdapter({
+    chainId,
+    whitelist: config.whitelist,
+    ...(options.signer === undefined ? {} : { account: options.signer.account }),
+  });
+
+  const tokenReader = new TokenReaderImpl(chain, registryFor(config), chainId);
+  const positionReader = new PositionReaderImpl(chain, chainId);
+  const referencePrice =
+    options.referencePrice ?? createReferencePriceProvider({ chainId, registry: config.whitelist.registry });
+
+  const notifier = createNotifierFromConfig(config, env);
+  const approvals = createSqliteApprovalGate(db, {
+    notifier,
+    timeoutMinutes: config.approvals.timeoutMinutes,
+    // §77: every approval decision is audited next to the pool/APR context that produced it.
+    audit: stateStoreDecisionLogSink(stateStore),
+  });
+
+  const monitor = new PortfolioMonitor({
+    chain,
+    tokenReader,
+    positionReader,
+    referencePrice,
+    whitelist: config.whitelist,
+    maxDrawdown: config.risk.maxDrawdown,
+    windowSeconds: config.monitor.portfolioIntervalMinutes * 60,
+    ...(env['STRATEGY_WALLET_ADDRESS'] === undefined || env['STRATEGY_WALLET_ADDRESS'] === ''
+      ? {}
+      : { watchAddress: env['STRATEGY_WALLET_ADDRESS'] as `0x${string}` }),
+  });
+
+  const readOnly = options.signer === undefined;
+  const stateMachineRef = stateMachine;
+  const executor = readOnly
+    ? null
+    : new PositionExecutor({
+        dex: options.dex,
+        txStore,
+        stateMachine: stateMachineRef,
+        approvalGate: approvals,
+        currentState: () => stateMachineRef.current,
+      });
+
+  if (unresolved.length > 0) {
+    notifier
+      .send(
+        ALERT_SEVERITIES.WARNING,
+        `${unresolved.length} transaction(s) need a chain query before any new build`,
+        unresolved
+          .map((record) => `${record.idempotencyKey} attempt ${record.attempt} state=${record.state} hash=${record.txHash ?? 'none'}`)
+          .join('\n'),
+      )
+      .catch(() => {
+        // Alerts are best-effort by contract; the startup path must not fail because a channel is down.
+      });
+  }
+
+  return {
+    config,
+    chain,
+    tokenReader,
+    positionReader,
+    referencePrice,
+    dex: options.dex,
+    provider: options.provider,
+    scanner: new PoolScanner({ config, provider: options.provider, dexAdapters: [options.dex] }),
+    monitor,
+    notifier,
+    approvals,
+    txStore,
+    stateStore,
+    stateMachine,
+    executor,
+    readOnly,
+  };
+}
+
+/** §89 cadences, derived from `config.monitor`. Each one is independent; none decides anything. */
+export function buildCadences(runtime: StrategyRuntime): readonly SchedulerCadence[] {
+  const { config } = runtime;
+  return [
+    {
+      name: 'portfolio-monitor',
+      intervalSeconds: config.monitor.portfolioIntervalMinutes * 60,
+      run: async (at) => {
+        const result = await runtime.monitor.monitor({
+          walletAddress: runtime.monitor.walletAddress(),
+          now: at,
+          // The position/pool are supplied by the position-tracking task; until a position exists the
+          // monitor correctly values a reserve-only portfolio.
+          position: null,
+          pool: null,
+          benchmark: null,
+          initialNAV: config.capital.initialStrategyCapitalUsd,
+          reserveRatio: config.capital.reserveRatio,
+          priorPeakNAV: null,
+          realizedFees: 0,
+          gasCost: 0,
+          swapCost: 0,
+          slippageCost: 0,
+        });
+        // §96: an incomplete NAV is reported as degraded, never treated as merely a smaller NAV.
+        if (!result.complete) {
+          await runtime.notifier.send(
+            ALERT_SEVERITIES.WARNING,
+            'portfolio valuation incomplete',
+            result.problems.join('\n'),
+          );
+        }
+      },
+    },
+    {
+      name: 'pool-scan',
+      intervalSeconds: config.monitor.poolScanIntervalMinutes * 60,
+      run: async (at) => {
+        const summary = await runtime.scanner.scan();
+        if (!summary.complete) {
+          // A partial scan must not look like a clean market: say which source failed.
+          await runtime.notifier.send(
+            ALERT_SEVERITIES.WARNING,
+            'pool scan incomplete',
+            summary.blockers.join('\n'),
+          );
+        }
+        const outcome = filterPools(
+          foundPools(summary),
+          {
+            minTvlUsd: config.pool.minTvlUsd,
+            minAvgDailyVolume7dUsd: config.pool.minAvgDailyVolume7dUsd,
+            minPoolAgeDays: config.pool.minPoolAgeDays,
+            maxNavDeviation: config.pool.maxNavDeviation,
+            maxSwapPriceImpact: config.pool.maxSwapPriceImpact,
+          },
+          {
+            evaluatedAt: at,
+            whitelist: config.whitelist,
+            isOnchainVerified: (snapshot: PoolSnapshot) => summary.onchainVerifiedByPool[snapshot.poolId] === true,
+          },
+        );
+        // §96: a pool rejected because a figure was unavailable is a DATA problem, not a bad pool, and
+        // the operator must be told which one it is.
+        if (!outcome.decisive) {
+          await runtime.notifier.send(
+            ALERT_SEVERITIES.WARNING,
+            'pool filter could not decide on its merits',
+            outcome.rejected.map((entry) => `${entry.snapshot.poolId}: ${entry.evaluation.reasons.join('; ')}`).join('\n'),
+          );
+        }
+      },
+    },
+  ];
+}
+
+/** The chain's token registry, reached through the whitelist (§8 identity source). */
+function registryFor(config: StrategyConfig): TokenRegistry {
+  return config.whitelist.registry;
+}
+
+/** §66 risk line, exposed so a status view can print it without recomputing. */
+export function riskOffLineUsd(config: StrategyConfig): UsdAmount {
+  return config.capital.initialStrategyCapitalUsd * (1 - config.risk.maxDrawdown);
+}
+
+/** §77 the operator-facing status line, used by the Telegram `/status` handler. */
+export function renderStatus(runtime: StrategyRuntime, at: IsoTimestamp): string {
+  return [
+    `lptrader @ ${at}`,
+    `state        : ${runtime.stateMachine.current}`,
+    `mode         : ${runtime.readOnly ? 'READ-ONLY (no signer)' : 'LIVE'}`,
+    `chain        : ${runtime.chain.chainId}`,
+    `dex          : ${runtime.dex.dex}`,
+    `approvals    : build=${runtime.config.approvals.buildPosition} switch=${runtime.config.approvals.switchPool}`,
+    `risk-off NAV : $${riskOffLineUsd(runtime.config).toFixed(2)}`,
+  ].join('\n');
+}
+
+/** §46 keystore read for the startup pre-flight (structural validation only, no passphrase). */
+export async function inspectKeystore(path: string): Promise<void> {
+  await readKeystoreFile(path);
+}
