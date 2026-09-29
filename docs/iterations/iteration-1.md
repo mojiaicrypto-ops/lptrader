@@ -1,6 +1,6 @@
 # Iteration 1 — 单池实盘（Phase 3）
 
-**状态**：Planning
+**状态**：Reviewing（Develop 完成，独立 Review 进行中）
 **对应产品基线**：`docs/product/stock-lp-auto-strategy-v1.md` §109 Phase 3
 
 ## 范围

@@ -11,13 +11,13 @@
 | 项 | 值 |
 |---|---|
 | 迭代 | Iteration 1 — 单池实盘（Phase 3） |
-| 阶段 | **Awaiting Plan Confirmation**（Plan: `docs/archive/tasks/2026-09-29-D2/plan.md`） |
+| 阶段 | **Reviewing**（Plan 已批准，Develop 完成；Plan: `docs/archive/tasks/2026-09-29-D2/plan.md`） |
 | 技术栈 | TypeScript / Node（viem 2.37.13 + PancakeSwap 官方 V3 SDK） |
 | 链 | BNB Chain（chainId 56） |
 | DEX | PancakeSwap V3 + Uniswap V3（白名单） |
 | 首期标的 | QQQB ×（USDC/USDT），池由 Scanner 自动发现 |
 | 初始资金示例 | 10,000 USDC（LP 上限 70%，Reserve 30%） |
-| 代码 | 尚未创建（Planning） |
+| 代码 | 已实现（49 源文件 / 25 测试文件 / 4 脚本）；`npm run typecheck` 0 错误，`npm test` **690 测试全绿** |
 
 ## 范围（Iteration 1）
 
@@ -29,6 +29,7 @@
 
 | 文档 | 作用 |
 |---|---|
+| [docs/iterations/iteration-1-acceptance.md](docs/iterations/iteration-1-acceptance.md) | §108 验收项 → 实现 → 可复现证据 → 状态 |
 | [docs/product/stock-lp-auto-strategy-v1.md](docs/product/stock-lp-auto-strategy-v1.md) | **产品基线**（canonical 事实来源） |
 | [AGENTS.md](AGENTS.md) | 项目级执行参数与硬性约束 |
 | [docs/document-index.md](docs/document-index.md) | 文档索引 |
@@ -36,6 +37,26 @@
 | [docs/known-issues.md](docs/known-issues.md) | 遗留问题登记 |
 | [docs/iterations/iteration-1.md](docs/iterations/iteration-1.md) | 当前迭代范围与状态 |
 | [docs/archive/tasks/](docs/archive/tasks/) | 任务归档（Plan / Review / Test / Settlement） |
+
+## 运行入口
+
+```bash
+npm run typecheck          # 0 错误
+npm test                   # 690 测试
+npm run dev                # 配置/白名单自检（只读，不连链）
+npm run smoke:read         # 链上只读：池状态 / 余额 / uiMultiplier
+npm run smoke:scan         # 真实三层扫描 + §16 过滤（约 4 分钟）
+npm run smoke:quote        # 真实 QuoterV2 报价 + §40 闸门
+npm run dry-run:build -- 7000   # 完整建仓决策链，不签名不发送
+npm run keystore:init      # 生成加密私钥（0600）
+npm run telegram:check     # Telegram 通道 fail-closed 自检
+```
+
+## 当前可执行性（实测，2026-09-29）
+
+真实扫描下**通过 §16 硬性过滤的池只有 2 个**（均为 PancakeSwap V3）：QQQB/USDT（fee 100，TVL ~$620k）与 AAPLB/USDT（fee 2500，TVL ~$540k）。
+此前记录的 QQQB/USDC @ Uniswap V3 **被淘汰**，唯一原因是 `$3500 换手价格影响 0.66% > 0.5%` 门槛 —— 即该池在 §110 的 $7,000 规模下深度不足。
+结论：**在 §110 资金规模下可执行的 QQQB 池只有 PancakeSwap V3 的 QQQB/USDT**（它同时是唯一支持 §42 原子建仓的 DEX）。详见 `docs/research/evidence-pool-scanner-filter-20260929.md`。
 
 ## 核心原则（详见产品基线 §2、§112）
 
