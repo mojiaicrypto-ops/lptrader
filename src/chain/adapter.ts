@@ -161,14 +161,27 @@ export class BscChainAdapter implements ChainAdapter {
     return token;
   }
 
+  /**
+   * Cross-checked (or single-endpoint) read.
+   *
+   * `operation` receives the block height the cross-check pinned and MUST pass it to the RPC call.
+   * Without it a cross-check compares two different blocks: `slot0`/balances/fee-growth are all
+   * block-mutable, so exact equality would fail on every live read (measured — see
+   * `RpcPool.crossCheck`). For a single-endpoint read the height is `undefined` ("latest"), because
+   * there is no second observation to agree with.
+   */
   private async read<T>(
-    operation: (client: PublicClient) => Promise<T>,
+    operation: (client: PublicClient, blockNumber: bigint | undefined) => Promise<T>,
     method: string,
     crossCheck: boolean,
   ): Promise<RpcReadResult<T>> {
-    return crossCheck && this.crossCheckEnabled
-      ? this.rpc.crossCheck(operation, method)
-      : this.rpc.call(operation, method);
+    if (crossCheck && this.crossCheckEnabled) {
+      return this.rpc.crossCheck(operation, method);
+    }
+    // A single-endpoint read has nothing to compare against, so no height is pinned and `undefined`
+    // means the node's own head ("latest"). That is the correct semantic for a non-cross-checked read:
+    // there is no second observation it would have to agree with.
+    return this.rpc.call((client) => operation(client, undefined), method);
   }
 
   async getBlockNumber(): Promise<bigint> {
@@ -194,12 +207,13 @@ export class BscChainAdapter implements ChainAdapter {
   async getTokenBalanceOf(tokenAddress: Address, holder: Address): Promise<bigint> {
     const token = this.requireWhitelistedToken(tokenAddress);
     const result = await this.read(
-      async (client) =>
+      async (client, blockNumber) =>
         (await client.readContract({
           address: token.address,
           abi: ERC20_ABI,
           functionName: 'balanceOf',
           args: [holder],
+          blockNumber,
         })) as bigint,
       'balanceOf',
       true,
@@ -209,7 +223,7 @@ export class BscChainAdapter implements ChainAdapter {
 
   async getNativeBalance(address: Address): Promise<bigint> {
     const result = await this.read(
-      (client) => client.getBalance({ address }),
+      (client, blockNumber) => client.getBalance({ address, blockNumber }),
       'eth_getBalance',
       true,
     );
@@ -253,11 +267,15 @@ export class BscChainAdapter implements ChainAdapter {
       }),
     );
 
-    const read = async (client: PublicClient): Promise<readonly bigint[]> => {
+    const read = async (
+      client: PublicClient,
+      blockNumber: bigint | undefined,
+    ): Promise<readonly bigint[]> => {
       const responses = (await client.readContract({
         address: MULTICALL3_ADDRESS,
         abi: MULTICALL3_AGGREGATE3_ABI,
         functionName: 'aggregate3',
+        blockNumber,
         args: [
           tokens.map((token, index) => ({
             target: token.address,
@@ -292,12 +310,13 @@ export class BscChainAdapter implements ChainAdapter {
   async getAllowance(tokenAddress: Address, owner: Address, spender: Address): Promise<bigint> {
     const token = this.requireWhitelistedToken(tokenAddress);
     const result = await this.read(
-      async (client) =>
+      async (client, blockNumber) =>
         (await client.readContract({
           address: token.address,
           abi: ERC20_ABI,
           functionName: 'allowance',
           args: [owner, spender],
+          blockNumber,
         })) as bigint,
       'allowance',
       true,
@@ -351,12 +370,13 @@ export class BscChainAdapter implements ChainAdapter {
     readonly args?: readonly unknown[];
   }): Promise<RpcReadResult<T>> {
     const result = await this.read(
-      (client) =>
+      (client, blockNumber) =>
         client.readContract({
           address: request.address,
           abi: request.abi,
           functionName: request.functionName,
           args: request.args ?? [],
+          blockNumber,
         }) as Promise<T>,
       `${request.functionName}(${request.address})`,
       true,

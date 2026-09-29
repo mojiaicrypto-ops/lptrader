@@ -272,6 +272,28 @@ export class RpcPool {
   }
 
   /**
+   * The block height every cross-checked observation is taken at.
+   *
+   * Resolved once per read from the first candidate that answers. Failure to resolve on any candidate
+   * is an `RpcUnavailableError`: without a height there is no meaningful cross-check, and falling back
+   * to unpinned reads would silently reintroduce the flakiness this exists to prevent.
+   */
+  private async pinBlockNumber(candidates: readonly Endpoint[], method: string): Promise<bigint> {
+    const failures: string[] = [];
+    for (const endpoint of candidates) {
+      try {
+        return await this.attempt(endpoint, (client) => client.getBlockNumber());
+      } catch (error) {
+        failures.push(`${endpoint.spec.label}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    throw new RpcUnavailableError(
+      `${method}: could not pin a block height for the §99 cross-check (${failures.join(' | ')})`,
+      { method, failures },
+    );
+  }
+
+  /**
    * Execute `operation` against one endpoint, verifying its chain id first. The chain-id guard is
    * what makes failover safe: a misconfigured endpoint for another network would otherwise answer
    * every read with plausible-looking garbage.
@@ -332,17 +354,32 @@ export class RpcPool {
   }
 
   /**
-   * §99 critical read: every one of the first `crossCheckEndpoints` endpoints is queried and all
-   * answers must be **equal** under `compare`.
+   * §99 critical read: every one of the first `crossCheckEndpoints` endpoints is queried at the SAME
+   * block height and all answers must be **equal** under `compare`.
    *
    * - A mismatch throws `CrossCheckError`; no value is returned at all (fail closed).
    * - If an endpoint cannot answer (transport failure) it is skipped; that downgrades the result to
    *   `degraded: true` rather than failing the read, because losing a *redundant* endpoint must not
    *   take the bot down. A node-level error (revert) is returned immediately: it is a property of
    *   the contract, not the node.
+   *
+   * ## Why the block height is pinned (this is not an optimisation)
+   * BSC produces a block every ~0.75s and two endpoints are never at exactly the same head. Comparing
+   * `slot0()` between them without pinning therefore compares **two different blocks**, and any
+   * price-mutable field (`sqrtPriceX96`, `tick`, balances after a transfer, fee growth) legitimately
+   * differs. That turns the cross-check into a flaky failure on every live read — measured, not
+   * theoretical: two endpoints returned `sqrtPriceX96` values differing in the 9th significant digit
+   * with an identical tick, i.e. one block of price movement, and the read was rejected.
+   *
+   * So the height is resolved once, from the first endpoint that answers, and every observation is
+   * taken against exactly that height. The comparison then means what §99 intends: "do these nodes
+   * agree about the *same* state". A node that disagrees at a fixed height is a real disagreement.
+   *
+   * `operation` receives the pinned height and MUST pass it to the RPC call. An operation that ignores
+   * it re-introduces the flakiness, which is why the parameter is not optional.
    */
   async crossCheck<T>(
-    operation: (client: PublicClient) => Promise<T>,
+    operation: (client: PublicClient, blockNumber: bigint) => Promise<T>,
     method: string,
     options: {
       readonly compare?: (a: T, b: T) => boolean;
@@ -367,9 +404,14 @@ export class RpcPool {
     const observations: { endpoint: string; value: T }[] = [];
     const failures: string[] = [];
 
+    // Pin the height BEFORE any observation. Resolved on the first candidate that answers, so a dead
+    // primary does not stop the read; every observation is then taken at exactly this height, which is
+    // what makes exact equality a meaningful test for block-mutable state.
+    const blockNumber = await this.pinBlockNumber(candidates, method);
+
     for (const endpoint of candidates) {
       try {
-        const value = await this.attempt(endpoint, operation);
+        const value = await this.attempt(endpoint, (client) => operation(client, blockNumber));
         observations.push({ endpoint: endpoint.spec.label, value });
       } catch (error) {
         if (error instanceof ChainError) {

@@ -247,6 +247,92 @@ describe('§99 cross-check on critical reads', () => {
     await adapter.getGasPrice();
     expect(nodes.every((node) => node.countOf('eth_gasPrice') <= 1)).toBe(true);
   });
+
+  it('pins ONE block height for every observation, so a block-mutable read cannot self-fail', async () => {
+    // Measured production failure this prevents: two endpoints at slightly different heads returned
+    // `sqrtPriceX96` differing in the 9th significant digit with an identical tick — one block of real
+    // price movement — and the exact-equality cross-check rejected the read. Comparing different blocks
+    // is not a disagreement, so every observation must be taken at the same height.
+    const blockTags: unknown[] = [];
+    const nodes = [0, 1].map(() =>
+      createMockNode({
+        contracts: { [USDC.toLowerCase()]: entry({}, 'balanceOf(address)', 7_000n) },
+        chainId: 56,
+      }),
+    );
+    const adapter = new BscChainAdapter({
+      chainId: 56,
+      whitelist: whitelistFor(createBuiltinRegistry().list()),
+      rpc: {
+        endpoints: nodes.map((_endpoint, index) => ({ label: `node${index + 1}`, url: `mock://node${index + 1}` })),
+        transportFactory: (endpoint) => {
+          const index = Number(endpoint.label.replace('node', '')) - 1;
+          const node = nodes[index]!;
+          // Wrap the node so the block tag carried by `eth_call` is observable.
+          return handlerTransport((request) => {
+            if (request.method === 'eth_call') {
+              // eth_call params: [{to, data}, blockTag].
+              const params = request.params as readonly unknown[];
+              blockTags.push(params[1] ?? null);
+            }
+            return node.handle(request);
+          });
+        },
+        crossCheckEndpoints: 2,
+        retries: 0,
+      },
+    });
+
+    const result = await adapter.readContract<bigint>({
+      address: USDC,
+      abi: ERC20_ABI,
+      functionName: 'balanceOf',
+      args: [WALLET],
+    });
+
+    expect(result.value).toBe(7_000n);
+    // The height is resolved exactly once and then reused for both observations.
+    const blockRequests = nodes.reduce((total, node) => total + node.countOf('eth_blockNumber'), 0);
+    expect(blockRequests).toBe(1);
+    // Both calls carried the SAME explicit block tag — which is what makes the comparison valid.
+    expect(blockTags).toHaveLength(2);
+    expect(new Set(blockTags.map((tag) => JSON.stringify(tag))).size).toBe(1);
+    expect(blockTags[0]).not.toBeNull();
+  });
+
+  it('fails closed when no endpoint can supply a height to pin', async () => {
+    // Without a height there is no meaningful cross-check, and silently falling back to unpinned reads
+    // would restore exactly the flakiness the pin exists to prevent.
+    const nodes = [0, 1].map(() => createMockNode({ chainId: 56 }));
+    const adapter = new BscChainAdapter({
+      chainId: 56,
+      whitelist: whitelistFor(createBuiltinRegistry().list()),
+      rpc: {
+        endpoints: nodes.map((_endpoint, index) => ({ label: `node${index + 1}`, url: `mock://node${index + 1}` })),
+        transportFactory: (endpoint) => {
+          const index = Number(endpoint.label.replace('node', '')) - 1;
+          const node = nodes[index]!;
+          return handlerTransport((request) => {
+            if (request.method === 'eth_blockNumber') {
+              return Promise.reject(new Error('this node cannot report its head'));
+            }
+            return node.handle(request);
+          });
+        },
+        crossCheckEndpoints: 2,
+        retries: 0,
+      },
+    });
+
+    await expect(
+      adapter.readContract<bigint>({
+        address: USDC,
+        abi: ERC20_ABI,
+        functionName: 'balanceOf',
+        args: [WALLET],
+      }),
+    ).rejects.toMatchObject({ code: CHAIN_ERROR_CODES.RPC_UNAVAILABLE });
+  });
 });
 
 describe('whitelist gate on reads', () => {
