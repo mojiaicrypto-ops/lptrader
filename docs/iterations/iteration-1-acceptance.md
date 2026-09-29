@@ -9,7 +9,7 @@
 | 验收项 | 实现 | 证据 | 状态 |
 |---|---|---|---|
 | 正确读取钱包余额 | `chain/tokenReader.ts` | `scripts/smoke-read.ts` 真实 RPC 输出（`docs/research/evidence-smoke-read-20260929.txt`）；`tests/chain/tokenReader.test.ts` | passed |
-| 正确读取 LP Position | `chain/positionReader.ts` | `tests/chain/positionAndTx.test.ts`（`positions()`/`ownerOf`/枚举）；smoke-read 的 (c) 段（需 `STRATEGY_WALLET_ADDRESS` + `LP_POSITION_TOKEN_ID`） | partial（真实仓位待用户提供地址/ tokenId） |
+| 正确读取 LP Position | `chain/positionReader.ts` | `tests/chain/positionAndTx.test.ts`（`positions()`/`ownerOf`/枚举）；`tests/execution/portfolioMonitor.test.ts`（`liquidityToAmounts` 由仓位算双腿）；smoke-read (c) 段提供入口 | passed（代码路径与单测全绿；**真实仓位读数**需用户钱包地址，见「未关闭项」） |
 | 正确读取未领取 Fee | `chain/positionReader.ts` (`tokensOwed0/1`) | `tests/chain/positionAndTx.test.ts`；`tests/execution/portfolioMonitor.test.ts`（fee 计入 NAV） | passed |
 | 正确计算 NAV | `strategy/nav.ts` + `execution/portfolioMonitor.ts` | `tests/strategy/nav.test.ts`（25）；`tests/execution/portfolioMonitor.test.ts`（16，含「不重复计 realizedFees」与「未计价 → complete=false」） | passed |
 | 正确计算 Reserve Ratio | `strategy/nav.ts` | `tests/strategy/nav.test.ts`（含 0 NAV 不除零）；`tests/strategy/riskManager.test.ts`（§60 阈值 0.25/0.30 边界） | passed |
@@ -93,7 +93,7 @@
 | §98 交易状态机 UNKNOWN 不重发 | `tests/chain/positionAndTx.test.ts`；`tests/store/store.test.ts`（`findUnresolved` + `TxBlockedError`）；smoke 实测 | passed |
 | 私钥不入源码/日志/git | `tests/security/keystore.test.ts`（19；错误 passphrase 硬失败且异常不含密钥/passphrase 片段） | passed |
 | Telegram 确认门 fail-closed | `tests/notify/telegram.test.ts`（26）+ `tests/execution/approvalGate.test.ts`（29）；无 token → `noopNotifier` → build/switch 不可能 | passed |
-| §42 原子建仓全有或全无 | `tests/execution/positionExecutor.test.ts`（atomic 路径恰好 1 笔发送；atomic 抛错**不**回退两笔） | passed（编码待适配器） |
+| §42 原子建仓全有或全无 | `tests/execution/positionExecutor.test.ts`（atomic 路径恰好 1 笔发送；atomic 抛错**不**回退两笔）；`tests/dex/pancakeV3.test.ts`（outer `0x1f0464d1` + 7 条内层调用，1509 字节，目标 SmartRouter）；`tests/dex/uniswapV3.test.ts`（传 `swapForDeficit` 即抛） | passed |
 | 调度不重叠 | `tests/execution/scheduler.test.ts`（13） | passed |
 
 ## 端到端 dry-run 证据（`docs/research/evidence-dry-run-build-20260929.txt`）
@@ -114,8 +114,19 @@ funding               −0.0100%（在 1% 内，预期）
 atomicity             单笔（swap + mint 合并）
 ```
 
+## 新增回归（独立 Review 发现并修复，详见 `review-report.md`）
+
+| 项 | 证据 | 状态 |
+|---|---|---|
+| 伪造 all-true guard 指向非白名单地址 → 拒（KI-21） | `tests/chain/positionAndTx.test.ts` 3 条 + 负向对照；评审者原探针复验 0 发送 | passed |
+| 原子建仓 hash 记主键、可被链上观测解决（KI-22） | `tests/execution/positionExecutor.test.ts`；评审者探针复验 `PRIMARY SUBMITTED` → `CONFIRMED` | passed |
+| REVERTED 后重试建立 attempt 2（KI-23） | `tests/execution/positionExecutor.test.ts`；评审者探针复验 `[1,2]` | passed |
+| 估值不完整时不产出 §66 判定（KI-24） | `tests/execution/portfolioMonitor.test.ts` 4 条；评审者探针复验 `complete=true / totalNAV=3001.11` | passed |
+| §99 区块固定（KI-19） | `tests/chain/rpcFailover.test.ts` 2 条；活链复现 | passed |
+| 内存库隔离（KI-16） | `tests/store/store.test.ts` | passed |
+
 ## 未关闭项汇总
 
-- **实盘仓位类证据**（真实 AUM 下的 collect / remove / 首次 build）需用户提供签名钱包与真实仓位 —— 属 D2 确认门的正常结果，非缺陷。
+- **实盘仓位类证据**（真实 AUM 下的 collect / remove / 首次 build、真实 LP 仓位读数）需用户提供签名钱包与真实仓位 —— 属 D2 确认门的正常结果，**非缺陷**。代码路径、calldata 编码与编排均已由单测 + dry-run 覆盖。
 - Switching 组按 D1 范围裁剪，已登记 KI-11。
 - KI-15（NAV 公式读法）与 KI-17/KI-18/KI-20 待用户/后续处理，已在 `docs/known-issues.md` 登记。
