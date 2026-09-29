@@ -1,0 +1,21 @@
+# Stablecoin whitelist — baseline docs/product/stock-lp-auto-strategy-v1.md §87 (+ §10).
+#
+# §10 V1: USDC and USDT, preferring USDC. `priority` is explicit (1 = most preferred) so ordering
+# never depends on list position.
+#
+# WARNING: BSC USDC and USDT are Binance-Peg tokens with **18 decimals**, not 6. Hardcoding 6
+# produces a $10^12 error. USDC here is NOT Circle-native.
+# USDT additionally needs ZERO_THEN_MAX approval handling on BSC (approve-from-nonzero guard).
+
+stablecoins:
+  - symbol: USDC
+    chain_id: 56
+    contract: "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d"
+    priority: 1
+    notes: "Binance-Peg USDC (not Circle-native); 18 decimals."
+
+  - symbol: USDT
+    chain_id: 56
+    contract: "0x55d398326f99059fF775485246999027B3197955"
+    priority: 2
+    notes: "Binance-Peg USDT; 18 decimals; requires ZERO_THEN_MAX approval."

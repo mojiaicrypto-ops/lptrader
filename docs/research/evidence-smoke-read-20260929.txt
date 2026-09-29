@@ -1,0 +1,112 @@
+lptrader — on-chain read-only smoke test (T4/T5)
+================================================
+  chain id                           56 (BNB Chain)
+  whitelisted DEXes                  uniswap-v3, pancakeswap-v3
+  RPC primary (read path)            (default) https://bsc-dataseed.bnbchain.org
+  RPC secondary (cross-check)        (default) https://bsc-rpc.publicnode.com
+  signer attached                    no (read-only; sendTransaction is unreachable)
+
+chain
+-----
+  endpoints configured               default#1, default#2
+  head block                         124709645
+  gas price                          0.050 Gwei
+
+(a) wallet balances
+-------------------
+  wallet                             not configured (set STRATEGY_WALLET_ADDRESS to read balances)
+  native BNB                         skipped
+
+(b) QQQB/USDT @ PancakeSwap V3 (0.01%)
+--------------------------------------
+  pool address                       0xe531fcb1f5a195de7608b9f4f9518544c2cdb693
+  pool id                            56:pancakeswap-v3:0xe531fcb1f5a195de7608b9f4f9518544c2cdb693
+  token0 / token1                    0x205812CdBed920aFf76C6580abD681a46D11efc7 / 0x55d398326f99059fF775485246999027B3197955
+  fee tier                           100 (0.01%)
+  tick spacing                       1
+  sqrtPriceX96                       2154944071477206728621729597984
+  tick                               66067
+  active liquidity (§108)            1556463151563366171503721
+  price (USDT per QQQB)              739.79746497
+  reserves (QQQB / USDT)             434.2745 / 301344.9950
+  reserve-derived TVL                $622,620
+  read at block                      124709651
+  cross-checked by                   default#1 + default#2
+  tick vs price deviation            0.0007%
+
+(b) QQQB/USDC @ Uniswap V3 (0.3%)
+---------------------------------
+  pool address                       0xfc4e77248b76fefc27c4cac7151a2ee5b5cc590e
+  pool id                            56:uniswap-v3:0xfc4e77248b76fefc27c4cac7151a2ee5b5cc590e
+  token0 / token1                    0x205812CdBed920aFf76C6580abD681a46D11efc7 / 0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d
+  fee tier                           3000 (0.3%)
+  tick spacing                       60
+  sqrtPriceX96                       2151984124972400064582136273129
+  tick                               66039
+  active liquidity (§108)            1647325147708000085584945
+  price (USDC per QQQB)              737.76654726
+  reserves (QQQB / USDC)             845.6788 / 1156486.0645
+  reserve-derived TVL                $1,780,400
+  read at block                      124709657
+  cross-checked by                   default#1 + default#2
+  tick vs price deviation            0.0058%
+
+(d) BEP-677 scaled UI amount — live uiMultiplier() [KI-3 closure evidence]
+--------------------------------------------------------------------------
+  QQQB (0x205812cdbed920aff76c6580abd681a46d11efc7) uiMultiplier = 1000724838657573033
+    QQQB ERC-165                     core(0xa60bf13d)=true balances(0xd890fd71)=true
+    QQQB ratio to 1e18               1.000724838658
+    QQQB toUIAmount(1000000000000000000) contract 1000724838657573033 | local 1000724838657573033 | MATCH
+    QQQB toUIAmount(12345678901234567890123) contract 12354627526556166471372 | local 12354627526556166471372 | MATCH
+    QQQB uiMultiplier vs 1e18        non-trivial (1000724838657573033 ; ratio 1.000724838657573)
+  MSFTB (0x80106cb3ead06659a5ad19df39d9b4733863b9b0) uiMultiplier = 1001313964833366845
+    MSFTB ERC-165                    core(0xa60bf13d)=true balances(0xd890fd71)=true
+    MSFTB ratio to 1e18              1.001313964833
+    MSFTB toUIAmount(1000000000000000000) contract 1001313964833366845 | local 1001313964833366845 | MATCH
+    MSFTB toUIAmount(12345678901234567890123) contract 12361900689154829143191 | local 12361900689154829143191 | MATCH
+    MSFTB uiMultiplier vs 1e18       non-trivial (1001313964833366845 ; ratio 1.0013139648333669)
+  AAPLB (0x431a3bee82e2ca41e49895cbece5bb0f76a89b7a) uiMultiplier = 1000603906075632366
+    AAPLB ERC-165                    core(0xa60bf13d)=true balances(0xd890fd71)=true
+    AAPLB ratio to 1e18              1.000603906076
+    AAPLB toUIAmount(1000000000000000000) contract 1000603906075632366 | local 1000603906075632366 | MATCH
+    AAPLB toUIAmount(12345678901234567890123) contract 12353134531730829758255 | local 12353134531730829758255 | MATCH
+    AAPLB uiMultiplier vs 1e18       non-trivial (1000603906075632366 ; ratio 1.0006039060756324)
+  AMZNB (0x1a4b499833a79a09ad7cf1d42d7dacf71e92eb00) uiMultiplier = 1000000000000000000
+    AMZNB ERC-165                    core(0xa60bf13d)=true balances(0xd890fd71)=true
+    AMZNB ratio to 1e18              1.000000000000
+    AMZNB toUIAmount(1000000000000000000) contract 1000000000000000000 | local 1000000000000000000 | MATCH
+    AMZNB toUIAmount(12345678901234567890123) contract 12345678901234567890123 | local 12345678901234567890123 | MATCH
+    AMZNB uiMultiplier vs 1e18       exactly 1e18 (no distribution accumulated yet — value is still read, never assumed)
+  METAB (0x7425889fe94f9d693e8daefe88bcced6acfef4c0) uiMultiplier = 1000548290410744950
+    METAB ERC-165                    core(0xa60bf13d)=true balances(0xd890fd71)=true
+    METAB ratio to 1e18              1.000548290411
+    METAB toUIAmount(1000000000000000000) contract 1000548290410744950 | local 1000548290410744950 | MATCH
+    METAB toUIAmount(12345678901234567890123) contract 12352447918590251054355 | local 12352447918590251054355 | MATCH
+    METAB uiMultiplier vs 1e18       non-trivial (1000548290410744950 ; ratio 1.000548290410745)
+  NVDAB (0x02fca66c1d1afb4e2a7884261eb00f63598a7436) uiMultiplier = 1000778223752807865
+    NVDAB ERC-165                    core(0xa60bf13d)=true balances(0xd890fd71)=true
+    NVDAB ratio to 1e18              1.000778223753
+    NVDAB toUIAmount(1000000000000000000) contract 1000778223752807865 | local 1000778223752807865 | MATCH
+    NVDAB toUIAmount(12345678901234567890123) contract 12355286601800047534864 | local 12355286601800047534864 | MATCH
+    NVDAB uiMultiplier vs 1e18       non-trivial (1000778223752807865 ; ratio 1.0007782237528078)
+  TSLAB (0x5b1910eaad6450e50f816082aa078c41f10c292f) uiMultiplier = 1000000000000000000
+    TSLAB ERC-165                    core(0xa60bf13d)=true balances(0xd890fd71)=true
+    TSLAB ratio to 1e18              1.000000000000
+    TSLAB toUIAmount(1000000000000000000) contract 1000000000000000000 | local 1000000000000000000 | MATCH
+    TSLAB toUIAmount(12345678901234567890123) contract 12345678901234567890123 | local 12345678901234567890123 | MATCH
+    TSLAB uiMultiplier vs 1e18       exactly 1e18 (no distribution accumulated yet — value is still read, never assumed)
+  PLTRB (0x0ca5d51d0277bd006fd9607d3e560785ebad8222) uiMultiplier = 1000000000000000000
+    PLTRB ERC-165                    core(0xa60bf13d)=true balances(0xd890fd71)=true
+    PLTRB ratio to 1e18              1.000000000000
+    PLTRB toUIAmount(1000000000000000000) contract 1000000000000000000 | local 1000000000000000000 | MATCH
+    PLTRB toUIAmount(12345678901234567890123) contract 12345678901234567890123 | local 12345678901234567890123 | MATCH
+    PLTRB uiMultiplier vs 1e18       exactly 1e18 (no distribution accumulated yet — value is still read, never assumed)
+
+(c) LP position + unclaimed fees
+--------------------------------
+  position                           skipped (set STRATEGY_WALLET_ADDRESS and LP_POSITION_TOKEN_ID)
+
+verdict
+-------
+  all required reads succeeded
+

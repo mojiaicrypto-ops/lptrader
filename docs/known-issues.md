@@ -18,6 +18,10 @@
 | KI-12 | P2 | open | **§101 Backtest / §102 Paper Trading 未实现**：用户选择直接 Phase 3 实盘。§102 的"不发交易"价值子集由 dry-run 建仓脚本部分覆盖，但无 14–30 天 paper 运行期。 | D1（用户选择） | §101 / §102 |
 | KI-13 | P2 | open | **§103 Mainnet Rollout 逐步放量未实现**：用户选择 Mode 1 直接实盘且未设 `$500 → $2000 → …` 金额阶梯。风险补偿为 Telegram 确认门 + 白名单非空校验；无程序化金额上限。 | D2（用户裁定） | §103 |
 | KI-14 | P1 | open | **Telegram 确认门本身成为单点**：若用户长时间不响应，`BUILD_POSITION` / `SWITCH_POOL` 将永久 pending（fail closed 的正确行为），但**风控退出不受影响**（自动）。需要 TTL 过期后的明确告警与状态可见性。 | D2 设计 | §96 / T13 |
+| KI-15 | P1 | open | **§5 NAV 公式与 §64 Profit Vault 不自洽**：§5 写 `TotalNAV = Wallet + LP + Unconfirmed Fees + Realized Fees`，但 §64 的 `Profit Vault = realised fees` 且 reserve 就是钱包余额 → 把 `realizedFees` 再加一次会**重复计算已收手续费**，抬高 NAV 并可能把 NAV 推过 §66 风控线之上，从而**静默关闭亏损保护**。实现取保守读法：**不重复计入**（`realizedFees` 仍计算并落库，只是不作为 NAV 项），低估方向只会让 §66 更早触发。**需用户确认此读法。** | 实现期发现（`src/strategy/nav.ts` 头部注释） | §5 / §64 / §66 |
+| KI-16 | P1 | **resolved** | **`src/store/db.ts` 的 `:memory:` 未隔离**：注释称内存库绕过 singleton map，实际 lookup 发生在 in-memory 判断之前且仍写入 map → 两次 `openDatabase(':memory:')` 返回**同一连接**（实测第二个句柄能看到第一个写入的行）。影响范围超出测试：任何以为拿到独立内存库的调用方（dry-run / paper 模式）会与其它组件共享状态。**已修复**：`openDatabase` 对内存库跳过 map 查找与写入（新增 `isMemoryDatabase()` 导出）；`closeDatabase` 改为幂等。owner 提供 red-before 证据（临时回退后 1 failed）与回归测试。 | 实现期发现（executor 测试串味） | §74 / T11 |
+| KI-17 | P2 | open | **Notifier 返回不匹配的 `requestId` 时确认门会挂到 TTL 才拒绝**：`settle()` 检测到 id 不符只记日志并 return，waiter 因此等到 `expiresAt`。行为本身是 fail closed（最终拒绝），但会把 executor 挂住整个 TTL（实测 30 分钟级）。建议：id 不符时立即以拒绝结算。 | 实现期发现（executor 测试） | §96 / T13 |
+| KI-18 | P2 | open | **`PoolSnapshot.currentTick` / `sqrtPriceX96` / `activeLiquidity` 无可用性位**：三者是冻结的裸类型（非 `Sourced`），RPC 不可达时 provider 写 `0 / 0n / 0n`。`activeLiquidity = 0n` 是合法值（流动性全出区间），`currentTick = 0` 是**合法 tick**，下游无法与真实数据区分。缓解：filter 增加 `onchainVerified !== true` → 拒绝（§96「无法验证即拒绝」），使哨兵值不可达；但该保护依赖所有消费者都走 filter。 | DataTests 发现（D2） | §15 / §16 / §34 |
 
 ## 已登记待处理（Onboarding 阶段产生）
 

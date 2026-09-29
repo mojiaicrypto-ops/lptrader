@@ -1,0 +1,100 @@
+# Strategy configuration — baseline docs/product/stock-lp-auto-strategy-v1.md §85 (+ approvals/telegram).
+#
+# Every value is validated by src/config/schema.ts at startup; an unknown key or an out-of-range
+# value aborts the process (fail closed). Ratios are fractions (0.003 = 0.3%), not percentages.
+# Thresholds below are the §85 baseline defaults, stated explicitly so the operator can see them.
+
+strategy:
+  capital:
+    # §3 at most 70% of NAV may sit in LP; the rest is the §4 reserve.
+    max_lp_ratio: 0.70
+    reserve_ratio: 0.30
+    # §68 InitialStrategyCapital. Fixed by the user; the bot must NEVER top this up automatically.
+    initial_strategy_capital_usd: 10000
+
+  monitor:
+    portfolio_interval_minutes: 5
+    pool_scan_interval_minutes: 60
+    # §89 current-pool health cadence.
+    pool_health_interval_minutes: 15
+
+  range:
+    # §33 lower = current * 0.85, upper = current * 1.16.
+    lower_ratio: 0.85
+    upper_ratio: 1.16
+
+  yield:
+    # §27-§28 target/warning Net APR (computed locally, never a frontend number).
+    target_net_apr: 0.15
+    warning_net_apr: 0.12
+    warning_duration_hours: 72
+
+  pool:
+    # §16 hard filters. A pool failing any of these is discarded before ranking.
+    min_tvl_usd: 500000
+    min_avg_daily_volume_7d: 250000
+    min_age_days: 7
+    max_nav_deviation: 0.01
+    max_swap_price_impact: 0.005
+
+  swap:
+    # §40 caps. Slippage is enforceable inside the atomic call; price impact MUST be self-computed
+    # before encoding (the Pancake SDK cannot enforce it).
+    max_slippage: 0.003
+    max_price_impact: 0.005
+    # §41 quote freshness.
+    quote_ttl_seconds: 30
+
+  switch:
+    # §70-§72 (Phase 5 consumers; present from day one so the thresholds are reviewed up front).
+    min_apr_improvement: 0.08
+    max_break_even_days: 14
+    cooldown_days: 7
+    max_switch_cost_ratio: 0.0075
+
+  risk:
+    # §65/§66: NAV <= initial * (1 - 0.15) triggers GLOBAL_RISK_OFF.
+    max_drawdown: 0.15
+    # §55 depeg ladder, strictly increasing.
+    peg_warning: 0.01
+    stop_new_position: 0.02
+    exit_review: 0.03
+    emergency_exit: 0.05
+    # §59 TVL collapse (24h drop).
+    tvl_drop_review: 0.50
+    tvl_drop_emergency: 0.70
+    # §60 reserve floor below which no new LP may be added.
+    min_reserve_before_new_lp: 0.25
+
+  fees:
+    # §61 V1 never auto-compounds. This is a literal `false` in the schema.
+    auto_compound: false
+    min_collect_usd: 100
+    collect_interval_days: 30
+    # §63 stock-token fees are converted to the stablecoin before entering the reserve.
+    convert_stock_fees_to_stable: true
+
+  approvals:
+    # Human confirmation gate (user decision): only these two need an answer.
+    build_position: confirm
+    switch_pool: confirm
+    # Collect fees / exit position / risk operations stay automatic (§91). Fixed by the schema so a
+    # config edit cannot stall the emergency-exit path.
+    others: auto
+    # After this window the request expires and nothing executes (fail closed).
+    timeout_minutes: 30
+
+  telegram:
+    # Disabled by default: with no notifier there is no way to grant an approval, so the bot
+    # cannot build or switch. Set to true only together with TELEGRAM_BOT_TOKEN in .env.
+    enabled: false
+
+# §11/§12 whitelists. Token addresses come from config/tokens.yaml + config/stablecoins.yaml.
+whitelist:
+  chains:
+    - 56          # BNB Chain (§11: V1 covers BNB Chain only)
+  dexes:
+    - chain_id: 56
+      dex: uniswap-v3
+    - chain_id: 56
+      dex: pancakeswap-v3

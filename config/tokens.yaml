@@ -1,0 +1,78 @@
+# Stock-token whitelist — baseline docs/product/stock-lp-auto-strategy-v1.md §86 (+ §8/§9).
+#
+# IDENTITY RULE (§8): `contract` is the identity. `symbol` is a display alias only.
+# These 8 contracts are also compiled in at src/config/builtins.ts, so an empty or truncated file
+# can never widen the whitelist; entries here only OVERRIDE attributes of the same address.
+# Decimals are an on-chain fact (all bStocks are 18) and can only be restated, not changed.
+#
+# Risk tiers (§9): CORE = QQQB/MSFTB/AAPLB/AMZNB/METAB (auto-tradeable in V1);
+#                  HIGH_VOL = NVDAB/TSLAB/PLTRB (monitor only, auto_trade: false).
+# Reminder: same-symbol impostors exist on BSC (QQQx, QQQon, an unlisted QQQB-like address, and
+# several 8-decimal "<X> Tokenized bStocks" contracts) — never resolve a token by symbol.
+
+tokens:
+  - symbol: QQQB
+    chain_id: 56
+    contract: "0x205812CdBed920aFf76C6580abD681a46D11efc7"
+    name: "Invesqo QQQ"
+    risk_tier: CORE
+    auto_trade: true
+    notes: "Binance bStocks. On-chain name is 'Invesqo QQQ' (misspelling is expected)."
+
+  - symbol: MSFTB
+    chain_id: 56
+    contract: "0x80106cb3ead06659a5ad19df39d9b4733863b9b0"
+    risk_tier: CORE
+    auto_trade: true
+    notes: "Binance bStocks."
+
+  - symbol: AAPLB
+    chain_id: 56
+    contract: "0x431a3bee82e2ca41e49895cbece5bb0f76a89b7a"
+    risk_tier: CORE
+    auto_trade: true
+    notes: "Binance bStocks; no APRO price feed exists."
+
+  - symbol: AMZNB
+    chain_id: 56
+    contract: "0x1a4b499833a79a09ad7cf1d42d7dacf71e92eb00"
+    risk_tier: CORE
+    auto_trade: true
+    notes: "Binance bStocks; no APRO price feed exists."
+
+  - symbol: METAB
+    chain_id: 56
+    contract: "0x7425889fe94f9d693e8daefe88bcced6acfef4c0"
+    risk_tier: CORE
+    auto_trade: true
+    notes: "Binance bStocks; on-chain ticker was observed lowercase."
+
+  - symbol: NVDAB
+    chain_id: 56
+    contract: "0x02fca66c1d1afb4e2a7884261eb00f63598a7436"
+    risk_tier: HIGH_VOL
+    auto_trade: false
+    notes: "HIGH_VOL: monitor only in V1."
+
+  - symbol: TSLAB
+    chain_id: 56
+    contract: "0x5b1910eaad6450e50f816082aa078c41f10c292f"
+    risk_tier: HIGH_VOL
+    auto_trade: false
+    notes: "HIGH_VOL: monitor only in V1."
+
+  - symbol: PLTRB
+    chain_id: 56
+    contract: "0x0ca5d51d0277bd006fd9607d3e560785ebad8222"
+    risk_tier: HIGH_VOL
+    auto_trade: false
+    notes: "HIGH_VOL: monitor only in V1; no Chainlink equity feed exists."
+
+  # WBNB is the native leg of every swap. Compiled in as `wrapped-native`; listed here so the
+  # whitelist is reviewable in one place.
+  - symbol: WBNB
+    chain_id: 56
+    contract: "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
+    risk_tier: CORE
+    auto_trade: false
+    notes: "Wrapped native; must equal WNATIVE[56] before any native-value swap."

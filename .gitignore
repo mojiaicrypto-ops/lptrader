@@ -1,11 +1,25 @@
+# Dependencies / build output
 node_modules/
 dist/
+*.tsbuildinfo
+
+# Secrets — never commit key material, passphrases or decrypted output
 secrets/
 *.enc
 .env
 .env.*
 !.env.example
+
+# Runtime state / local databases
 data/
 *.sqlite
 *.sqlite-*
+*.db
+*.db-journal
+*.db-wal
+
+# Tooling / OS noise
+coverage/
+.vitest/
 .DS_Store
+*.log

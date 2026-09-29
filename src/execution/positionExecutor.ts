@@ -1,0 +1,586 @@
+/**
+ * §39-§43 build / exit orchestration.
+ *
+ * This is the only component that decides whether a transaction may be sent, and it gates on four
+ * independent conditions. All four must pass, in this order:
+ *
+ *   1. **§95 transaction guard** — `TxGuardChecks.ok`. The adapter refuses anyway, but the executor
+ *      must not even attempt to encode a transaction it already knows is invalid.
+ *   2. **§44/§58/§60/§66 write gate** — `checkWriteAllowed(state, action)`. A read-only state sends
+ *      nothing; a `NO_NEW_CAPITAL` state may still exit and collect, but must not commit new capital.
+ *   3. **§40/§41 swap gate** — `evaluateSwapQuote`. Impact and quote freshness are checked BEFORE
+ *      encoding, because the on-chain slippage bound is measured against the quoted price and
+ *      therefore cannot protect against a stale or illiquid quote (research §4.2).
+ *   4. **Approval gate** (user decision D2) — `BUILD_POSITION` and `SWITCH_POOL` are released only by
+ *      a persisted, human-approved request. If the channel is unavailable the action does not run;
+ *      there is no "degrade to automatic" path.
+ *
+ * Everything that mutates is idempotent (§97) through `TxStore`: the intent is persisted before the
+ * send, keyed on a caller-supplied `idempotencyKey`, and a second execution of the same key is
+ * refused rather than re-sent. A §43 partial (swap landed, add-liquidity did not) parks the bot in
+ * `PARTIAL_POSITION` and is never auto-completed.
+ */
+import type {
+  AddLiquidityRequest,
+  CollectFeesRequest,
+  DexAdapter,
+  RemoveLiquidityRequest,
+  SwapExecutionRequest,
+  SwapQuote,
+  TxGuardChecks,
+} from '../types/adapters.ts';
+import type { PoolSnapshot } from '../types/market.ts';
+import type { BotState } from '../types/state.ts';
+import type { Address, Hash, IsoTimestamp, PoolId, Tick, UsdAmount } from '../types/primitives.ts';
+import type { ApprovalGate, GateOutcome } from './approvalGate.ts';
+import type { TxStore } from '../store/txStore.ts';
+import type { StateMachine } from '../strategy/stateMachine.ts';
+import { APPROVAL_KINDS } from '../types/notifier.ts';
+import { SWAP_PURPOSES } from '../types/adapters.ts';
+import { checkWriteAllowed, WRITE_ACTIONS } from '../strategy/stateMachine.ts';
+import { evaluateSwapQuote, planSwapIntent, type SwapLimits } from '../strategy/swapPlanner.ts';
+import type { PositionPlan } from '../strategy/positionPlanner.ts';
+import { canOpenNewAttempt, RAW_TX_FORMATS, TX_PURPOSES } from '../store/txStore.ts';
+
+/** A build refuses for a named reason; it never throws for a business refusal. */
+export const BUILD_REFUSALS = {
+  GUARD_FAILED: 'tx_guard_failed',
+  WRITE_BLOCKED: 'write_blocked_by_state',
+  QUOTE_REJECTED: 'swap_gate_rejected',
+  APPROVAL_DENIED: 'approval_denied',
+  ALREADY_EXECUTED: 'idempotency_key_already_used',
+  ADAPTER_FAILED: 'adapter_failed',
+} as const;
+export type BuildRefusal = (typeof BUILD_REFUSALS)[keyof typeof BUILD_REFUSALS];
+
+export interface BuildPositionInput {
+  readonly pool: PoolSnapshot;
+  readonly capitalUsd: UsdAmount;
+  readonly walletAddress: Address;
+  /** Output of `planPosition` — the §38 optimal ratio, already computed from the live price. */
+  readonly plan: PositionPlan;
+  /** Fresh quote for exactly the swap the plan requires. */
+  readonly quote: SwapQuote;
+  readonly tickRange: { readonly lowerTick: Tick; readonly upperTick: Tick; readonly tickSpacing: number };
+  /** §40 slippage-derived minimums for the add-liquidity leg (RAW). */
+  readonly amount0MinRaw: bigint;
+  readonly amount1MinRaw: bigint;
+  readonly guard: TxGuardChecks;
+  readonly limits: SwapLimits;
+  readonly deadline: SwapExecutionRequest['deadline'];
+  readonly idempotencyKey: string;
+  readonly now: IsoTimestamp;
+}
+
+/** What actually happened. `partial` is set when only part of the intent landed (§43). */
+export interface ExecutionOutcome {
+  readonly ok: boolean;
+  readonly refusal?: BuildRefusal;
+  readonly reason: string;
+  /** Set when a transaction was sent. */
+  readonly swapTxHash?: Hash;
+  readonly addLiquidityTxHash?: Hash;
+  readonly positionTokenId?: bigint;
+  /** §43: the operation must not be retried automatically. */
+  readonly partial?: {
+    readonly completedSteps: readonly string[];
+    readonly failedStep: string;
+    readonly reason: string;
+  };
+  /** §77 audit row ids / the approval request id, when one was involved. */
+  readonly approvalRequestId?: string;
+}
+
+export interface PositionExecutorDeps {
+  readonly dex: DexAdapter;
+  readonly txStore: TxStore;
+  readonly stateMachine: StateMachine;
+  readonly approvalGate: ApprovalGate;
+  /** Current bot state; injected so the executor never caches a stale gate verdict. */
+  readonly currentState: () => BotState;
+}
+
+/**
+ * Executes a position build.
+ *
+ * Atomic vs two-step is a property of the venue: PancakeSwap's SmartRouter can carry
+ * swap+add-liquidity in one transaction, the plain V3 router cannot (its `multicall` is a
+ * self-delegatecall). The executor does not care which — it asks the adapter and interprets the
+ * result, because the partial-failure semantics differ and §43 is the reason this distinction has
+ * to be visible.
+ */
+export class PositionExecutor {
+  private readonly deps: PositionExecutorDeps;
+
+  constructor(deps: PositionExecutorDeps) {
+    this.deps = deps;
+  }
+
+  /**
+   * §39 build. The order of the checks is deliberate: cheap, local, and non-bypassable first;
+   * anything involving a human last, so an operator is never asked to approve something the guard
+   * would have rejected anyway.
+   */
+  async buildPosition(input: BuildPositionInput): Promise<ExecutionOutcome> {
+    const guard = this.checkGuard(input.guard);
+    if (guard !== null) return guard;
+
+    const gate = this.checkState(WRITE_ACTIONS.SWAP_BUILD);
+    if (gate !== null) return gate;
+
+    const quoteVerdict = evaluateSwapQuote(input.quote, input.limits, input.now);
+    if (!quoteVerdict.ok) {
+      return {
+        ok: false,
+        refusal: BUILD_REFUSALS.QUOTE_REJECTED,
+        reason: `swap gate rejected the quote: ${quoteVerdict.reasons.join('; ')}`,
+      };
+    }
+
+    // §38: the swap amount comes from the concentrated-liquidity solution, never a fixed split.
+    const intent = planSwapIntent(input.plan, input.quote, input.quote.slippageTolerance);
+
+    const request = await this.deps.approvalGate.request(APPROVAL_KINDS.BUILD_POSITION, {
+      summary: this.describeBuild(input, intent.amountInRaw),
+      json: {
+        poolId: input.pool.poolId,
+        chainId: input.pool.chainId,
+        dex: input.pool.dex,
+        capitalUsd: input.capitalUsd,
+        entryPrice: input.pool.currentPrice.value,
+        lowerPrice: input.plan.lowerPrice,
+        upperPrice: input.plan.upperPrice,
+        lowerTick: input.plan.lowerTick,
+        upperTick: input.plan.upperTick,
+        liquidity: input.plan.liquidity.toString(),
+        amount0Raw: input.plan.amount0.toString(),
+        amount1Raw: input.plan.amount1.toString(),
+        swapAmountInRaw: intent.amountInRaw.toString(),
+        swapTokenIn: intent.tokenIn,
+        swapTokenOut: intent.tokenOut,
+        amountOutMinimumRaw: intent.amountOutMinimumRaw.toString(),
+        priceImpact: input.quote.priceImpact,
+        slippageTolerance: input.quote.slippageTolerance,
+        maxPriceImpact: input.limits.maxPriceImpact,
+        idempotencyKey: input.idempotencyKey,
+      },
+    });
+
+    // `request()` returns null when the channel could not even publish the request. Nothing has been
+    // created and nothing may run — refusing here is the §96 behaviour, and it is why the executor
+    // treats a null request as a denial rather than retrying.
+    if (request === null) {
+      return {
+        ok: false,
+        refusal: BUILD_REFUSALS.APPROVAL_DENIED,
+        reason:
+          'not executed — no approval request could be created (approval channel unavailable); ' +
+          'fail closed, no build was attempted',
+      };
+    }
+
+    const outcome = await this.deps.approvalGate.gate(APPROVAL_KINDS.BUILD_POSITION, request.id, () =>
+      this.runBuild(input),
+    );
+
+    return this.fromGateOutcome(outcome, request.id);
+  }
+
+  /** §71-style exit. Only a `REMOVE_LIQUIDITY`-class write, so it can run from RISK_REVIEW. */
+  async exitPosition(input: {
+    readonly poolId: PoolId;
+    readonly positionTokenId: bigint;
+    readonly liquidityRaw: bigint | null;
+    readonly amount0MinRaw: bigint;
+    readonly amount1MinRaw: bigint;
+    readonly recipient: Address;
+    readonly deadline: RemoveLiquidityRequest['deadline'];
+    readonly guard: TxGuardChecks;
+    readonly idempotencyKey: string;
+  }): Promise<ExecutionOutcome> {
+    const guard = this.checkGuard(input.guard);
+    if (guard !== null) return guard;
+
+    const gate = this.checkState(WRITE_ACTIONS.REMOVE_LIQUIDITY);
+    if (gate !== null) return gate;
+
+    const duplicate = this.checkIdempotencyKey(input.idempotencyKey);
+    if (duplicate !== null) return duplicate;
+
+    this.deps.txStore.recordIntended(
+      {
+        idempotencyKey: input.idempotencyKey,
+        chainId: this.deps.dex.chainId,
+        purpose: TX_PURPOSES.REMOVE_LIQUIDITY,
+        rawTx: JSON.stringify({
+          kind: 'removeLiquidity',
+          poolId: input.poolId,
+          positionTokenId: input.positionTokenId.toString(),
+          liquidityRaw: input.liquidityRaw === null ? 'all' : input.liquidityRaw.toString(),
+        }),
+        rawTxFormat: RAW_TX_FORMATS.CALL_REQUEST,
+      },
+      input.guard,
+    );
+
+    try {
+      const result = await this.deps.dex.removeLiquidity({
+        poolId: input.poolId,
+        positionTokenId: input.positionTokenId,
+        liquidityRaw: input.liquidityRaw,
+        amount0MinRaw: input.amount0MinRaw,
+        amount1MinRaw: input.amount1MinRaw,
+        recipient: input.recipient,
+        deadline: input.deadline,
+        idempotencyKey: input.idempotencyKey,
+        guard: input.guard,
+      });
+      this.deps.txStore.markSubmitted(input.idempotencyKey, result.txHash);
+      if (result.partial !== undefined) {
+        return {
+          ok: false,
+          reason: `remove liquidity partially executed: ${result.partial.reason}`,
+          partial: {
+            completedSteps: result.partial.completedSteps,
+            failedStep: result.partial.failedStep,
+            reason: result.partial.reason,
+          },
+        };
+      }
+      return { ok: true, reason: 'liquidity removed', addLiquidityTxHash: result.txHash };
+    } catch (error) {
+      return this.adapterFailure(input.idempotencyKey, error);
+    }
+  }
+
+  /**
+   * §62/§63 fee collection. Runs automatically (no approval): it reduces exposure and moves the
+   * proceeds toward the reserve, so blocking it on a human would only increase risk.
+   */
+  async collectFees(input: {
+    readonly poolId: PoolId;
+    readonly positionTokenId: bigint;
+    readonly recipient: Address;
+    readonly guard: TxGuardChecks;
+    readonly idempotencyKey: string;
+  }): Promise<ExecutionOutcome> {
+    const guard = this.checkGuard(input.guard);
+    if (guard !== null) return guard;
+
+    const gate = this.checkState(WRITE_ACTIONS.COLLECT_FEES);
+    if (gate !== null) return gate;
+
+    const duplicate = this.checkIdempotencyKey(input.idempotencyKey);
+    if (duplicate !== null) return duplicate;
+
+    const request: CollectFeesRequest = {
+      poolId: input.poolId,
+      positionTokenId: input.positionTokenId,
+      recipient: input.recipient,
+      idempotencyKey: input.idempotencyKey,
+      guard: input.guard,
+    };
+
+    this.deps.txStore.recordIntended(
+      {
+        idempotencyKey: input.idempotencyKey,
+        chainId: this.deps.dex.chainId,
+        purpose: TX_PURPOSES.COLLECT_FEES,
+        rawTx: JSON.stringify({
+          kind: 'collectFees',
+          poolId: input.poolId,
+          positionTokenId: input.positionTokenId.toString(),
+        }),
+        rawTxFormat: RAW_TX_FORMATS.CALL_REQUEST,
+      },
+      input.guard,
+    );
+
+    try {
+      const result = await this.deps.dex.collectFees(request);
+      this.deps.txStore.markSubmitted(input.idempotencyKey, result.txHash);
+      return { ok: true, reason: 'fees collected', addLiquidityTxHash: result.txHash };
+    } catch (error) {
+      return this.adapterFailure(input.idempotencyKey, error);
+    }
+  }
+
+  /**
+   * The body that runs only once an approval is held.
+   *
+   * Splitting this out is the point: `buildPosition` cannot reach it without passing `gate()`, and
+   * `gate()` in turn cannot release without an approved persisted request.
+   *
+   * Two build shapes exist and the venue decides which (§42). The executor never branches on a DEX
+   * id — it asks the adapter. The difference matters because the failure modes are different: an
+   * atomic build either lands or does not, while a two-transaction build can land the swap and miss
+   * the mint, which is the §43 `PARTIAL_POSITION` case.
+   */
+  private async runBuild(input: BuildPositionInput): Promise<ExecutionOutcome> {
+    // §97: an intent is persisted before the first send, and the *executor* must refuse a key that has
+    // already been used. `TxStore.record` deliberately RETURNS the existing row for a repeated
+    // `(key, attempt)` rather than throwing (it is a record-keeping primitive, not a lock), so the
+    // guard has to live here — otherwise a retry after a crash would re-send the same build.
+    const refusal = this.checkIdempotencyKey(input.idempotencyKey);
+    if (refusal !== null) return refusal;
+
+    this.deps.txStore.recordIntended(
+      {
+        idempotencyKey: input.idempotencyKey,
+        chainId: this.deps.dex.chainId,
+        purpose: this.deps.dex.supportsAtomicBuild ? TX_PURPOSES.ATOMIC_BUILD : TX_PURPOSES.SWAP,
+        rawTx: JSON.stringify({
+          kind: 'buildPosition',
+          poolId: input.pool.poolId,
+          atomic: this.deps.dex.supportsAtomicBuild,
+          capitalUsd: input.capitalUsd,
+          amount0Raw: input.plan.amount0.toString(),
+          amount1Raw: input.plan.amount1.toString(),
+        }),
+        rawTxFormat: RAW_TX_FORMATS.CALL_REQUEST,
+      },
+      input.guard,
+    );
+
+    return this.deps.dex.supportsAtomicBuild
+      ? this.runAtomicBuild(input)
+      : this.runTwoStepBuild(input);
+  }
+
+  /**
+   * §97. Only a definite, observed failure may be retried; an in-flight or confirmed operation must
+   * not be. `canOpenNewAttempt` is the store's own rule, so the two layers cannot disagree about
+   * which states are retryable.
+   */
+  private checkIdempotencyKey(idempotencyKey: string): ExecutionOutcome | null {
+    const latest = this.deps.txStore.latestAttempt(idempotencyKey);
+    if (latest === null) return null;
+    const verdict = canOpenNewAttempt(latest);
+    if (verdict.ok) return null;
+    return {
+      ok: false,
+      refusal: BUILD_REFUSALS.ALREADY_EXECUTED,
+      reason:
+        `not executed — '${idempotencyKey}' is already on record in state ${latest.state} ` +
+        `(${verdict.code}): ${verdict.reason}`,
+    };
+  }
+
+  /**
+   * §42 atomic: exactly ONE adapter send.
+   *
+   * The `swapForDeficit` field is what carries the trade into the add-liquidity calldata; passing it
+   * makes combining mandatory, so a venue that cannot must throw rather than quietly return to the
+   * two-step path (which the executor would then misinterpret as a completed atomic build).
+   */
+  private async runAtomicBuild(input: BuildPositionInput): Promise<ExecutionOutcome> {
+    try {
+      const result = await this.deps.dex.addLiquidity({
+        ...this.addLiquidityRequest(input),
+        swapForDeficit: { quote: input.quote, atomic: true },
+      });
+
+      this.recordSubmitted(`${input.idempotencyKey}#add`, result.txHash, TX_PURPOSES.ADD_LIQUIDITY);
+
+      if (result.partial !== undefined) {
+        return this.partialOutcome('atomic build', result.txHash, result.partial);
+      }
+
+      return {
+        ok: true,
+        reason: 'position built atomically (swap + add liquidity in one transaction)',
+        addLiquidityTxHash: result.txHash,
+        ...(result.positionTokenId === undefined
+          ? {}
+          : { positionTokenId: result.positionTokenId }),
+      };
+    } catch (error) {
+      // Deliberately NOT retried on the two-step path: a venue advertising atomic support that then
+      // fails is an unexpected-state condition, and silently splitting the build would send a swap
+      // the operator never approved under this shape.
+      return this.adapterFailure(input.idempotencyKey, error);
+    }
+  }
+
+  /**
+   * Two-transaction build (§42 fallback for venues whose router cannot combine).
+   *
+   * The window between the two sends is exactly why this path is worse, and why the swap result must
+   * be checked before the mint: once the swap has landed, the planned ratio is stale and the mint
+   * has to be derived from live balances rather than the pre-swap plan.
+   */
+  private async runTwoStepBuild(input: BuildPositionInput): Promise<ExecutionOutcome> {
+    const swapRequest: SwapExecutionRequest = {
+      quote: input.quote,
+      deadline: input.deadline,
+      purpose: SWAP_PURPOSES.BUILD_POSITION,
+      idempotencyKey: input.idempotencyKey,
+      guard: input.guard,
+    };
+
+    let swapTxHash: Hash;
+    try {
+      const swap = await this.deps.dex.executeSwap(swapRequest);
+      swapTxHash = swap.txHash;
+      this.deps.txStore.markSubmitted(input.idempotencyKey, swap.txHash);
+
+      // A partial from the swap leg means the mint must not be attempted at all.
+      if (swap.partial !== undefined) {
+        return this.partialOutcome('swap', swap.txHash, swap.partial);
+      }
+    } catch (error) {
+      return this.adapterFailure(input.idempotencyKey, error);
+    }
+
+    try {
+      const liquidity = await this.deps.dex.addLiquidity(this.addLiquidityRequest(input));
+      this.recordSubmitted(`${input.idempotencyKey}#add`, liquidity.txHash, TX_PURPOSES.ADD_LIQUIDITY);
+
+      if (liquidity.partial !== undefined) {
+        return this.partialOutcome(
+          'add liquidity',
+          liquidity.txHash,
+          liquidity.partial,
+          swapTxHash,
+        );
+      }
+
+      return {
+        ok: true,
+        reason: 'position built (swap then add liquidity, two transactions)',
+        swapTxHash,
+        addLiquidityTxHash: liquidity.txHash,
+        ...(liquidity.positionTokenId === undefined
+          ? {}
+          : { positionTokenId: liquidity.positionTokenId }),
+      };
+    } catch (error) {
+      // The swap already landed. This is the §43 partial: the operator must re-derive the position
+      // from live balances, and the bot must not auto-retry the mint.
+      const failure = this.adapterFailure(input.idempotencyKey, error);
+      return {
+        ...failure,
+        reason: `swap landed but add liquidity failed: ${failure.reason}`,
+        swapTxHash,
+        partial: {
+          completedSteps: ['swap'],
+          failedStep: 'addLiquidity',
+          reason: failure.reason,
+        },
+      };
+    }
+  }
+
+  /** §43: park for manual review, carrying the exact step that failed. */
+  private partialOutcome(
+    label: string,
+    txHash: Hash,
+    partial: { readonly completedSteps: readonly string[]; readonly failedStep: string; readonly reason: string },
+    swapTxHash?: Hash,
+  ): ExecutionOutcome {
+    return {
+      ok: false,
+      reason: `${label} partially executed: ${partial.reason}`,
+      ...(swapTxHash === undefined ? { addLiquidityTxHash: txHash } : { swapTxHash }),
+      partial: {
+        completedSteps: partial.completedSteps,
+        failedStep: partial.failedStep,
+        reason: partial.reason,
+      },
+    };
+  }
+
+  /** §98 bookkeeping for the second leg. The added leg's key is derived, not reused. */
+  private recordSubmitted(idempotencyKey: string, txHash: Hash, purpose: (typeof TX_PURPOSES)[keyof typeof TX_PURPOSES]): void {
+    this.deps.txStore.record({
+      idempotencyKey,
+      chainId: this.deps.dex.chainId,
+      purpose,
+      rawTx: JSON.stringify({ txHash }),
+      rawTxFormat: RAW_TX_FORMATS.CALL_REQUEST,
+      txHash,
+      attempt: 1,
+    });
+  }
+
+  private addLiquidityRequest(input: BuildPositionInput): AddLiquidityRequest {
+    return {
+      poolId: input.pool.poolId,
+      tickRange: {
+        lowerTick: input.tickRange.lowerTick,
+        upperTick: input.tickRange.upperTick,
+        tickSpacing: input.tickRange.tickSpacing,
+      },
+      // §37: the amounts come from the plan solved against live balances, not from a fixed split.
+      // On an atomic venue the router tops up the deficit itself; on a two-step venue the caller
+      // must have re-derived these from the post-swap wallet.
+      amount0DesiredRaw: input.plan.amount0,
+      amount1DesiredRaw: input.plan.amount1,
+      amount0MinRaw: input.amount0MinRaw,
+      amount1MinRaw: input.amount1MinRaw,
+      recipient: input.walletAddress,
+      deadline: input.deadline,
+      idempotencyKey: `${input.idempotencyKey}#add`,
+      guard: input.guard,
+    };
+  }
+
+  /** §95. `ok` is the aggregate the adapters also check; a `false` here stops everything. */
+  private checkGuard(guard: TxGuardChecks): ExecutionOutcome | null {
+    if (guard.ok) return null;
+    return {
+      ok: false,
+      refusal: BUILD_REFUSALS.GUARD_FAILED,
+      reason: `transaction guard rejected the build: ${guard.failures.join('; ')}`,
+    };
+  }
+
+  /** §44/§58/§60/§66. Reads the state at call time, never a cached value. */
+  private checkState(action: (typeof WRITE_ACTIONS)[keyof typeof WRITE_ACTIONS]): ExecutionOutcome | null {
+    const state = this.deps.currentState();
+    const verdict = checkWriteAllowed(state, action);
+    if (verdict.ok) return null;
+    return {
+      ok: false,
+      refusal: BUILD_REFUSALS.WRITE_BLOCKED,
+      reason: verdict.reason ?? `${state} does not permit ${action.id}`,
+    };
+  }
+
+  private adapterFailure(idempotencyKey: string, error: unknown): ExecutionOutcome {
+    const message = error instanceof Error ? error.message : String(error);
+    // The record is deliberately left in its persisted state: a network error is `UNKNOWN` territory
+    // and must be resolved by a chain query, never by re-sending (§96/§98).
+    this.deps.txStore.markUnknown(idempotencyKey, message);
+    return {
+      ok: false,
+      refusal: BUILD_REFUSALS.ADAPTER_FAILED,
+      reason: `adapter failed: ${message} (left unresolved for a chain query; not retried)`,
+    };
+  }
+
+  private fromGateOutcome(outcome: GateOutcome<ExecutionOutcome>, requestId: string): ExecutionOutcome {
+    if (outcome.approved) return { ...outcome.value, approvalRequestId: requestId };
+    return {
+      ok: false,
+      refusal: BUILD_REFUSALS.APPROVAL_DENIED,
+      reason: `not executed — ${outcome.reason}: ${outcome.recordedReason}`,
+      approvalRequestId: requestId,
+    };
+  }
+
+  /** Human-readable digest for the approval message. Must contain no secret material. */
+  private describeBuild(input: BuildPositionInput, swapAmountInRaw: bigint): string {
+    const price = input.pool.currentPrice.value;
+    return [
+      `BUILD ${input.pool.dex} ${input.pool.poolId}`,
+      `capital $${input.capitalUsd.toFixed(2)}`,
+      `price $${price.toFixed(4)}`,
+      `range $${input.plan.lowerPrice.toFixed(2)} – $${input.plan.upperPrice.toFixed(2)}`,
+      `ticks ${input.plan.lowerTick} → ${input.plan.upperTick}`,
+      `swap ${swapAmountInRaw.toString()} raw`,
+      `impact ${(input.quote.priceImpact * 100).toFixed(4)}% (max ${(input.limits.maxPriceImpact * 100).toFixed(2)}%)`,
+      `slippage ${(input.quote.slippageTolerance * 100).toFixed(2)}%`,
+    ].join('\n');
+  }
+}
