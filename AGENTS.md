@@ -65,14 +65,25 @@
 1. 更新正式文档：`PROJECT.md`、迭代文档、`docs/document-index.md`、`docs/code-map.md`（任务状态 / 边界 / 待立项列表）。
 2. 归档 `plan.md` / `implementation-summary.md` / `review-report.md` / `test-report.md` / `settlement-report.md` 至 `docs/archive/tasks/<date>-<编号>/`。
 3. 机械核对：grep 全仓**非归档区**本任务领域关键词，无"待立项 / 后续 Planning / 未启用 / 未实现 / 暂提示"等过时状态残留（含相邻文档与代码注释）。
-4. known-issues 登记：`docs/known-issues.md` 无本任务遗留未登记项（Review 的 P2/P3、Test 失败/未覆盖、Settlement 的"已知保留"必须登记；修复时销号）。
-5. git 工作区干净，全部产物已提交。
+4. **逐目录 `git ls-files` 与实际文件数核对**（`for d in src tests scripts config; do echo "$d: $(git ls-files $d|wc -l) / $(find $d -type f|wc -l)"; done`）。**不得**用 `git status` 或"文件可读"代替：未锚定的 `.gitignore` 规则（如裸 `data/` 会匹配 `src/data/**`）会让整层代码留在磁盘但**从未入库**，`git status` 完全看不出来。D2 曾因此丢失整个数据层的提交。
+5. **组合根装配须以真实依赖跑通一次只读 + dry-run 全链路**（`npm run smoke:read`、`npm run dry-run:build`），不只看模块级单测。D2 的 3 个最严重缺陷（定价接了错误的依赖、写路径信任调用方自报布尔值、写目标合约漏登记）全部发生在**装配层**，而验收清单全是模块级，模块级全绿也发现不了。确认装配时**没有** stub / 占位 / `as never` 顶上依赖。
+6. known-issues 登记：`docs/known-issues.md` 无本任务遗留未登记项（Review 的 P2/P3、Test 失败/未覆盖、Settlement 的"已知保留"必须登记；修复时销号）。
+7. git 工作区干净，全部产物已提交。
 
 ## 编号与归档
 
 - 任务编号：`D<序号>`。
 - 归档目录：`docs/archive/tasks/<YYYY-MM-DD>-D<序号>/`。
 - known-issues：`docs/known-issues.md`。
+
+## 评审代理的取证要求（撞坑即补，源自 D2）
+
+D2 的 4 个评审代理（1 个综合 + 3 个分域）**全部在产出报告前中断**，结论只能从其探针脚本与会话记录取证。因此要求：
+
+- 评审者必须把验证探针落在**仓库外的固定路径**（如 `/tmp/<task>-review/*.test.ts`），并保证探针可独立复跑。
+- 评审者应在开始深入后**尽快**落一份最小 findings 草图，再继续深挖；不要把所有结论留到最后的正式报告 —— 一次中断就意味着全部结论丢失。
+- 取证整理者（集成方）必须在报告里**明确标注**哪些结论来自评审者探针、哪些来自自行复现，不得把两者混为一谈。
+- 独立性：若无法配置**不同模型**，必须在 review-report 的 `reviewer_model` 处如实说明"同模型 + 隔离会话"，不得声称满足 `references/delivery-workflow.md` 的模型独立性建议。
 
 ## 流程复盘
 

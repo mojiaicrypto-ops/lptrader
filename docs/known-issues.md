@@ -4,10 +4,11 @@
 
 | ID | 严重度 | 状态 | 描述 | 来源 | 关联 |
 |---|---|---|---|---|---|
-| KI-1 | P1 | open | **L3 硬门禁未纳入真实资金操作**：`AGENTS.md` 的 L3 关键词含 `swap`/`sendTransaction`，但"主网真实资金执行"仅由 Plan 确认段的规则约束，未做机械拦截（无 dry-run 强制、无金额上限校验）。 | Onboarding 决策 D1 | AGENTS.md / 执行层 |
+| KI-1 | P1 | **resolved（部分）** | ~~L3 硬门禁未纳入真实资金操作~~ **已建立的机械拦截**：① `sendTransaction` 广播前独立校验写目标 ∈ 白名单 DEX 合约（伪造 guard 无法绕过，KI-21）；② `BUILD_POSITION`/`SWITCH_POOL` 只能经 `ApprovalGate.gate()` 放行，无 token 时为 `noopNotifier`（永不放行）；③ §44 写门（`READ_ONLY_STATES`/`NO_NEW_CAPITAL_STATES`）；④ 白名单为空拒启；⑤ `dry-run:build` 为可运行的零发送全链路。**残留**：**无程序化金额上限**（用户 D2 选择不加 §103 阶梯）→ 见 KI-13。 | Onboarding 决策 D1 + 本次交付 | AGENTS.md / 执行层 |
+
 | KI-2 | P1 | **resolved** | ~~`RangeProgress` 定义与 Range 上下限口径不一致~~ → 用户裁定：按基线 §49 字面公式，仅驱动 `BOUNDARY_WATCH` 告警，不参与交易决策（见 `docs/decisions/D2-execution-and-approvals.md`）。 | 调研 C3 | §33 / §49 |
-| KI-3 | P1 | open | **BEP-677 Scaled UI Amount 未纳入基线与循环**：所有余额/份额必须走 UI 换算（`balanceOfUI`/`toUIAmount`）且 `uiMultiplier()` 不得硬编码；企业行动（拆股/分红 ex-date）会暂停存取与交易，需要停摆逻辑。 | 调研 §2 | §5 / §75 |
-| KI-4 | P1 | open | **`tick` / `liquidity` 无任何免费 HTTP API 提供** → 必须实现链上读取层（viem multicall `slot0()`/`liquidity()`/`fee()`）；`fees24h/7d` 无免费直供，只能 `volume × feeTier` 推导或走需 key 的 subgraph。 | 调研 §4.2 | §15 / §18 |
+| KI-3 | P1 | **resolved** | ~~BEP-677 Scaled UI Amount 未纳入基线与循环~~ **已实现并实测**：`TokenReader` 运行期探测 ERC-165 + 读 `uiMultiplier()` + `balanceOfUI`/`toUIAmount`/`fromUIAmount`；`TokenAmount` 同时携带 raw/ui/multiplier，`PortfolioMonitor` 复用余额批次读到的 multiplier（禁止硬编码 1e18）。**实测证据**：8 个 bStock 的 multiplier 全部读出（QQQB `1.000724838658`、MSFTB `1.001313964833`…），本地换算与合约 `toUIAmount` 逐样本 MATCH（`docs/research/evidence-smoke-read-20260929.txt`）。**残留**：企业行动（拆股/分红 ex-date）的**自动停摆**逻辑未实现 → 见 KI-26。 | 调研 §2 | §5 / §75 |
+| KI-4 | P1 | **resolved** | ~~`tick`/`liquidity` 无免费 HTTP API~~ **已实现链上读取层**：`PoolReader` 经 viem `eth_call` + Multicall3 读 `slot0()`/`liquidity()`/`fee()`/`token0`/`token1`/`tickSpacing`；`BscOnchainPoolStateSource` 供扫描器做存在性探针。**实测**：真实扫描输出 `currentTick 66041 / activeLiquidity 1158746174719549200573411`。`fees24h/7d` 按计划以 `volume × feeTier` 推导并在返回值上标注为 `derived`（非伪装真值）。 | 调研 §4.2 | §15 / §18 |
 | KI-5 | P2 | open | **BSC `eth_getLogs` 受限**（官方 dataseed 禁用；Ankr 限 1000 区块；QuickNode 免费试用限 5 区块）→ 事件驱动设计必须小窗口分页或 WS。 | 调研 §4.2 | §98 / §99 |
 | KI-6 | P2 | open | **`@pancakeswap/v3-sdk` 精确锁定 `viem 2.37.13`**，与 viem 最新 2.57.0 冲突 → 需对齐版本或加 overrides 并冒烟验证，否则装出两份 viem。 | 调研 §5 | 依赖层 |
 | KI-7 | P2 | open | **同 symbol 异物与 ticker 大小写不一**（`QQQx`/`QQQon`/冒充地址；链上 ticker 小写）→ Registry 必须以地址为主键，禁止 symbol 等值比较。 | 调研 §1 | §8 |
@@ -31,6 +32,9 @@
 
 | KI-24 | P1 | **resolved** | ~~组合监控用**股票**参考价源给**稳定币**定价（类别错误：`ReferencePriceProvider` 只认 bStock ticker，对 USDC/USDT 必然返回不可用）→ 预留资金计价为 0 → `totalNAV = 0` → §66 风控线判定 `breached: true` → **健康组合被当成全额亏损而立即 GLOBAL_RISK_OFF 停机**~~。且 `buildPriceTable` 对**白名单每一个**未定价 token 都记问题（与持仓无关）→ 任何组合都永远 `complete=false`。**实测**：修复前 `complete=false / totalNAV=0 / breached=true`。**已修复**：① 新增 `PortfolioMonitor` 的 `stablecoinPrice` 依赖（runtime 接 Binance `USDCUSDT` spot，USDT 因是报价币按约定为 1）；② **估值不完整时 `drawdown` 返回 `null`**（既非 safe 也非 breached，因为此时 `totalNAV` 只是下界）；③ 未定价问题只对**实际持仓非零**的 token 报告。修复后同一场景：`complete=true / totalNAV=3001.11 / problems=[]`。回归测试 4 条（不完整 → `drawdown` 为 null；稳定币专用源计价；源不可用不假设 1.0；完整估值仍能报出真实 breach）。 | 独立评审（ReviewFailClosed 探针） | §5 / §65 / §96 |
 | KI-25 | P1 | **resolved** | ~~实测缺陷：原子建仓把 hash 记在派生键（KI-22）与重试 attempt 固定为 1（KI-23）—— 见上两条。~~ | 独立评审 | §42 / §97 / §98 |
+
+| KI-26 | P2 | open | **BEP-677 企业行动（拆股/分红 ex-date）未实现自动停摆**：`uiMultiplier()` 运行期读取与换算已闭环（KI-3），但"监测到 `UIMultiplierUpdated` 后在生效窗内暂停交易"的逻辑未实现。风险：企业行动期间交易被暂停，本系统可能在停摆窗内发起建仓或退出。缓解：建仓/换池需人工确认（D2），操作者有窗口拦截；但**自动**路径（collect / 风险退出）无此保护。 | KI-3 的残留 | §58 / §75 |
+| KI-27 | P2 | open | **同 DEX 的 tickSpacing 未与链上回读交叉校验**：`planPosition` 用内置 fee→spacing 表的 spacing 做对齐，而 `PoolReader` 也读了链上 `tickSpacing()`；两处一致时无碍，但缺少"不一致即拒"的显式断言（当前仅由池视图比对间接覆盖）。 | 集成期观察 | §34 |
 
 ## 已登记待处理（Onboarding 阶段产生）
 
