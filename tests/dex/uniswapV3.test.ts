@@ -17,7 +17,7 @@ import { buildTxGuard, emptyTxGuard, selectorOf } from '../../src/chain/txState.
 import { BSC_ADDRESSES, BSC_DEX_CONTRACTS } from '../../src/config/builtins.ts';
 import { createWhitelist, defaultDexWhitelist } from '../../src/config/index.ts';
 import { createBuiltinRegistry } from '../../src/config/registry.ts';
-import { tickSpacingFor } from '../../src/dex/index.ts';
+import { createDexAdapter, tickSpacingFor } from '../../src/dex/index.ts';
 import {
   DEFAULT_SLIPPAGE_TOLERANCE,
   MAX_UINT128,
@@ -30,7 +30,7 @@ import {
   createUniswapV3Adapter,
 } from '../../src/dex/uniswapV3.ts';
 import { applyFloorRatio } from '../../src/util/decimal.ts';
-import { TX_STATES, type DeadlineSpec, type SwapQuote, type TxGuardChecks } from '../../src/types/adapters.ts';
+import { TX_STATES, type AddLiquidityRequest, type DeadlineSpec, type SwapQuote, type TxGuardChecks } from '../../src/types/adapters.ts';
 import { DEX_IDS } from '../../src/types/primitives.ts';
 import { callEntry, createMockNode, entry, type MockNodeOptions } from '../chain/mockNode.ts';
 
@@ -252,6 +252,22 @@ describe('capability', () => {
     expect(
       () => new UniswapV3Adapter({ chainId: 56, whitelist, chain: otherChain }),
     ).toThrowError(/mismatched pair/);
+  });
+
+  it('plugs into the shared §82 factory as a registered constructor', () => {
+    const { adapter } = harness();
+    const chain = (adapter as unknown as { chain: BscChainAdapter }).chain;
+    const whitelist = createWhitelist(createBuiltinRegistry().list(), [56], defaultDexWhitelist([56]));
+    // The runtime builds adapters through `createDexAdapter`; this proves the exported constructor
+    // matches the shape that factory calls, so wiring can never be the thing that fails at startup.
+    const built = createDexAdapter(
+      DEX_IDS.UNISWAP_V3,
+      { chainId: 56, whitelist, chain },
+      { [DEX_IDS.UNISWAP_V3]: createUniswapV3Adapter },
+    );
+    expect(built).toBeInstanceOf(UniswapV3Adapter);
+    expect(built.dex).toBe(DEX_IDS.UNISWAP_V3);
+    expect(built.supportsAtomicBuild).toBe(false);
   });
 
   it('exposes a factory that builds the same adapter', () => {
@@ -561,7 +577,8 @@ describe('§95 guard: no write path may send through a failed guard', () => {
       }),
     ).rejects.toBeInstanceOf(TxGuardError);
     expect(sent).toEqual([]);
-    expect(node.countOf('eth_call')).toBe(0);
+    // Every RPC method is untouched: the §95 refusal happens before the adapter reads anything.
+    expect(node.calls).toEqual([]);
   });
 
   it('addLiquidity refuses and sends nothing', async () => {
@@ -581,8 +598,7 @@ describe('§95 guard: no write path may send through a failed guard', () => {
       }),
     ).rejects.toBeInstanceOf(TxGuardError);
     expect(sent).toEqual([]);
-    expect(node.countOf('eth_call')).toBe(0);
-    expect(node.countOf('eth_estimateGas')).toBe(0);
+    expect(node.calls).toEqual([]);
   });
 
   it('removeLiquidity refuses and sends nothing', async () => {
@@ -601,8 +617,7 @@ describe('§95 guard: no write path may send through a failed guard', () => {
       }),
     ).rejects.toBeInstanceOf(TxGuardError);
     expect(sent).toEqual([]);
-    expect(node.countOf('eth_call')).toBe(0);
-    expect(node.countOf('eth_estimateGas')).toBe(0);
+    expect(node.calls).toEqual([]);
   });
 
   it('collectFees refuses and sends nothing', async () => {
@@ -617,8 +632,7 @@ describe('§95 guard: no write path may send through a failed guard', () => {
       }),
     ).rejects.toBeInstanceOf(TxGuardError);
     expect(sent).toEqual([]);
-    expect(node.countOf('eth_call')).toBe(0);
-    expect(node.countOf('eth_estimateGas')).toBe(0);
+    expect(node.calls).toEqual([]);
   });
 
   it('an entirely empty guard never reaches a send', async () => {
@@ -633,12 +647,12 @@ describe('§95 guard: no write path may send through a failed guard', () => {
       }),
     ).rejects.toBeInstanceOf(TxGuardError);
     expect(sent).toEqual([]);
-    expect(node.countOf('eth_call')).toBe(0);
+    expect(node.calls).toEqual([]);
   });
 });
 
 describe('§42 addLiquidity', () => {
-  function add(overrides: Record<string, unknown> = {}) {
+  function add(overrides: Partial<AddLiquidityRequest> = {}): AddLiquidityRequest {
     return {
       poolId: POOL_ID,
       tickRange: { lowerTick: -60, upperTick: 60, tickSpacing: SPACING },
@@ -657,7 +671,7 @@ describe('§42 addLiquidity', () => {
   it('refuses swapForDeficit and sends nothing — the venue cannot be atomic', async () => {
     const { adapter, sent } = harness({ contracts: liveContracts() });
     const error = await adapter
-      .addLiquidity(add({ swapForDeficit: { quote: quote(), atomic: true } }) as never)
+      .addLiquidity(add({ swapForDeficit: { quote: quote(), atomic: true } }))
       .catch((thrown: unknown) => thrown);
 
     expect(error).toBeInstanceOf(Error);
@@ -670,7 +684,7 @@ describe('§42 addLiquidity', () => {
 
   it('encodes mint with the pool’s own token order, the aligned range and the raw amounts', async () => {
     const { adapter, sent } = harness({ contracts: liveContracts() });
-    const result = await adapter.addLiquidity(add() as never);
+    const result = await adapter.addLiquidity(add());
 
     expect(result.state).toBe(TX_STATES.SUBMITTED);
     // The mint return values need a receipt, so they are absent rather than assumed.
@@ -703,7 +717,7 @@ describe('§42 addLiquidity', () => {
     // -61 is not a multiple of 60: minting it would revert, and nudging it would mint a range the
     // planner never approved.
     await expect(
-      adapter.addLiquidity(add({ tickRange: { lowerTick: -61, upperTick: 60, tickSpacing: SPACING } }) as never),
+      adapter.addLiquidity(add({ tickRange: { lowerTick: -61, upperTick: 60, tickSpacing: SPACING } })),
     ).rejects.toThrowError(/not aligned to tickSpacing 60/);
     expect(sent).toEqual([]);
   });
@@ -711,7 +725,7 @@ describe('§42 addLiquidity', () => {
   it('rejects a range whose declared tickSpacing disagrees with the DEX fee map', async () => {
     const { adapter, sent } = harness({ contracts: liveContracts() });
     await expect(
-      adapter.addLiquidity(add({ tickRange: { lowerTick: -60, upperTick: 60, tickSpacing: 10 } }) as never),
+      adapter.addLiquidity(add({ tickRange: { lowerTick: -60, upperTick: 60, tickSpacing: 10 } })),
     ).rejects.toThrowError(/declares tickSpacing 10/);
     expect(sent).toEqual([]);
   });
@@ -719,13 +733,13 @@ describe('§42 addLiquidity', () => {
   it('rejects inverted, out-of-bounds and fractional tick ranges', async () => {
     const { adapter, sent } = harness({ contracts: liveContracts() });
     await expect(
-      adapter.addLiquidity(add({ tickRange: { lowerTick: 60, upperTick: 60, tickSpacing: SPACING } }) as never),
+      adapter.addLiquidity(add({ tickRange: { lowerTick: 60, upperTick: 60, tickSpacing: SPACING } })),
     ).rejects.toThrowError(/lowerTick < upperTick/);
     await expect(
-      adapter.addLiquidity(add({ tickRange: { lowerTick: -60, upperTick: 900_000, tickSpacing: SPACING } }) as never),
+      adapter.addLiquidity(add({ tickRange: { lowerTick: -60, upperTick: 900_000, tickSpacing: SPACING } })),
     ).rejects.toThrowError(/representable range/);
     await expect(
-      adapter.addLiquidity(add({ tickRange: { lowerTick: -60.5, upperTick: 60, tickSpacing: SPACING } }) as never),
+      adapter.addLiquidity(add({ tickRange: { lowerTick: -60.5, upperTick: 60, tickSpacing: SPACING } })),
     ).rejects.toThrowError(/must be integers/);
     expect(sent).toEqual([]);
   });
@@ -733,17 +747,25 @@ describe('§42 addLiquidity', () => {
   it('refuses a previousBlockhash deadline: the deployed NPM has no bytes32 multicall', async () => {
     const { adapter, sent } = harness({ contracts: liveContracts() });
     const error = await adapter
-      .addLiquidity(add({ deadline: BLOCKHASH_DEADLINE }) as never)
+      .addLiquidity(add({ deadline: BLOCKHASH_DEADLINE }))
       .catch((thrown: unknown) => thrown);
     expect((error as Error).message).toMatch(/previousBlockhash/);
     expect((error as Error).message).toMatch(/multicall\(bytes32,bytes\[\]\)/);
     expect(sent).toEqual([]);
   });
 
+  it('refuses a mint to the zero address rather than creating an unrecoverable position', async () => {
+    const { adapter, sent } = harness({ contracts: liveContracts() });
+    await expect(
+      adapter.addLiquidity(add({ recipient: '0x0000000000000000000000000000000000000000' })),
+    ).rejects.toThrowError(/zero address/);
+    expect(sent).toEqual([]);
+  });
+
   it('refuses a build with zero desired amounts instead of minting nothing', async () => {
     const { adapter, sent } = harness({ contracts: liveContracts() });
     await expect(
-      adapter.addLiquidity(add({ amount0DesiredRaw: 0n, amount1DesiredRaw: 0n }) as never),
+      adapter.addLiquidity(add({ amount0DesiredRaw: 0n, amount1DesiredRaw: 0n })),
     ).rejects.toThrowError(/ZERO_LIQUIDITY/);
     expect(sent).toEqual([]);
   });
@@ -825,6 +847,29 @@ describe('executeSwap calldata', () => {
         guard: GUARD,
       }),
     ).rejects.toThrowError(/needs an attached signer/);
+    expect(sent).toEqual([]);
+  });
+
+  it('refuses an unbounded swap: a non-positive or inverted amountOutMinimum', async () => {
+    const { adapter, sent } = harness({ contracts: liveContracts(), now: () => NOW });
+    const base = {
+      deadline: TIMESTAMP_DEADLINE,
+      purpose: 'BUILD_POSITION' as const,
+      idempotencyKey: 'k',
+      guard: GUARD,
+    };
+    // A zero floor would accept any output whatsoever.
+    await expect(
+      adapter.executeSwap({ ...base, quote: quote({ amountOutMinimumRaw: 0n }) }),
+    ).rejects.toThrowError(/non-positive floor/);
+    // A floor above the quoted output is a guaranteed revert.
+    await expect(
+      adapter.executeSwap({ ...base, quote: quote({ amountOutMinimumRaw: QUOTED_OUT + 1n }) }),
+    ).rejects.toThrowError(/exceeds its amountOutRaw/);
+    // A zero-input swap has nothing to sell.
+    await expect(
+      adapter.executeSwap({ ...base, quote: quote({ amountInRaw: 0n }) }),
+    ).rejects.toThrowError(/positive quote.amountInRaw/);
     expect(sent).toEqual([]);
   });
 

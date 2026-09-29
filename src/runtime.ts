@@ -42,7 +42,7 @@ import type { TokenReader } from './chain/tokenReader.ts';
 import { TokenReader as TokenReaderImpl } from './chain/tokenReader.ts';
 import type { DexAdapter, PoolDataProvider, ReferencePriceProvider } from './types/adapters.ts';
 import type { StrategyConfig } from './types/config.ts';
-import type { IsoTimestamp, UsdAmount } from './types/primitives.ts';
+import { DEX_IDS, type DexId, type IsoTimestamp, type UsdAmount } from './types/primitives.ts';
 import type { PoolSnapshot } from './types/market.ts';
 import { ALERT_SEVERITIES, type Notifier } from './types/notifier.ts';
 import type { DecryptedPrivateKey } from './security/keystore.ts';
@@ -60,6 +60,9 @@ import { PortfolioMonitor } from './execution/portfolioMonitor.ts';
 import { PoolScanner, foundPools } from './data/poolScanner.ts';
 import { filterPools } from './data/poolFilter.ts';
 import { createReferencePriceProvider } from './data/referencePrice.ts';
+import { createPancakeV3Adapter } from './dex/pancakeV3.ts';
+import { createUniswapV3Adapter } from './dex/uniswapV3.ts';
+import { DEX_PREFERENCE, createDexAdapter, type DexAdapterFactoryOptions } from './dex/index.ts';
 import { createNotifierFromConfig } from './notify/telegram.ts';
 import { type SchedulerCadence } from './execution/scheduler.ts';
 import { readKeystoreFile } from './security/keystore.ts';
@@ -94,8 +97,16 @@ export interface RuntimeSigner {
 
 export interface BuildRuntimeOptions {
   readonly config: StrategyConfig;
-  /** §82 DEX implementation. Required: without it a build could not be encoded. */
-  readonly dex: DexAdapter;
+  /**
+   * §82 DEX implementation. Omitted ⇒ the composition root constructs every whitelisted adapter and
+   * picks the preferred one (PancakeSwap first, because it is the only venue that can perform the §42
+   * atomic build). Injecting one is for tests and for a deliberately single-venue run.
+   */
+  readonly dex?: DexAdapter;
+  /** Every adapter to construct when `dex` is not injected, in preference order. */
+  readonly dexConstructors?: Readonly<
+    Partial<Record<DexId, (options: DexAdapterFactoryOptions) => DexAdapter>>
+  >;
   /** §83 market-data source. Required: without it no pool can be discovered. */
   readonly provider: PoolDataProvider;
   /** §84 reference prices. Omitted ⇒ a Binance-backed provider is constructed for the chain. */
@@ -127,8 +138,7 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
   if (chainId === undefined) {
     throw new Error('no whitelisted chain: refusing to start (§11)');
   }
-  // §12: the injected DEX must be one this chain is allowed to use, or the whole runtime is suspect.
-  config.whitelist.assertWhitelistedDex(chainId, options.dex.dex);
+
 
   const db = openDatabase(env['LP_DB_PATH'] ?? 'data/lptrader.db');
   const stateStore = new StateStore(db);
@@ -144,6 +154,25 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
     whitelist: config.whitelist,
     ...(options.signer === undefined ? {} : { account: options.signer.account }),
   });
+
+  // §82: one adapter per whitelisted DEX, constructed from the SAME chain instance so there is exactly
+  // one signer and one set of §99 cross-check semantics for the whole process. The preferred adapter is
+  // the first in `DEX_PREFERENCE` that this chain is whitelisted for.
+  const constructors = options.dexConstructors ?? {
+    [DEX_IDS.PANCAKESWAP_V3]: (factoryOptions) => createPancakeV3Adapter(factoryOptions),
+    [DEX_IDS.UNISWAP_V3]: (factoryOptions) => createUniswapV3Adapter(factoryOptions),
+  };
+  const adapters = options.dex !== undefined
+    ? [options.dex]
+    : DEX_PREFERENCE.filter((dex) => config.whitelist.isWhitelistedDex(chainId, dex)).map((dex) =>
+        createDexAdapter(dex, { chainId, whitelist: config.whitelist, chain }, constructors),
+      );
+  const dex = options.dex ?? adapters[0];
+  if (dex === undefined) {
+    throw new Error(
+      `no DEX adapter could be constructed for chain ${chainId}: no whitelisted DEX is registered in this build`,
+    );
+  }
 
   const tokenReader = new TokenReaderImpl(chain, registryFor(config), chainId);
   const positionReader = new PositionReaderImpl(chain, chainId);
@@ -176,7 +205,7 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
   const executor = readOnly
     ? null
     : new PositionExecutor({
-        dex: options.dex,
+        dex,
         txStore,
         stateMachine: stateMachineRef,
         approvalGate: approvals,
@@ -203,9 +232,9 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
     tokenReader,
     positionReader,
     referencePrice,
-    dex: options.dex,
+    dex,
     provider: options.provider,
-    scanner: new PoolScanner({ config, provider: options.provider, dexAdapters: [options.dex] }),
+    scanner: new PoolScanner({ config, provider: options.provider, dexAdapters: adapters }),
     monitor,
     notifier,
     approvals,

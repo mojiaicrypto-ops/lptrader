@@ -648,6 +648,33 @@ export class UniswapV3Adapter implements DexAdapter {
 
     const quote = request.quote;
     const recipient = this.requireSigner('executeSwap');
+    // An unbounded swap must never be signed. A zero `amountOutMinimum` would accept any output —
+    // exactly what the §40 slippage bound exists to prevent — and the §95 guard checks the
+    // *tolerance* value, not the bound derived from it, so the encoding is validated here.
+    if (quote.amountInRaw <= 0n) {
+      throw new ChainError(
+        CHAIN_ERROR_CODES.INVALID_ARGUMENT,
+        `executeSwap requires a positive quote.amountInRaw, got ${quote.amountInRaw.toString()}`,
+        { poolId: quote.poolId },
+      );
+    }
+    if (quote.amountOutMinimumRaw <= 0n) {
+      throw new ChainError(
+        CHAIN_ERROR_CODES.INVALID_ARGUMENT,
+        `executeSwap refuses a quote whose amountOutMinimumRaw is ${quote.amountOutMinimumRaw.toString()}: ` +
+          'a non-positive floor accepts any output, which is the unbounded swap §40 slippage exists ' +
+          'to prevent',
+        { poolId: quote.poolId, amountOutMinimumRaw: quote.amountOutMinimumRaw.toString() },
+      );
+    }
+    if (quote.amountOutMinimumRaw > quote.amountOutRaw) {
+      throw new ChainError(
+        CHAIN_ERROR_CODES.INVALID_ARGUMENT,
+        `executeSwap refuses a quote whose amountOutMinimumRaw (${quote.amountOutMinimumRaw.toString()}) ` +
+          `exceeds its amountOutRaw (${quote.amountOutRaw.toString()}): the swap would revert`,
+        { poolId: quote.poolId },
+      );
+    }
     const poolAddress = addressFromPoolId(quote.poolId, this.chainId, UNISWAP_V3);
     const target = await this.poolReader.resolvePool(poolAddress, UNISWAP_V3);
     // Route against the pool the quote names, verified by the pool's own token order.
@@ -733,6 +760,7 @@ export class UniswapV3Adapter implements DexAdapter {
     }
 
     const deadline = this.positionManagerDeadline(request.deadline, 'addLiquidity');
+    assertNotZeroAddress(request.recipient, 'addLiquidity', 'recipient');
     const data = encodeFunctionData({
       abi: UNISWAP_V3_POSITION_MANAGER_ABI,
       functionName: 'mint',
@@ -777,8 +805,9 @@ export class UniswapV3Adapter implements DexAdapter {
    * `liquidity`, never from a cached figure or `type(uint128).max`.
    */
   async removeLiquidity(request: RemoveLiquidityRequest): Promise<LiquidityExecutionResult> {
+    // §95 is the first statement, before any whitelist lookup, encoding or read.
+    assertTxGuard(request.guard, { to: this.contracts.positionManager });
     const positionManager = this.positionReader.positionManagerFor(UNISWAP_V3);
-    assertTxGuard(request.guard, { to: positionManager });
 
     const raw = await this.positionReader.readRawPosition(positionManager, request.positionTokenId);
     if (raw === null) {
@@ -849,8 +878,9 @@ export class UniswapV3Adapter implements DexAdapter {
    * the §93 "never unlimited" rule (which is about ERC-20 allowances) does not apply.
    */
   async collectFees(request: CollectFeesRequest): Promise<LiquidityExecutionResult> {
+    // §95 is the first statement, before any whitelist lookup, encoding or read.
+    assertTxGuard(request.guard, { to: this.contracts.positionManager });
     const positionManager = this.positionReader.positionManagerFor(UNISWAP_V3);
-    assertTxGuard(request.guard, { to: positionManager });
     assertNotZeroAddress(request.recipient, 'collectFees', 'recipient');
 
     // The position must belong to the pool the caller named, or the audit trail would describe a
