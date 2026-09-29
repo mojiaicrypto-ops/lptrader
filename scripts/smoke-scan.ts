@@ -176,7 +176,23 @@ async function main(): Promise<void> {
 
   section('scan');
   const startedAt = Date.now();
-  const summary: PoolScanSummary = await scanner.scan();
+  // A throttled scan legitimately takes minutes (the GeckoTerminal 429s are real, research §4.4),
+  // so a heartbeat goes to stderr and the operator never mistakes it for a hang. Do NOT shorten the
+  // throttle to speed this up: the delay is the rate-limit protection, not overhead.
+  process.stderr.write(
+    `scanning ${String(config.whitelist.registry.listStockTokens({ autoTradeOnly: true }).length)} stock tokens × ` +
+      `${String(config.whitelist.registry.listStablecoins().length)} stablecoins × ` +
+      `${String(config.whitelist.dexes.length)} DEXes — throttled, expect a few minutes…\n`,
+  );
+  const heartbeat = setInterval(() => {
+    process.stderr.write(`  …still scanning (${((Date.now() - startedAt) / 1000).toFixed(0)}s elapsed)\n`);
+  }, 15_000);
+  let summary: PoolScanSummary;
+  try {
+    summary = await scanner.scan();
+  } finally {
+    clearInterval(heartbeat);
+  }
   line('scanned at', summary.scannedAt);
   line('elapsed', `${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
   line('probes', String(summary.probes.length));

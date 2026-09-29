@@ -381,13 +381,43 @@ export interface HttpTransport {
   request(request: HttpRequest): Promise<HttpResponse>;
 }
 
+/**
+ * Per-request cap for the default transport.
+ *
+ * MUST stay far below the §14 scan cadence (60 min). A send that never returns is worse than a
+ * failed one: the scheduler serialises a host, so one hung read blocks that cadence forever and the
+ * round never completes, which makes the bot look idle instead of broken. 30 s is ~8x the slowest
+ * observed response and small enough that the retry budget still fits inside a scan.
+ */
+export const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
+
 /** `globalThis.fetch` transport (Node >= 22.6 — no dependency needed). */
 export class FetchHttpTransport implements HttpTransport {
+  readonly #timeoutMs: number;
+
+  constructor(options: { readonly timeoutMs?: number } = {}) {
+    const configured = options.timeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS;
+    if (!Number.isFinite(configured) || configured <= 0) {
+      throw new PoolDataError(
+        POOL_DATA_ERROR_CODES.INVALID_ARGUMENT,
+        `HTTP timeout must be a positive number of milliseconds, received ${String(options.timeoutMs)}`,
+      );
+    }
+    this.#timeoutMs = configured;
+  }
+
+  get timeoutMs(): number {
+    return this.#timeoutMs;
+  }
+
   async request(request: HttpRequest): Promise<HttpResponse> {
+    // `AbortSignal.timeout` aborts the socket read, so a stalled peer surfaces as an error the
+    // scheduler can retry rather than as an unbounded pending promise.
     const response = await fetch(request.url, {
       method: 'GET',
       headers: { ...request.headers },
       redirect: 'follow',
+      signal: AbortSignal.timeout(this.#timeoutMs),
     });
     const headers: Record<string, string> = {};
     response.headers.forEach((value: string, name: string) => {

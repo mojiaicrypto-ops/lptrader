@@ -6,6 +6,7 @@
  * all deterministic. Research §4.4 is the source of the layer facts asserted here.
  */
 
+import { createServer } from 'node:http';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { loadConfig } from '../../src/config/index.ts';
 import { createBuiltinRegistry } from '../../src/config/registry.ts';
@@ -13,8 +14,11 @@ import {
   CROSS_CHECK_CRITICAL_TOLERANCE,
   DEFAULT_DEXPAPRIKA_BASE_URL,
   DEFAULT_GECKOTERMINAL_BASE_URL,
+  DEFAULT_HTTP_TIMEOUT_MS,
   FEE_TIER_TO_RATIO,
+  FetchHttpTransport,
   FEE_TIER_UNKNOWN,
+  LayeredPoolDataProvider,
   POOL_DATA_ERROR_CODES,
   PoolDataError,
   combineMarketDataSource,
@@ -718,6 +722,85 @@ describe('pool identity and the single-pool getters', () => {
     await expect(provider.getTVL(poolIdFor(56, DEX_IDS.UNISWAP_V3, POOL))).rejects.toThrow(
       /geckoterminal pool detail unavailable/,
     );
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * The default transport must not hang
+ * ------------------------------------------------------------------ */
+
+describe('FetchHttpTransport is bounded', () => {
+  it('rejects with a positive, validated timeout by default', () => {
+    const transport = new FetchHttpTransport();
+    expect(transport.timeoutMs).toBe(DEFAULT_HTTP_TIMEOUT_MS);
+    expect(DEFAULT_HTTP_TIMEOUT_MS).toBeLessThan(60_000);
+    expect(() => new FetchHttpTransport({ timeoutMs: 0 })).toThrow(/positive number/);
+    expect(() => new FetchHttpTransport({ timeoutMs: Number.NaN })).toThrow(/positive number/);
+  });
+
+  it('aborts a peer that accepts the request but never answers', async () => {
+    // A server that never responds is the failure the scan cadence cannot survive: a pending read
+    // never returns, so the cadence round would never complete.
+    const server = createServer(() => {
+      // Deliberately never call `res.end()`.
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (address === null || typeof address !== 'object') throw new Error('no server address');
+
+    try {
+      const transport = new FetchHttpTransport({ timeoutMs: 250 });
+      const startedAt = Date.now();
+      await expect(
+        transport.request({
+          url: `http://127.0.0.1:${String(address.port)}/hang`,
+          headers: {},
+        }),
+      ).rejects.toThrow(/aborted|timeout/i);
+      expect(Date.now() - startedAt).toBeLessThan(3_000);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it('turns a stalled source into a retried failure, then a precise error', async () => {
+    let accepted = 0;
+    const server = createServer(() => {
+      accepted += 1; // accept and never answer
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (address === null || typeof address !== 'object') throw new Error('no server address');
+
+    try {
+      const transport = new FetchHttpTransport({ timeoutMs: 200 });
+      const provider = new LayeredPoolDataProvider({
+        chainId: 56,
+        registry,
+        transport,
+        clock: clockNow,
+        geckoterminal: {
+          baseUrl: `http://127.0.0.1:${String(address.port)}`,
+          policy: {
+            minIntervalMs: 0,
+            maxAttempts: 2,
+            baseBackoffMs: 1,
+            maxBackoffMs: 2,
+            maxRetryAfterMs: 5,
+          },
+        },
+      });
+
+      // The timeout surfaces as an ordinary source failure instead of hanging the process.
+      await expect(provider.getPoolsDetailed({ ...QUERY })).rejects.toMatchObject({
+        code: POOL_DATA_ERROR_CODES.SOURCE_UNAVAILABLE,
+      });
+      expect(accepted).toBe(2); // retried exactly once, then gave up
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });
 
