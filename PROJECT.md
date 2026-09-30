@@ -38,6 +38,16 @@
 | [docs/iterations/iteration-1.md](docs/iterations/iteration-1.md) | 当前迭代范围与状态 |
 | [docs/archive/tasks/](docs/archive/tasks/) | 任务归档（Plan / Review / Test / Settlement） |
 
+## 文档
+
+| 想做什么 | 读 |
+|---|---|
+| **装到新机器 / 运维** | [`docs/OPS.md`](docs/OPS.md) |
+| **日常操作（确认、加资金、停机）** | [`docs/USAGE.md`](docs/USAGE.md) |
+| 只想读一份 | [`docs/OPS-AND-USAGE.md`](docs/OPS-AND-USAGE.md) |
+| 产品设计意图 | [`docs/product/stock-lp-auto-strategy-v1.md`](docs/product/stock-lp-auto-strategy-v1.md) |
+| 已知限制 / 未实现项 | [`docs/known-issues.md`](docs/known-issues.md) |
+
 ## 运行入口
 
 ```bash

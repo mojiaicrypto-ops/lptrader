@@ -11,6 +11,9 @@
 | `docs/decisions/D2-execution-and-approvals.md` | 决策 | L3 | D2：执行授权（Mode 1 实盘）、确认闸门（建仓/换池）、Telegram 双向机器人 |
 | `docs/research/onchain-facts-2026-09-29.md` | 调研 | L2 | 链上事实：bStocks 地址、BEP-677、参考价源、池子实况、数据源、SDK 事实 |
 | `docs/product/scope-corrections.md` | 澄清 | L2 | 基线「不改语义」的读法澄清（池组合、symbol、RangeProgress 等） |
+| `docs/OPS.md` | 运维 | L1 | **新机器部署与运维**：前置条件、安装、配置、systemd、备份、排障、安全清单 |
+| `docs/USAGE.md` | 手册 | L1 | **日常使用**：看什么、确认请求怎么判读、加资金、何时停机、常见疑问 |
+| `docs/OPS-AND-USAGE.md` | 综合 | L1 | 上述两者的合并版（一份读到底） |
 | `docs/code-map.md` | 索引 | L1 | 代码入口、模块、测试位置 |
 | `docs/known-issues.md` | 登记 | L1 | 遗留问题与已知保留 |
 | **D2 任务归档** | 归档 | L4 | `docs/archive/tasks/2026-09-29-D2/`：`plan.md`、`implementation-summary.md`、`review-report.md`、`test-report.md`、`settlement-report.md` |
