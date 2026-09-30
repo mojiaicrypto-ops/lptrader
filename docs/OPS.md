@@ -28,6 +28,7 @@
 | **Node.js** | **≥ 22.6.0**（实测 24.x；`package.json` 里有 `engines` 强制声明） | 直接用 Node 跑 TypeScript，**不需要编译步骤**；低于此版本无法执行 `.ts` |
 | 磁盘 | ≥ 500 MB（`node_modules` 约占 300 MB） | 依赖包含 Pancake SDK 全家桶 |
 | 网络出站 | 允许访问：BSC RPC、`api.binance.com`、`fapi.binance.com`、`api.geckoterminal.com`、`api.dexpaprika.com`、`api.telegram.org` | 报价、参考价、池数据、审批通道 |
+| **BSC RPC** | **可留空**（用已验证的公共默认端点）；若要自备，见下方警告 | 见 §3.3 的 RPC 注意事项 |
 | 时间同步 | 必须准确（NTP） | 报价 TTL、审批过期、市场开闭判断都依赖时钟 |
 | git | 任意版本 | 拉代码 |
 
@@ -173,12 +174,37 @@ chmod 600 .env
 |---|---|---|
 | `STRATEGY_WALLET_ADDRESS` | 只读监控时必填 | 监控哪个地址；**有签名器时以签名器地址为准** |
 | `KEYSTORE_PATH` | 否 | 默认 `secrets/wallet.enc` |
-| `BSC_RPC_URL` / `BSC_RPC_URL_SECONDARY` | 建议 | 留空则用公共 RPC。**生产建议填两个**（程序会在两个端点间做一致性交叉校验） |
+| `BSC_RPC_URL` / `BSC_RPC_URL_SECONDARY` | 建议 | **留空 = 用已验证的公共默认端点**（`bsc-dataseed.bnbchain.org` + `bsc-rpc.publicnode.com`）。**生产建议填两个** —— 程序会在两个端点间做一致性交叉校验（§99）。⚠️ 见下方 RPC 警告 |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` / `TELEGRAM_ALLOWED_USER_IDS` | 实盘必填 | 见 §6 |
 | `DRY_RUN` | ★ | `1` = 不发送任何交易（默认）；`0` = 允许真实交易 |
 | `LP_DB_PATH` | 否 | 默认 `data/lptrader.db` |
 
 **`.env` 永远不要提交、不要贴给别人、不要写进工单。**
+
+#### ⚠️ RPC 选择：三个实测过的坑
+
+**坑 1：Infura 不支持 BNB Chain 的完整 JSON-RPC。** 实测 `eth_gasPrice` 返回
+`An internal error was received`。它的 BSC 端点 URL 看起来正常、部分方法也能通，于是很容易
+误以为配对了，直到某个调用失败：
+
+```text
+eth_gasPrice could not be served by any RPC endpoint (1 tried): ... An internal error was received
+```
+
+**修法**：把这个变量**留空**用公共默认端点，或换成真正支持 BSC 的 provider
+（如 Alchemy / Ankr / NodeReal，或自建节点）。
+
+**坑 2：key 在 URL 路径里 → 报错会连 key 一起打出来。** 形如
+`https://.../v3/<key>` 的地址，出错时 viem 会把整条 URL 打进错误文本，于是**终端、journal、
+告警里都是你的 key**。
+
+已修：程序现在会把错误文本里的 URL 脱敏成 `https://host/v3/<redacted>`（保留 host 便于排查，
+去掉凭据）。但有测试覆盖 ≠ 鼓励把 key 放在路径里 —— 能用 Header 认证的 provider 更安全。
+
+> **如果你曾经把带 key 的错误输出贴给任何人（包括贴进对话），请去 provider 控制台 rotate 该 key。**
+
+**坑 3：只配一个端点 = 单点故障。** 生产环境请配两个：程序会对关键读取做一致性交叉校验
+（§99），并且在主端点失败时自动切换。
 
 ---
 

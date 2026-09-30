@@ -186,6 +186,12 @@ sqlite3 data/lptrader.db "select timestamp, action, result, reason from decision
 **Q：`noopNotifier` / `fail closed` 是什么意思？**
 "通道不可用 ⇒ 拒绝执行"。没有 Telegram 时它**拒绝**建仓，而**不是**降级成自动执行 —— 沉默绝不被当成许可。
 
+**Q：`SMOKE READ FAILED (all RPC endpoints unreachable)` / `An internal error was received`？**
+RPC 端点有问题。**先把 `.env` 里的 `BSC_RPC_URL` 留空** —— 程序会用已验证的公共端点。若你用的是 Infura：**它不支持 BNB Chain 的完整 JSON-RPC**（`eth_gasPrice` 会报 internal error）。换 Alchemy / Ankr / NodeReal 或自建节点。
+
+**Q：报错里出现了我的 API key？**
+已修：错误文本现在会把 URL 脱敏为 `https://host/v3/<redacted>`（保留 host 便于排查）。但**若你曾把这类输出贴给别人，请去 provider 控制台 rotate 该 key**。
+
 **Q：启动报 `cannot read keystore file ... ENOENT`？**
 `.env` 里设了 `KEYSTORE_PATH=secrets/wallet.enc`，但文件还没创建。两种修法：**创建它**（`npm run keystore:init`），或**注释掉那一行**退回只读模式。这是 fail-closed 设计，不是故障。
 

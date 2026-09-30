@@ -99,6 +99,73 @@ interface NodeLevelFailure {
   readonly message: string;
 }
 
+/**
+ * Strip credentials and endpoint URLs out of an error message.
+ *
+ * viem renders the transport URL into its error text (`URL: ...`, plus a `Request body:` line), and RPC
+ * providers routinely put the API key IN the URL path — `https://bsc-mainnet.infura.io/v3/<key>` is the
+ * common shape. Without this, **every RPC failure prints the credential** to the terminal, the systemd
+ * journal, and any alert that quotes the error. That happened: the message surfaced in a live run.
+ *
+ * This is applied at `classify`, which is the single point where an external error's text is captured
+ * into our own messages, so no call site can forget it. It removes by PATTERN rather than by endpoint
+ * label because the leak is in viem's text, not in our formatting — and it also redacts this process's
+ * own configured URLs, since those are the ones most likely to carry a key.
+ */
+export function redactSecrets(text: string): string {
+  let out = text;
+  // 1. Any configured endpoint URL (exact, longest first so a prefix swap cannot leave a tail behind).
+  for (const url of REDACTABLE_URLS) {
+    out = out.split(url).join(redactUrl(url));
+  }
+  // 2. Any remaining absolute URL, so a URL we were not told about still loses its query/path tail.
+  //    Runs BEFORE the `URL:` rule so the host is preserved: "which provider failed" is the diagnostic
+  //    value, and collapsing the whole URL would throw that away along with the credential.
+  out = out.replace(/https?:\/\/[^\s"']+/gu, (match) => redactUrl(match));
+  // 3. A bare `URL:` whose value is not a parseable absolute URL (viem may print an empty or partial one).
+  out = out.replace(/URL:\s*(?!https?:\/\/)\S*/gu, 'URL: <redacted>');
+  return out;
+}
+
+/**
+ * Keep the host, hide everything that could be a credential.
+ *
+ * The host is kept on purpose: "which provider failed" is the diagnostic value, while the path and query
+ * are where API keys live. A bare `https://host/v3/<key>` becomes `https://host/v3/<redacted-key>`.
+ */
+function redactUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const segments = parsed.pathname.split('/').filter((segment) => segment.length > 0);
+    const kept = segments.map((segment) =>
+      // A path segment that looks like a credential (long hex, or a long opaque token) is redacted;
+      // short structural segments (`v3`, `rpc`, `mainnet`) are kept for readability.
+      /^[0-9a-fA-F]{16,}$/u.test(segment) || /^[A-Za-z0-9_-]{24,}$/u.test(segment)
+        ? '<redacted>'
+        : segment,
+    );
+    const query = parsed.search.length > 0 ? '?<redacted>' : '';
+    return `${parsed.protocol}//${parsed.host}${kept.length === 0 ? '' : `/${kept.join('/')}`}${query}`;
+  } catch {
+    return '<redacted-url>';
+  }
+}
+
+/**
+ * URLs this process was configured with, redacted eagerly at resolution time.
+ *
+ * Registered when endpoints are resolved so `redactSecrets` can match them exactly, which catches the
+ * case where the URL appears in an error *without* a scheme-prefixed form we could detect by pattern.
+ */
+const REDACTABLE_URLS: string[] = [];
+
+/** Register a configured URL for redaction. Idempotent; called at endpoint resolution. */
+export function registerRedactableUrl(url: string): void {
+  if (!REDACTABLE_URLS.includes(url)) REDACTABLE_URLS.push(url);
+  // Longest first, so replacing a prefix cannot leave a credential-bearing tail behind.
+  REDACTABLE_URLS.sort((a, b) => b.length - a.length);
+}
+
 function classify(error: unknown): NodeLevelFailure | { readonly kind: 'transport'; readonly message: string } {
   const chain: unknown[] = [];
   let cursor: unknown = error;
@@ -119,7 +186,7 @@ function classify(error: unknown): NodeLevelFailure | { readonly kind: 'transpor
           kind: 'node-error',
           rpcCode: candidate.code,
           data: typeof candidate.data === 'string' ? candidate.data : undefined,
-          message: typeof candidate.message === 'string' ? candidate.message : 'rpc error',
+          message: typeof candidate.message === 'string' ? redactSecrets(candidate.message) : 'rpc error',
         };
       }
     }
@@ -137,7 +204,7 @@ function classify(error: unknown): NodeLevelFailure | { readonly kind: 'transpor
 
   return {
     kind: 'transport',
-    message: error instanceof Error ? error.message : String(error),
+    message: redactSecrets(error instanceof Error ? error.message : String(error)),
   };
 }
 
@@ -155,13 +222,41 @@ function defaultTransport(
   timeoutMs: number,
   retries: number | undefined,
 ): Transport {
-  return http(endpoint.url, {
+  // viem embeds the transport URL verbatim in error messages (`URL: ...`, `Request body: ...`). RPC
+  // providers routinely put the API key IN the path — `https://bsc-mainnet.infura.io/v3/<key>` — so a
+  // plain `http(endpoint.url)` means **every RPC failure prints the credential**, into the terminal, the
+  // systemd journal and any alert that quotes the error. Redirecting `http`'s own logging is not enough,
+  // because the URL is part of the thrown error object itself.
+  //
+  // `onFetchRequest`/`onFetchResponse` cannot scrub it either. So the transport is given a URL that is
+  // reachable but carries no secret in the path, and the real request is issued by this wrapper.
+  return http(REDACTED_TRANSPORT_URL, {
     timeout: timeoutMs,
     ...(retries === undefined ? {} : { retryCount: retries }),
     // A failed endpoint must be replaced by the next endpoint in the §99 pool, not retried silently
     // by the transport. Retries stay low so one dead endpoint cannot stall a monitor tick.
     retryDelay: 250,
+    fetchFn: (input, init) => {
+      // The wrapper re-targets the call to the real endpoint, so error text can only ever quote the
+      // placeholder. `input` is a URL/Request built from the placeholder; only its path and body are used.
+      const target = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      const path = safePathSuffix(target);
+      return fetch(`${endpoint.url.replace(/\/+$/u, '')}${path}`, init);
+    },
   });
+}
+
+/** Placeholder host substituted for a real endpoint URL, so error text cannot leak a key. */
+const REDACTED_TRANSPORT_URL = 'http://rpc-endpoint.invalid';
+
+/** The path+query of a URL, or '' when it cannot be parsed. Never includes credentials. */
+function safePathSuffix(value: string): string {
+  try {
+    const parsed = new URL(value);
+    return `${parsed.pathname}${parsed.search}`;
+  } catch {
+    return '';
+  }
 }
 
 /**
@@ -485,6 +580,8 @@ export function resolveEndpoints(
   for (const key of keys) {
     const url = env[key];
     if (url !== undefined && url.trim().length > 0) {
+      // Registered for redaction before it can appear in any error message.
+      registerRedactableUrl(url.trim());
       fromEnv.push({ label: key, url: url.trim() });
     }
   }

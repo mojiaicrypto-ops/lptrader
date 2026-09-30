@@ -13,7 +13,7 @@ import { BSC_ADDRESSES } from '../../src/config/builtins.ts';
 import { BscChainAdapter } from '../../src/chain/adapter.ts';
 import { CHAIN_ERROR_CODES, CrossCheckError, RpcNodeError } from '../../src/chain/errors.ts';
 import { WhitelistError } from '../../src/types/registry.ts';
-import { handlerTransport, resolveEndpoints } from '../../src/chain/rpc.ts';
+import { handlerTransport, redactSecrets, resolveEndpoints } from '../../src/chain/rpc.ts';
 import { ERC20_ABI } from '../../src/chain/abis.ts';
 import { createMockNode, entry, MULTICALL3_MOCK_ADDRESS } from './mockNode.ts';
 import { UI_AMOUNT_MODES, TOKEN_KINDS, TOKEN_RISK_TIERS } from '../../src/types/index.ts';
@@ -332,6 +332,44 @@ describe('§99 cross-check on critical reads', () => {
         args: [WALLET],
       }),
     ).rejects.toMatchObject({ code: CHAIN_ERROR_CODES.RPC_UNAVAILABLE });
+  });
+});
+
+describe('credential redaction in RPC errors', () => {
+  it('never prints an API key that lives in the endpoint URL', async () => {
+    // Measured in a live run: viem renders the transport URL into its error text, and providers commonly
+    // put the API key in the path (Infura, Alchemy, QuickNode), so an RPC failure printed the credential
+    // into the terminal and the journal. The redaction is applied where error text enters our messages.
+    const SECRET = 'e1e4d51290f34021a8d2f03871b3417e';
+    const url = `https://bsc-mainnet.infura.io/v3/${SECRET}`;
+    const adapter = new BscChainAdapter({
+      chainId: 56,
+      whitelist: whitelistFor(createBuiltinRegistry().list()),
+      rpc: {
+        endpoints: [{ label: 'infura', url }],
+        transportFactory: () =>
+          handlerTransport(async () => {
+            // Mimic viem's shape exactly, including the `URL:` line it adds from the transport config.
+            throw new Error(`Internal error\nURL: ${url}\nRequest body: {"method":"eth_gasPrice"}`);
+          }),
+        retries: 0,
+        crossCheckEndpoints: 1,
+      },
+    });
+
+    const error = await adapter.getGasPrice().catch((thrown: unknown) => thrown);
+    const text = `${String(error)}\n${error instanceof Error ? (error.stack ?? '') : ''}`;
+
+    expect(text).not.toContain(SECRET);
+    expect(text).toContain('<redacted>');
+    // The provider host is kept: "which endpoint failed" is the diagnostic value.
+    expect(text).toContain('bsc-mainnet.infura.io');
+  });
+
+  it('redacts a URL it was never told about', () => {
+    // Pattern-based fallback, so a URL arriving from a dependency still loses its credential tail.
+    const scratch = `https://example-provider.test/v1/${'a'.repeat(32)}/rpc`;
+    expect(redactSecrets(`boom ${scratch}`)).not.toContain('a'.repeat(32));
   });
 });
 
