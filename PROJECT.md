@@ -29,6 +29,7 @@
 
 | 文档 | 作用 |
 |---|---|
+| [docs/product/iteration-2-architecture.md](docs/product/iteration-2-architecture.md) | **Iteration 2 架构（已确认）**：四模块划分、两段式筛选、时序存储、精华保留清单 |
 | [docs/iterations/iteration-1-acceptance.md](docs/iterations/iteration-1-acceptance.md) | §108 验收项 → 实现 → 可复现证据 → 状态 |
 | [docs/product/stock-lp-auto-strategy-v1.md](docs/product/stock-lp-auto-strategy-v1.md) | **产品基线**（canonical 事实来源） |
 | [AGENTS.md](AGENTS.md) | 项目级执行参数与硬性约束 |
