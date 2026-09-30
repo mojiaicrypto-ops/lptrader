@@ -125,6 +125,17 @@ atomicity             单笔（swap + mint 合并）
 | §99 区块固定（KI-19） | `tests/chain/rpcFailover.test.ts` 2 条；活链复现 | passed |
 | 内存库隔离（KI-16） | `tests/store/store.test.ts` | passed |
 
+## 用户裁定（2026-09-30）后的新增验收
+
+| 项 | 实现 | 证据 | 状态 |
+|---|---|---|---|
+| §5 NAV 不重复计入 realized fees | 产品基线 §5/§64 已改；`buildPortfolioSnapshot` 早已如此 | `tests/strategy/nav.test.ts`（"does NOT count realized fees a second time"） | passed |
+| §3 严格按比例分配 | `src/strategy/allocation.ts` | `tests/strategy/allocation.test.ts`（24 tests：预算=NAV×ratio、**结果态**校验、两次合规建仓不得合起来超比例、Reserve 下限、NAV 不可用即拒） | passed |
+| §3 每轮监控并告警（不自动补仓 §68） | `PortfolioMonitor.allocation` | `tests/execution/portfolioMonitor.test.ts`；dry-run 输出 `§3 allocation OK — LP 4900.00 of NAV 7000.00 (cap 70%)` | passed |
+| §40 单笔容忍度可**按池**配置 | `strategy.yaml.pool_overrides` → `swapLimitsForPool()` → 门禁 | `tests/strategy/allocation.test.ts`（§40 override 组）；**dry-run 实测**：Pancake 池 `slippage 0.80% / impact 0.80%`（覆盖生效），Uniswap 池 `0.30% / 0.50%`（全局默认） | passed |
+| §16 准入与 §40 执行容忍度分离 | 产品基线 §16/§40/§85 已改；类型层拆为 `PoolThresholdConfig.maxSwapPriceImpact` vs `SwapConfig.maxPriceImpact` | 同上；启动时拒绝「覆盖值低于准入阈值」 | passed |
+| 执行器加分配门 | `ALLOCATION_EXCEEDED` | `tests/execution/positionExecutor.test.ts`（含新增输入字段） | passed |
+
 ## 未关闭项汇总
 
 - **实盘仓位类证据**（真实 AUM 下的 collect / remove / 首次 build、真实 LP 仓位读数）需用户提供签名钱包与真实仓位 —— 属 D2 确认门的正常结果，**非缺陷**。代码路径、calldata 编码与编排均已由单测 + dry-run 覆盖。

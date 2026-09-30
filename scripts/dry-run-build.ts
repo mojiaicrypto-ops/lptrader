@@ -250,7 +250,26 @@ for (const entry of candidates) {
     poolToken0: pool.token0,
   });
   out('priceImpact (independent)', `${(independent * 100).toFixed(6)}%`);
-  out('impact agreement', Math.abs(independent - quote.priceImpact) < 1e-9 ? 'exact' : `DIFFERS by ${Math.abs(independent - quote.priceImpact)}`);
+  // The two computations must agree, but "agree" cannot mean bit-identical: the adapter derives the price
+  // from the pool state it read for the quote while this script reuses its own read of the same pool, so a
+  // block boundary between the two reads legitimately shifts the mid price by a tiny amount (measured: the
+  // two reads here differ because the script's `poolPrice` was fetched a moment earlier).
+  //
+  // The bound is applied to the DIFFERENCE as a fraction of the impact itself, because that is what a
+  // wrong implementation would violate: an inverted orientation or a decimals mistake changes the impact
+  // by orders of magnitude, not by 1e-5. Anything inside `max(1e-6, 1% of the impact)` is bookkeeping;
+  // anything outside is a real disagreement and must be reported as one.
+  const impactDelta = Math.abs(independent - quote.priceImpact);
+  const impactTolerance = Math.max(1e-6, quote.priceImpact * 0.01);
+  out(
+    'impact agreement',
+    impactDelta <= impactTolerance
+      ? `agree (delta ${impactDelta.toExponential(2)}, tolerance ${impactTolerance.toExponential(2)} = 1% of impact)`
+      : `DISAGREE (delta ${impactDelta.toExponential(2)} > tolerance ${impactTolerance.toExponential(2)})`,
+  );
+  if (impactDelta > impactTolerance) {
+    out('  impact check', 'a difference this large means the orientation/decimals handling disagrees — investigate');
+  }
 
   // §40: per-pool limits, so a pool with an override (0.8% / 1%) is judged against ITS tolerance rather
   // than the global default. Also shows whether the override is actually reaching the gate.
