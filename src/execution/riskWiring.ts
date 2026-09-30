@@ -253,7 +253,19 @@ export class RiskWiring {
       position: null,
       pool: open?.pool ?? null,
       benchmark: null,
-      initialNAV: this.deps.config.capital.initialStrategyCapitalUsd,
+      /**
+       * The §65/§66 baseline: the equity the operator actually committed, not a configured target.
+       *
+       * For an OPEN position that is its recorded `entryEquityUsd` — the money really at risk from the
+       * moment it was deployed. Falling back to the configured intent figure would put the drawdown line
+       * at a number the wallet may never have held (the operator funds manually and in steps), so a breach
+       * could fire on a portfolio that never lost anything.
+       *
+       * When flat there is no position to take a baseline from, and the configured figure is the only
+       * available intent — that case is already distinguished by `hasCommittedCapital`.
+       */
+      initialNAV:
+        open?.record.entryEquityUsd ?? this.deps.config.capital.initialStrategyCapitalUsd,
       reserveRatio: this.deps.config.capital.reserveRatio,
       priorPeakNAV: options.priorPeakNAV,
       realizedFees: options.realizedFees,
