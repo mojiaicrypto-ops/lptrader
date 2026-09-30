@@ -5,9 +5,25 @@
 ## 状态
 
 ```text
-代码：已创建并全部实现（Iteration 1 / D2，T1–T13 + DEX 适配器）；
-`npm run typecheck` 0 错误，`npm test` 24 文件 / 690 测试全绿。
+代码：54 源文件 / 31 测试文件；
+`npm run typecheck` 0 错误，`npm test` 803 测试全绿（2026-09-30）。
+
+注意：测试为组件级，不代表产品可用。
+      功能的真实接线状态以 `docs/product/feature-list.md` 为准 ——
+      本仓库曾出现"测试全绿但建仓功能未接线"的情况。
 ```
+
+## 功能接线状态
+
+**组件存在 ≠ 功能可用。** 以下断点已在 `docs/product/feature-list.md` 登记，实现状态见该文件：
+
+| 组件 | 文件 | 生产调用点 |
+|---|---|---|
+| `PositionExecutor.buildPosition` | `src/execution/positionExecutor.ts` | **无** |
+| `PoolScreener.screen` | `src/data/poolScreener.ts` | **无** |
+| `QueryHandlers` | `src/notify/telegram.ts`（接口） | **零注入** |
+| `approveRebuild` | `src/execution/actionHandlers.ts`（接口） | **无** |
+| `SELECT_POOL` 状态 | `src/types/state.ts` | **无消费者** |
 
 ## 已实现（实际文件 → 导出 → 基线章节）
 

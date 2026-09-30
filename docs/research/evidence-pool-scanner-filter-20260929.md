@@ -1,6 +1,7 @@
 # T6 acceptance evidence — Pool Scanner / Pool Filter
 
-Companion to `docs/iterations/iteration-1-acceptance.md`. Every row below names the **test** that
+Historical evidence record (2026-09-29). Current feature status lives in `docs/product/feature-list.md`.
+Every row below names the **test** that
 closes it and the **assertion** that makes it evidence; the items the offline tests cannot prove are
 closed by the live scan output pasted in §3.
 
