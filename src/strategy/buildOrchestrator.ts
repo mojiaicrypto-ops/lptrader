@@ -128,7 +128,12 @@ export class BuildOrchestrator {
     this.deps = deps;
   }
 
-  async prepare(candidates: readonly PoolSnapshot[], capitalUsd: UsdAmount): Promise<BuildDecision> {
+  /**
+   * `navUsd` is the NAV the build is sized against — NOT a budget. The LP amount is derived from it via
+   * `max_lp_ratio`, and the allocation check is then performed on the RESULTING state. Passing a budget
+   * here instead would apply the ratio twice and refuse every build as a 100% allocation.
+   */
+  async prepare(candidates: readonly PoolSnapshot[], navUsd: UsdAmount): Promise<BuildDecision> {
     const { config } = this.deps;
 
     // ---- 1. Screen -------------------------------------------------------------------------------
@@ -174,12 +179,13 @@ export class BuildOrchestrator {
       };
     }
 
-    // §3: the LP budget is capped by the allocation bands, and the check is on the RESULTING state so two
-    // individually-compliant builds cannot combine into an over-allocation.
+    // §3: the LP amount is the budget derived from NAV, and the check is on the RESULTING allocation so
+    // two individually-compliant builds cannot combine into an over-allocation.
+    const lpCapital = navUsd * config.capital.maxLpRatio;
     const allocation = checkBuildAllocation({
-      navUsd: capitalUsd,
+      navUsd,
       currentLpValueUsd: 0,
-      requestedUsd: capitalUsd,
+      requestedUsd: lpCapital,
       limits: {
         maxLpRatio: config.capital.maxLpRatio,
         reserveRatio: config.capital.reserveRatio,
@@ -194,7 +200,6 @@ export class BuildOrchestrator {
       };
     }
 
-    const lpCapital = capitalUsd * config.capital.maxLpRatio;
     let plan: PositionPlan;
     try {
       plan = planPosition({
@@ -282,7 +287,7 @@ export class BuildOrchestrator {
         input: {
           pool,
           capitalUsd: lpCapital,
-          navUsd: capitalUsd,
+          navUsd,
           currentLpValueUsd: 0,
           allocationLimits: {
             maxLpRatio: config.capital.maxLpRatio,
