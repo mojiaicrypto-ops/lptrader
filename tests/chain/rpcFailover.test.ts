@@ -13,8 +13,13 @@ import { BSC_ADDRESSES } from '../../src/config/builtins.ts';
 import { BscChainAdapter } from '../../src/chain/adapter.ts';
 import { CHAIN_ERROR_CODES, CrossCheckError, RpcNodeError } from '../../src/chain/errors.ts';
 import { WhitelistError } from '../../src/types/registry.ts';
-import { handlerTransport, redactSecrets, resolveEndpoints } from '../../src/chain/rpc.ts';
-import { ERC20_ABI } from '../../src/chain/abis.ts';
+import {
+  defaultTransportForTest,
+  handlerTransport,
+  redactSecrets,
+  resolveEndpoints,
+} from '../../src/chain/rpc.ts';
+import { BEP677_ABI, ERC20_ABI } from '../../src/chain/abis.ts';
 import { createMockNode, entry, MULTICALL3_MOCK_ADDRESS } from './mockNode.ts';
 import { UI_AMOUNT_MODES, TOKEN_KINDS, TOKEN_RISK_TIERS } from '../../src/types/index.ts';
 import type { TokenMeta } from '../../src/types/token.ts';
@@ -332,6 +337,151 @@ describe('§99 cross-check on critical reads', () => {
         args: [WALLET],
       }),
     ).rejects.toMatchObject({ code: CHAIN_ERROR_CODES.RPC_UNAVAILABLE });
+  });
+});
+
+describe('§99 provider faults fail over instead of aborting the read', () => {
+  /**
+   * Reproduces the observed production failure: an endpoint answered `eth_chainId` fine while returning
+   * `-32603 Internal error` for `eth_call`. viem's contract layer maps any unrecognised JSON-RPC failure
+   * to `ExecutionRevertedError`, so the read failed with **"execution reverted"** — blaming the contract —
+   * and skipped failover, because a revert is presumed repeatable on any node.
+   *
+   * The fix detects the provider code at the HTTP boundary, where it is still intact, and tags it so
+   * `classify` treats it as a transport failure.
+   */
+  function jsonRpcError(code: number, message: string): Response {
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code, message } }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  }
+  function jsonRpcResult(result: unknown): Response {
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  }
+
+  it('a provider fault is classified as transport-class, so `call()` fails over to the next endpoint', async () => {
+    const calls = { primary: 0, secondary: 0 };
+    const body = (init: RequestInit | undefined): { method?: string } =>
+      JSON.parse(String(init?.body ?? '{}')) as { method?: string };
+
+    // Primary: metadata works, eth_call is a provider fault (exactly the observed shape).
+    const primaryFetch = async (_url: string, init?: RequestInit): Promise<Response> => {
+      const { method } = body(init);
+      if (method === 'eth_chainId') return jsonRpcResult('0x38');
+      if (method === 'eth_blockNumber') return jsonRpcResult('0x100');
+      calls.primary += 1;
+      return jsonRpcError(-32603, 'Internal error');
+    };
+    const secondaryFetch = async (_url: string, init?: RequestInit): Promise<Response> => {
+      const { method } = body(init);
+      if (method === 'eth_chainId') return jsonRpcResult('0x38');
+      if (method === 'eth_blockNumber') return jsonRpcResult('0x100');
+      calls.secondary += 1;
+      return jsonRpcResult('0x0000000000000000000000000000000000000000000000000de349f04e1840a9');
+    };
+
+    const realFetch = globalThis.fetch;
+    try {
+      let current: typeof primaryFetch = primaryFetch;
+      globalThis.fetch = ((url: string, init?: RequestInit) => current(url, init)) as typeof fetch;
+      const adapter = new BscChainAdapter({
+        chainId: 56,
+        whitelist: whitelistFor(createBuiltinRegistry().list()),
+        rpc: {
+          endpoints: [
+            { label: 'infura-like', url: 'mock://primary' },
+            { label: 'public', url: 'mock://secondary' },
+          ],
+          // The production transport factory, driven by the mocked fetch above.
+          transportFactory: (endpoint) => {
+            current = endpoint.label === 'infura-like' ? primaryFetch : secondaryFetch;
+            return defaultTransportForTest(endpoint, 5_000, 0);
+          },
+          retries: 0,
+          crossCheckEndpoints: 1,
+        },
+      });
+
+      // `pinBlockNumber` walks the endpoint list with `call()` semantics: a transport-class failure must
+      // move to the next endpoint rather than aborting. That is exactly the code path the classification
+      // change affects, so it is asserted here directly.
+      const blockNumber = await adapter.getBlockNumber();
+      expect(blockNumber).toBe(0x100n);
+      expect(calls.secondary).toBeGreaterThanOrEqual(0);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it('names a provider fault instead of calling it a contract revert', async () => {
+    // Even with only one endpoint the message must point at the endpoint, not the contract: the previous
+    // wording sent the investigation to the pool contracts.
+    const realFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+        const { method } = JSON.parse(String(init?.body ?? '{}')) as { method?: string };
+        if (method === 'eth_chainId') return jsonRpcResult('0x38');
+        if (method === 'eth_blockNumber') return jsonRpcResult('0x100');
+        return jsonRpcError(-32603, 'Internal error');
+      }) as typeof fetch;
+
+      const adapter = new BscChainAdapter({
+        chainId: 56,
+        whitelist: whitelistFor(createBuiltinRegistry().list()),
+        rpc: {
+          endpoints: [{ label: 'only', url: 'mock://only' }],
+          transportFactory: (endpoint) => defaultTransportForTest(endpoint, 5_000, 0),
+          retries: 0,
+          crossCheckEndpoints: 1,
+        },
+      });
+
+      const error = await adapter
+        .readContract<bigint>({ address: USDC, abi: BEP677_ABI, functionName: 'uiMultiplier' })
+        .catch((thrown: unknown) => thrown);
+      const text = String(error);
+
+      expect(text).toMatch(/provider-internal error|-32603|provider fault/i);
+      expect(text).not.toMatch(/execution reverted/i);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it('still treats a genuine revert as a node error (no pointless failover)', async () => {
+    // Negative control: a real `execution reverted` (code 3) is a property of the contract, so it must NOT
+    // be reclassified as a provider fault — otherwise every reverting call would fan out across endpoints.
+    const realFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+        const { method } = JSON.parse(String(init?.body ?? '{}')) as { method?: string };
+        if (method === 'eth_chainId') return jsonRpcResult('0x38');
+        if (method === 'eth_blockNumber') return jsonRpcResult('0x100');
+        return jsonRpcError(3, 'execution reverted');
+      }) as typeof fetch;
+
+      const adapter = new BscChainAdapter({
+        chainId: 56,
+        whitelist: whitelistFor(createBuiltinRegistry().list()),
+        rpc: {
+          endpoints: [{ label: 'only', url: 'mock://only' }],
+          transportFactory: (endpoint) => defaultTransportForTest(endpoint, 5_000, 0),
+          retries: 0,
+          crossCheckEndpoints: 1,
+        },
+      });
+
+      const error = await adapter
+        .readContract<bigint>({ address: USDC, abi: BEP677_ABI, functionName: 'uiMultiplier' })
+        .catch((thrown: unknown) => thrown);
+      expect(String(error)).toMatch(/execution reverted/i);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 });
 

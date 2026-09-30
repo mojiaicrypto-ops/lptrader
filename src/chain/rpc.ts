@@ -166,6 +166,39 @@ export function registerRedactableUrl(url: string): void {
   REDACTABLE_URLS.sort((a, b) => b.length - a.length);
 }
 
+/**
+ * JSON-RPC error codes that mean **"this node is broken"**, not "your call was invalid".
+ *
+ * These are provider-internal failures: the request never reached the contract, so the same call to a
+ * different endpoint may well succeed. Treating them as contract errors (as this did) has two cost:
+ * it produces a message that points at the WRONG place — `execution reverted` for a node fault — and it
+ * skips failover, so a bot with a second endpoint configured still fails.
+ *
+ * Measured, in a live run: an Infura BSC endpoint answered `eth_chainId` normally while returning
+ * `-32603 Internal error` for ~55-100% of `eth_call`s, with HTTP 200 and **no** rate-limit headers.
+ * The read failed with "execution reverted", which sent the investigation to the pool contracts.
+ *
+ * `-32005` (limit exceeded / rate limited) is included, but note it is a *server-said-slow-down*, which
+ * is still worth trying elsewhere rather than failing the read outright.
+ */
+const PROVIDER_FAULT_CODES: ReadonlySet<number> = new Set([
+  -32000, // server error / "header not found" / generic node failure
+  -32002, // resource unavailable
+  -32005, // limit exceeded
+  -32603, // internal error  ← the one actually observed
+]);
+
+/**
+ * True when a JSON-RPC code indicates the endpoint itself failed, so another endpoint is worth trying.
+ *
+ * `-32601` (method not found) is deliberately NOT here: that is a property of the provider's feature
+ * set, so failing over to an endpoint of the same provider family would just repeat it. It is reported
+ * as a node error with its real code, which is what the operator needs to see.
+ */
+function isProviderFault(code: number): boolean {
+  return PROVIDER_FAULT_CODES.has(code);
+}
+
 function classify(error: unknown): NodeLevelFailure | { readonly kind: 'transport'; readonly message: string } {
   const chain: unknown[] = [];
   let cursor: unknown = error;
@@ -174,14 +207,42 @@ function classify(error: unknown): NodeLevelFailure | { readonly kind: 'transpor
     cursor = (cursor as { cause?: unknown }).cause;
   }
 
+  // FIRST: our own transport-level tag. It must be checked before viem's error names, because viem wraps
+  // everything a contract call touches into `ContractFunctionRevertedError`/`ExecutionRevertedError` and
+  // thereby destroys the distinction this class preserves. Checking names first would reproduce exactly
+  // the bug this exists to fix.
+  for (const link of chain) {
+    if (link instanceof ProviderFaultError) {
+      return {
+        kind: 'transport',
+        message:
+          `${link.message} (endpoint ${link.endpointLabel}, code ${link.rpcCode}). ` +
+          'Failing over to the next endpoint; if only one endpoint is configured, configure a second or ' +
+          'use a different RPC provider.',
+      };
+    }
+  }
+
   // A JSON-RPC error object anywhere in the cause chain means the endpoint served the request and
   // the request itself failed (revert, out-of-gas, bad params). Failover would just repeat it.
   for (const link of chain) {
     if (typeof link !== 'object' || link === null) continue;
     const candidate = link as { code?: unknown; data?: unknown; message?: unknown };
-    if (typeof candidate.code === 'number' && candidate.code > 0 && candidate.code !== 4001) {
+    if (typeof candidate.code === 'number' && candidate.code !== 0 && candidate.code !== 4001) {
       // viem wraps JSON-RPC errors with the raw `code`; `-1` is viem's own "unknown RPC error".
       if (candidate.code !== -1) {
+        // A provider-internal fault is a TRANSPORT-class failure: report it as such so the caller tries
+        // the next endpoint instead of surfacing a contract error.
+        if (isProviderFault(candidate.code)) {
+          return {
+            kind: 'transport',
+            message:
+              `RPC endpoint internal error (${candidate.code}` +
+              `${typeof candidate.message === 'string' ? `: ${redactSecrets(candidate.message)}` : ''}). ` +
+              'This is a PROVIDER fault, not a contract revert — the call never reached the chain. ' +
+              'Failing over to the next endpoint; if there is only one endpoint configured, use another RPC.',
+          };
+        }
         return {
           kind: 'node-error',
           rpcCode: candidate.code,
@@ -217,6 +278,15 @@ function classify(error: unknown): NodeLevelFailure | { readonly kind: 'transpor
  * `eth_call`s per probe) before surfacing. `http()` raises a typed `RpcRequestError` carrying the
  * node's real `code`/`data`, so a revert stays a revert: one call, no failover, no retry storm.
  */
+/** Test seam: the production transport factory, exposed so a test can drive it with a mocked fetch. */
+export function defaultTransportForTest(
+  endpoint: RpcEndpointSpec,
+  timeoutMs: number,
+  retries: number | undefined,
+): Transport {
+  return defaultTransport(endpoint, timeoutMs, retries);
+}
+
 function defaultTransport(
   endpoint: RpcEndpointSpec,
   timeoutMs: number,
@@ -236,14 +306,78 @@ function defaultTransport(
     // A failed endpoint must be replaced by the next endpoint in the §99 pool, not retried silently
     // by the transport. Retries stay low so one dead endpoint cannot stall a monitor tick.
     retryDelay: 250,
-    fetchFn: (input, init) => {
+    fetchFn: async (input, init) => {
       // The wrapper re-targets the call to the real endpoint, so error text can only ever quote the
       // placeholder. `input` is a URL/Request built from the placeholder; only its path and body are used.
       const target = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
       const path = safePathSuffix(target);
-      return fetch(`${endpoint.url.replace(/\/+$/u, '')}${path}`, init);
+      const response = await fetch(`${endpoint.url.replace(/\/+$/u, '')}${path}`, init);
+
+      // ## Why a provider fault is re-thrown as a tagged error
+      // viem's contract layer (`getCallError` → `getNodeError`) treats any JSON-RPC failure as a potential
+      // contract revert: it maps `RpcRequestError` to `ExecutionRevertedError` unless the code is one it
+      // recognises, and `-32603` is not on that list. Measured consequence: an endpoint returning
+      // `-32603 Internal error` for ~half of its `eth_call`s produced **"execution reverted"**, which is
+      // wrong twice — it blames the contract, and it skips failover because a revert is a property of the
+      // contract and repeatable on any node.
+      //
+      // The raw code is still readable HERE, before viem interprets it, so a provider fault is detected at
+      // the HTTP boundary and re-thrown as `ProviderFaultError`. `classify` then sees it as a transport
+      // failure and the pool moves to the next endpoint.
+      if (response.ok) {
+        const body = await response.clone().json().catch(() => null);
+        const code = extractRpcErrorCode(body);
+        if (code !== null && isProviderFault(code)) {
+          throw new ProviderFaultError(
+            `RPC endpoint returned a provider-internal error (${code}` +
+              `${extractRpcErrorMessage(body) === null ? '' : `: ${extractRpcErrorMessage(body)}`}) for ` +
+              `${methodOfBody(body) ?? 'a request'}; this is not a contract revert`,
+            code,
+            endpoint.label,
+          );
+        }
+      }
+      return response;
     },
   });
+}
+
+/** The `error.code` of a single JSON-RPC envelope, or `null` if the body is not one. */
+function extractRpcErrorCode(body: unknown): number | null {
+  if (typeof body !== 'object' || body === null) return null;
+  const error = (body as { error?: unknown }).error;
+  if (typeof error !== 'object' || error === null) return null;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === 'number' ? code : null;
+}
+
+function extractRpcErrorMessage(body: unknown): string | null {
+  const error = (body as { error?: { message?: unknown } } | null)?.error;
+  const message = error?.message;
+  return typeof message === 'string' ? redactSecrets(message) : null;
+}
+
+function methodOfBody(body: unknown): string | null {
+  const method = (body as { method?: unknown } | null)?.method;
+  return typeof method === 'string' ? method : null;
+}
+
+/**
+ * A provider-internal failure, tagged so it survives viem's error interpretation.
+ *
+ * Carrying the code on a distinct class (rather than relying on the message) is what lets `classify`
+ * distinguish "this node is broken" from "the contract reverted" — a distinction viem erases.
+ */
+export class ProviderFaultError extends Error {
+  readonly rpcCode: number;
+  readonly endpointLabel: string;
+
+  constructor(message: string, rpcCode: number, endpointLabel: string) {
+    super(message);
+    this.name = 'ProviderFaultError';
+    this.rpcCode = rpcCode;
+    this.endpointLabel = endpointLabel;
+  }
 }
 
 /** Placeholder host substituted for a real endpoint URL, so error text cannot leak a key. */
