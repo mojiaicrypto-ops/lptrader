@@ -355,7 +355,107 @@ MONITOR
 
 ---
 
-## 7. 待确认清单
+---
+
+## 7. Iteration 1 精华保留清单（重构不得丢失）
+
+> **本节是本文件最重要的一节。** 重梳模块划分时，最容易发生的损失不是"写错新代码"，而是**把已经验证过的判断逻辑在搬迁中丢掉或简化**。以下每一项都在 Iteration 1 已实现且有测试覆盖（727 测试 / 25 文件）。**改动时只允许换调用位置，不允许改变判定语义。**
+
+### 11.1 建仓可行性判断链（"这个池子现在能不能建仓"）
+
+这是整个产品的核心决策，**六道判断按固定顺序**，缺一不可：
+
+| # | 判断 | 实现 | 依据 | 精华点 |
+|---|---|---|---|---|
+| 1 | **池身份与白名单** | `poolFilter`（`CHAIN_NOT_WHITELISTED` / `DEX_NOT_WHITELISTED` / `LEG_NOT_WHITELISTED` / `STOCK_LEG_MISSING` / `STABLECOIN_LEG_MISSING`） | §8/§11/§12/§14 | **按合约地址**判定，无 symbol 路径 |
+| 2 | **§16 硬门槛** | `poolFilter`（TVL / volume / age / NAV deviation / $3500 impact） | §16 | **任一不过直接淘汰，不进入排序**；每个条件都有"恰好等于阈值"的边界测试 |
+| 3 | **建仓数学** | `planPosition`（区间 → tick 对齐 → **以 USD 总量反解 L** → 三分支金额 → swap 缺口） | §33–§38 | **不是固定 50/50**；反解出的 L **绝不超募**（`valueAt(L) <= capital` 且 `L+1` 超） |
+| 4 | **报价与滑点闸门** | `evaluateSwapQuote`（impact / slippage / TTL） | §40/§41 | **impact 必须本地自算**（SDK 不提供）；**报价过期即拒** |
+| 5 | **分配比例** | `checkBuildAllocation`（按**结果态**判定） | §3 | 两次各自"合规"的建仓**不得合起来超比例** |
+| 6 | **写路径与确认** | `TxGuardChecks` + 写目标白名单 + `ApprovalGate` | §93/§95/D2 | 伪造的全 true guard **不能**绕过写目标校验（KI-21） |
+
+**顺序是约束，不可调换**：便宜且不可绕过的判断在前，涉及人的判断在最后 —— 否则会把"已经被拒的建仓"拿去问人。
+
+**搬迁到模块 2 时**：第 1、2 项中**HTTP 可测的部分**留在模块 1，**链上才能测的部分**（NAV deviation、$3500 impact）移到模块 2。第 3–6 项**原样保留**，只换调用点。
+
+### 11.2 风控判定（已实现，**当前未接线**）
+
+`src/strategy/riskManager.ts` 是 Iteration 1 最完整的一块（**78 个测试**）。**搬迁到模块 3 时全部保留**：
+
+| 判定 | 函数 | 基线 | 精华点（易被简化掉的） |
+|---|---|---|---|
+| 脱锚五档 | `evaluatePegRisk` / `classifyPegLevel` | §54–§55 | 五档边界**精确**：0.01/0.02/0.03/0.05，各有"恰好等于"测试 |
+| **闭市脱锚只报警** | `thresholdExpansionFor` + `hardExitAllowed` | **§56/§57** | **`hardExitAllowed === false` 时，再大的脱锚也只能告警，绝不产生强制平仓** —— 这是最容易被重构丢掉的一条 |
+| 全局回撤线 | `evaluateDrawdown` | §65–§66 | 边界**含 `<=`**：NAV 恰好 = 初始×85% 即触发 |
+| TVL 崩溃 | `evaluateTvlCollapse` | §59 | >50% → REVIEW，>70% → EMERGENCY；**无历史 → `insufficient-data`（fail closed），不是"安全"** |
+| 储备下限 | `evaluateReserve` | §60 | <25% 阻止新增 LP，但**不强制 rebalance** |
+| 区间 | `evaluateRangeRisk` | §49–§52 | 出上界=不追涨；**出下界=`RISK_REVIEW`（人工），不自动卖** |
+| 紧急事件 | `evaluateEmergency` | §58 | 9 类条件逐个可触发 |
+| 市场下跌 | `evaluateMarketDecline` | §53 | 股价跌 + NAV 同步跌 → **HOLD**，不是卖出 |
+| **复合判决** | `evaluateRisk` | — | 取所有域中**最严动作**；`dataDegraded` 阻止把 HOLD 当清洁健康；severity 取各域**最大值**（曾修过的真实缺陷） |
+
+**三条硬性要求**（有专门测试锁定，搬迁时不得放松）：
+
+1. **闭市 + 大幅脱锚 → 只告警，不平仓**（§57）
+2. **市场同步下跌 → HOLD**（§53）
+3. **数据降级 → 不得当作健康**，`dataDegraded: true` 必须让调用方无法把 HOLD 读成"没事"（§96）
+
+**当前缺口**：`runtime.ts` **没有调用** `evaluateRisk`，且不喂 `tvlSeries` / `position` / `pool`。**模块 3 的核心工作就是把这块接上**，而不是重写。
+
+### 11.3 数据可信度规则（跨模块，必须保留）
+
+| 规则 | 实现 | 为什么关键 |
+|---|---|---|
+| **`Sourced<T>` 三件套** | `value` + `source` + `stale` | 每个外部数字都带出处与新鲜度，消费者可据此拒绝 |
+| **"不存在" ≠ "读不到"** | `POOL_EXISTENCE` / `POOL_EXISTENCE_EVIDENCE` | 数据源失败**不得**被当成"这个池子没有" —— 否则会错误地放弃或错误地建仓 |
+| **不可用即拒绝** | `*_UNAVAILABLE` 系列码 + `ONCHAIN_UNVERIFIED` | §16 的 impact / deviation 读不到 → 该候选判 `indeterminate` 并跳过，**不当作通过** |
+| **fees 标注为 `derived`** | `Sourced.source = 'derived'` | `volume × feeTier` 是推导值，**不得伪装成真实费用数据** |
+| **两源冲突取 canonical + 留 crossCheck** | GeckoTerminal 为 canonical，DexPaprika 存 `crossChecks` | 实测两源 TVL 差约 3%；**不得静默混用** |
+| **NAV 不重复计入 realized fees** | `buildPortfolioSnapshot` | 重复计会抬高 NAV、**静默关闭 §66** |
+| **稳定币不假设为 1.0** | `PortfolioMonitor.stablecoinPrice` | 假设平价会**隐藏脱锚**（§58） |
+
+### 11.4 执行安全（写路径，一字不改）
+
+| 机制 | 实现 | 精华点 |
+|---|---|---|
+| **唯一写路径** | `BscChainAdapter.sendTransaction` | 全系统只有这一个出口 |
+| **写目标独立校验** | `assertWhitelistedWriteTarget` | 伪造的全 true guard **仍不能**指向非白名单地址（KI-21，含负向对照测试） |
+| **§42 原子建仓全有或全无** | `supportsAtomicBuild` + `swapForDeficit` | 原子抛错**不得**回退成两笔（会丢 §42 语义） |
+| **§43 partial 不自动重试** | `PARTIAL_POSITION` 状态 | swap 成功但 mint 失败 → 停车人工，**不自动补救** |
+| **§97 幂等** | `TxStore` + `checkIdempotencyKey` | 同 key 第二次**不发交易**；确定性失败后可开 attempt N+1，未解决时拒绝 |
+| **§98 UNKNOWN 不重发** | `TxStateUnknownError` + `planUnresolvedRecovery` | 未知状态**只能查链确认**，永不自动重发 |
+| **provider 故障可切换端点** | `ProviderFaultError` 分类 | `-32603` 等**不得**被误报成 `execution reverted`（KI-19/KI-21） |
+| **错误文本脱敏** | `redactSecrets` | 端点 URL 里的 API key **不得**进入日志 |
+| **确认门 fail closed** | `ApprovalGate` + `noopNotifier` | 无通道 ⇒ 建仓/换池**不可能执行**，不降级为自动 |
+
+### 11.5 量化与单位约定（跨模块）
+
+| 约定 | 说明 |
+|---|---|
+| 金额一律 **raw bigint** + 随行 decimals | 绝不把 raw 当 UI 数量 |
+| BSC USDC/USDT = **18 decimals**（不是 6） | 硬编码 6 会产生 10¹² 级错误 |
+| **BEP-677 UI 换算运行期读取** | `uiMultiplier()` 绝不硬编码 1e18；实测 QQQB = 1.000724838658 |
+| 价格是 **UI 计价**（token1 per 1 whole token0） | 与 `toFloat(raw, decimals)` 同口径 |
+| tick 对齐用 **per-DEX** 的 fee→tickSpacing 表 | Pancake 与 Uniswap **不共享** fee 枚举，混用会静默选错池 |
+| `toFloat` / `fromFloat` / `applyFloorRatio` | 唯一换算入口；`floor` 方向是签名安全方向 |
+
+### 11.6 搬运方式（避免丢失的操作要求）
+
+```text
+允许：换调用位置、改函数签名以适配新模块、拆分为两段（HTTP 段 / 链上段）
+禁止：改判定语义、删边界测试、把 hardExitAllowed 之类的"限幅"简化掉、
+      把 fail-closed 分支改成 fail-open、把 §99 校验整体降级为单读
+      （分级见 §5.5，且「关键」类必须保持双读）
+
+要求：搬迁后，§7.1–§7.5 的每一项都必须仍能由现有测试证明。
+      若某测试因搬迁而无法再表达，必须写等价测试，不得删除。
+```
+
+**验收方式**：重构完成后，`tests/strategy/riskManager.test.ts`（78）、`positionPlanner.test.ts`（36）、`swapPlanner.test.ts`（31）、`allocation.test.ts`（24）、`positionExecutor.test.ts`（26）等**必须全绿且断言未被削弱**。测试通过不是形式 —— 它是这些精华唯一的凭证。
+
+---
+
+## 8. 待确认清单
 
 | # | 问题 | 选项 | 我的建议 |
 |---|---|---|---|
@@ -368,7 +468,7 @@ MONITOR
 
 ---
 
-## 8. 对现有实现的改动清单
+## 9. 对现有实现的改动清单
 
 | 模块 | 改动 | 影响面 |
 |---|---|---|
@@ -381,11 +481,23 @@ MONITOR
 | 模块 3 | 注册缺失的 `pool_health_interval_minutes` cadence | `src/runtime.ts` |
 | 模块 3 | 探针 TTL 分级 + 只读持仓 token | `src/chain/tokenReader.ts`、`portfolioMonitor.ts` |
 | 模块 3 | §99 交叉校验分级 | `src/chain/adapter.ts`、`src/chain/rpc.ts` |
-| 模块 4 | （待定，见 §7 问题 1） | 新增 |
+| 模块 4 | （待定，见 §8 问题 1） | 新增 |
+
+### 9.1 改动时的硬性约束
+
+```text
+每一项改动都必须满足：§7 的精华清单逐条不丢。
+
+具体到最容易出事的四处：
+  · 模块 1 移除链上探测时，不得连带删掉「不存在 vs 读不到」的区分
+  · 模块 2 拆两段过滤时，不得把 §16 的任何一项降级为"可选"或"尽力而为"
+  · 模块 3 接线时，是"调用已有的 evaluateRisk"，不是"重写一套风控"
+  · §5.5 的校验分级只允许把「自愈类」降为单读；「关键类」（tick/liquidity/报价）必须保持双读
+```
 
 ---
 
-## 9. 不变量（本次梳理不改变的部分）
+## 10. 不变量（本次梳理不改变的部分）
 
 以下来自 Iteration 1，**继续保持**：
 
@@ -400,7 +512,7 @@ MONITOR
 
 ---
 
-## 10. 待你确认后
+## 11. 待你确认后
 
 1. 你批注 §7 的 6 个问题（或直接说"按建议来"）
 2. 我据此更新本文件为 `confirmed`
