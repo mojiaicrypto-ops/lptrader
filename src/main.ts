@@ -1,29 +1,48 @@
 /**
- * Live entry point.
+ * Live entry point: validate, decrypt, assemble, and **actually run**.
  *
- * ## The two things this file owns
- * 1. **The startup pre-flight** — validate config, whitelist and (optionally) the keystore structure
- *    before any network object exists. A bad config must stop the process here, not on the first write.
- * 2. **Wiring the signal handlers and the loop**, so a shutdown leaves no half-recorded transaction.
+ * ## Why this file was rewritten
+ * It used to validate the configuration, print a summary and exit. That was correct while the modules did
+ * not exist, and **wrong the moment they did**: `buildRuntime` was only ever called from tests and probe
+ * scripts, so `npm run dev` never built a runtime, never started a `Scheduler`, and never opened the
+ * database. The system looked assembled and did nothing.
  *
- * Everything else lives in `src/runtime.ts` (assembly) and the modules it composes. This file contains no
- * strategy logic on purpose.
+ * The failure mode is worth naming, because every unit test and every `typecheck` passed throughout: the
+ * *components* were verified and the *entry point* was not. `AGENTS.md` now requires the opposite — a real
+ * end-to-end run of the composition root, not just module-level tests.
  *
- * ## Read-only vs live
- * The runtime is **read-only unless a decrypted signer is supplied**, and this entry point does not
- * decrypt a key on its own: the passphrase is entered interactively (`scripts/keystore-init.ts` for
- * setup) and the composition root is given an account only when one is available. Without a signer the
- * process still monitors, scans and alerts — it simply cannot build or exit, because no code path can
- * reach a write.
+ * ## Startup order is the safety property
+ * Each step is a precondition for the next, and failure at any step stops the process:
  *
- * ## Why the scheduler is not started without a signer
- * A monitor-only process is genuinely useful (it proves the data sources and the risk view before any
- * money moves), but a process that *cannot act* while claiming to run the strategy is misleading. So the
- * read-only mode states that plainly at startup instead of silently doing half the job.
+ * ```text
+ * 1. config + whitelist      → an empty whitelist or a non-whitelisted DEX stops here (§96)
+ * 2. unresolved transactions → surfaced for a chain query, NEVER re-sent (§98)
+ * 3. keystore (optional)     → without it the process is a read-only monitor; no code path can write
+ * 4. runtime assembly        → one chain instance, one signer, one set of adapters
+ * 5. scheduler + long poll   → the beats actually start, and stop cleanly on a signal
+ * ```
+ *
+ * ## Read-only is a real mode, not a degraded one
+ * With no signer the process scans, persists the time series, values the portfolio, evaluates risk and
+ * alerts — everything except writing. That is genuinely useful (it proves the data sources and the risk
+ * view before any money moves), so it is supported explicitly rather than refused. What it must NOT do is
+ * pretend: the startup output says which mode it is in and what is therefore impossible.
  */
 import { loadConfig, ConfigError } from './config/index.ts';
-import { KeystoreError, readKeystoreFile } from './security/keystore.ts';
+import {
+  KeystoreError,
+  decryptPrivateKey,
+  readKeystoreFile,
+} from './security/keystore.ts';
 import { WhitelistError } from './types/registry.ts';
+import { buildCadences, buildRuntime, type StrategyRuntime } from './runtime.ts';
+import { Scheduler } from './execution/scheduler.ts';
+import { BscOnchainPoolStateSource } from './data/bscOnchainSource.ts';
+import { LayeredPoolDataProvider } from './data/poolDataProvider.ts';
+import { createReferencePriceProvider } from './data/referencePrice.ts';
+import { promptSecret } from '../scripts/lib/prompt.ts';
+import { privateKeyToAccount } from 'viem/accounts';
+import type { ChainId } from './types/primitives.ts';
 
 export interface StartupSummary {
   readonly sourcePath: string;
@@ -41,8 +60,8 @@ export interface StartupSummary {
 /**
  * Validate everything a start must validate, without touching the chain or the network.
  *
- * Exported so the same checks are usable from scripts and tests: a live start and a pre-flight check must
- * never disagree about whether the configuration is usable.
+ * Exported so the same checks can run from a script: a pre-flight and a live start must never disagree
+ * about whether the configuration is usable.
  */
 export async function loadStartupSummary(env: NodeJS.ProcessEnv = process.env): Promise<StartupSummary> {
   const config = await loadConfig();
@@ -57,8 +76,8 @@ export async function loadStartupSummary(env: NodeJS.ProcessEnv = process.env): 
 
   const keystorePath = env['KEYSTORE_PATH'];
   if (keystorePath !== undefined && keystorePath.length > 0) {
-    // Structural validation only: this proves the envelope exists and is well formed. The passphrase is
-    // entered interactively and is never available to a scheduler (§92/§94).
+    // Structural validation only: this proves the envelope exists and is well formed. Decryption needs the
+    // passphrase, which is entered interactively below and never stored.
     await readKeystoreFile(keystorePath);
   }
 
@@ -82,7 +101,7 @@ export async function loadStartupSummary(env: NodeJS.ProcessEnv = process.env): 
 function renderSummary(summary: StartupSummary): string {
   return [
     '',
-    `lptrader — startup check (${summary.sourcePath})`,
+    `lptrader — startup (${summary.sourcePath})`,
     '------------------------------------------------------',
     `  chains          : ${summary.chains.join(', ')}`,
     `  dexes           : ${summary.dexes.join(', ')}`,
@@ -91,18 +110,86 @@ function renderSummary(summary: StartupSummary): string {
     `  §66 risk-off NAV: $${summary.riskOffLineUsd.toFixed(2)}`,
     `  approvals       : ${summary.approvals}`,
     `  telegram        : ${summary.telegramEnabled ? 'enabled' : 'DISABLED — no build or switch can be approved'}`,
-    `  keystore        : ${summary.keystorePath ?? 'not configured'}`,
-    `  dry-run         : ${summary.dryRun ? 'yes (no transaction will be sent)' : 'NO — transactions will be signed'}`
+    `  keystore        : ${summary.keystorePath ?? 'not configured (read-only monitor)'}`,
+    `  dry-run         : ${summary.dryRun ? 'yes (no transaction will be sent)' : 'NO — transactions will be signed'}`,
   ].join('\n');
 }
 
+/**
+ * Decrypt the keystore, or return `null` for a read-only run.
+ *
+ * The passphrase is read interactively and never stored. A wrong passphrase is a HARD failure rather than
+ * a fallback to read-only: silently downgrading would leave the operator believing the bot can trade when
+ * it cannot, and the next thing they would notice is a missed position.
+ */
+async function resolveSigner(
+  env: NodeJS.ProcessEnv,
+): Promise<NonNullable<Parameters<typeof buildRuntime>[0]['signer']> | null> {
+  const keystorePath = env['KEYSTORE_PATH'];
+  if (keystorePath === undefined || keystorePath.length === 0) return null;
+
+  const chainId = Number(env['KEYSTORE_CHAIN_ID'] ?? 56);
+  const envelope = await readKeystoreFile(keystorePath);
+
+  process.stdout.write(
+    '\nA keystore is configured, so the signing key is needed.\n' +
+      'Enter the passphrase (hidden). Press Ctrl-C to run read-only instead.\n',
+  );
+  const passphrase = await promptSecret('Passphrase (hidden): ');
+  if (passphrase.length === 0) {
+    process.stdout.write('No passphrase supplied — running read-only.\n');
+    return null;
+  }
+
+  const decrypted = await decryptPrivateKey(envelope, passphrase, { chainId });
+  const account = privateKeyToAccount(decrypted.privateKeyHex);
+  if (account.address.toLowerCase() !== decrypted.address.toLowerCase()) {
+    throw new KeystoreError(
+      'ADDRESS_MISMATCH',
+      'the decrypted key does not match the address recorded in the envelope; refusing to sign with it',
+    );
+  }
+  return {
+    privateKey: decrypted,
+    account,
+  } as NonNullable<Parameters<typeof buildRuntime>[0]['signer']>;
+}
+
+/** Construct the real data layer. Module 1 is HTTP-only, so the on-chain source feeds the *provider*. */
+function buildProvider(runtimeConfig: Awaited<ReturnType<typeof loadConfig>>, env: NodeJS.ProcessEnv) {
+  const chainId = (runtimeConfig.whitelist.chains[0] ?? 56) as ChainId;
+  const onchain = new BscOnchainPoolStateSource({
+    ...(env['BSC_RPC_URL'] === undefined ? {} : { rpcUrl: env['BSC_RPC_URL'] }),
+  });
+  return new LayeredPoolDataProvider({
+    chainId,
+    registry: runtimeConfig.whitelist.registry,
+    onchain,
+    referencePrice: createReferencePriceProvider({ chainId, registry: runtimeConfig.whitelist.registry }),
+  });
+}
+
 async function main(): Promise<void> {
-  const summary = await loadStartupSummary();
+  const env = process.env;
+  const summary = await loadStartupSummary(env);
   process.stdout.write(`${renderSummary(summary)}\n`);
 
+  const config = await loadConfig();
+  const signer = await resolveSigner(env);
+
+  const runtime = buildRuntime({
+    config,
+    provider: buildProvider(config, env),
+    // `dex` is omitted so the runtime constructs every whitelisted adapter (Pancake first: it is the only
+    // venue with the §42 atomic build) from ONE chain instance, so there is one signer and one set of
+    // cross-check semantics for the whole process.
+    ...(signer === null ? {} : { signer }),
+    env,
+  });
+
   if (!summary.telegramEnabled) {
-    // Stated loudly because it is the single most common reason "nothing happens": the confirmation gate
-    // cannot be satisfied, so BUILD_POSITION and SWITCH_POOL are impossible (by design).
+    // Stated loudly because it is the usual reason "nothing happens": the confirmation gate cannot be
+    // satisfied, so BUILD_POSITION and SWITCH_POOL are impossible by design.
     process.stdout.write(
       '\nNOTE: the confirmation channel is disabled, so this process can monitor, alert, collect fees and\n' +
         'exit a position on risk — but it CANNOT open or switch a position. Configure TELEGRAM_* and set\n' +
@@ -110,16 +197,67 @@ async function main(): Promise<void> {
     );
   }
   if (summary.dryRun) {
-    process.stdout.write(
-      '\nNOTE: DRY_RUN is on. Transactions are guard-checked and then refused before broadcast.\n',
+    process.stdout.write('\nNOTE: DRY_RUN is on. Transactions are guard-checked and then refused before broadcast.\n');
+  }
+
+  const cadences = buildCadences(runtime);
+  process.stdout.write(
+    `\nmode: ${runtime.readOnly ? 'READ-ONLY (no signer — no write path exists)' : 'LIVE'}\n` +
+      `cadences: ${cadences.map((cadence) => `${cadence.name}=${cadence.intervalSeconds / 60}m`).join(' ')}\n` +
+      '\nStarting. Ctrl-C to stop.\n',
+  );
+
+  const scheduler = new Scheduler({
+    cadences,
+    onReport: (report) => {
+      if (!report.ok) {
+        process.stderr.write(`[scheduler] ${report.name} failed: ${report.error ?? 'unknown'}\n`);
+      }
+    },
+  });
+
+  installSignalHandlers(scheduler, runtime);
+
+  // §97/§98: anything still in flight from a previous run is queried, never re-sent. Surfaced before the
+  // first write-capable beat runs, so an operator sees it rather than discovering it from a double build.
+  const unresolved = runtime.txStore.findUnresolved({ chainId: runtime.chain.chainId });
+  if (unresolved.length > 0) {
+    process.stderr.write(
+      `\nWARNING: ${unresolved.length} transaction(s) from a previous run are unresolved. They will NOT be ` +
+        're-sent; query the chain and resolve them with the operator tools.\n' +
+        unresolved.map((record) => `  ${record.idempotencyKey} attempt ${record.attempt} state=${record.state}`).join('\n') +
+        '\n',
     );
   }
 
-  process.stdout.write(
-    '\nThis entry point validates the configuration and the whitelist. The scheduler is started by the\n' +
-      'runtime assembly (`src/runtime.ts`, `runOnce`/`Scheduler`); without a signing key this process is a\n' +
-      'read-only monitor.\n\n',
-  );
+  // Telegram long-poll runs alongside the scheduler so an approval can arrive while a cadence is working.
+  // Started before the loop so the channel is listening by the time anything asks for an approval.
+  const notifier = runtime.notifier as { start?: () => void };
+  notifier.start?.();
+
+  // Runs until a signal arrives.
+  await scheduler.run();
+}
+
+/**
+ * Stop cleanly.
+ *
+ * A hard kill mid-cadence could leave a transaction recorded as in-flight when it was never broadcast, or
+ * the reverse. The scheduler's `stop()` lets the current tick finish, and the process exits only after it
+ * returns, so the recorded state matches what actually happened.
+ */
+function installSignalHandlers(scheduler: Scheduler, runtime: StrategyRuntime): void {
+  let stopping = false;
+  const stop = (signal: string): void => {
+    if (stopping) return;
+    stopping = true;
+    process.stdout.write(`\n${signal} received — finishing the current cadence and stopping...\n`);
+    scheduler.stop();
+    const notifier = runtime.notifier as { stop?: () => Promise<void> };
+    void notifier.stop?.();
+  };
+  process.on('SIGINT', () => stop('SIGINT'));
+  process.on('SIGTERM', () => stop('SIGTERM'));
 }
 
 try {
