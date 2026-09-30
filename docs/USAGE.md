@@ -206,16 +206,54 @@ sqlite3 data/lptrader.db "select timestamp, action, result, reason from decision
 
 ---
 
-## 9. 交给别人或换机器
+## 9. 私钥备份（**最重要的维护动作**）
+
+一句话：**只备份 `secrets/wallet.enc` 是不够的** —— 口令不在任何文件里，口令一忘文件就是废纸。所以要额外抄下私钥本身。
+
+```bash
+npm run keystore:verify -- --export    # 输入口令 → 手打 EXPORT 确认 → 打印私钥
+```
+
+拿到私钥后：
+
+1. **抄到纸上两份**，放**两个不同的物理位置**
+2. **或存密码管理器**（确保有云端备份）
+3. **清屏**，确认没在录屏/投屏
+4. **然后立刻验证备份可用**：
+
+```bash
+npm run keystore:verify               # 不打印私钥，只打印地址
+```
+
+打印出的 **address 必须和你创建时记录的一致** —— 一致才算备份有效。
+
+**恢复**（三种场景，详见 `docs/OPS.md` §5.5）：
+
+| 情况 | 怎么做 |
+|---|---|
+| 文件被误删 | 把备份的 `wallet.enc` 放回 `secrets/` → `npm run keystore:verify` |
+| 换新机器 | 按 `OPS.md` §2 部署 → 放回 `wallet.enc` 与 `.env` → verify |
+| **只有私钥，没有文件** | `npm run keystore:init` 重新输入私钥 → **地址不变**，资金仓位都不用动 |
+
+`keystore:verify` 会区分"口令错""chain id 不对""文件损坏""文件被手改"，并给出不同建议 —— 恢复时按它的提示走，**不要**手工去编辑 `wallet.enc`。
+
+**建议在真正放钱之前，用一个小额钱包把"备份→销毁→恢复"完整演练一遍。** 没验证过的备份不算备份。
+
+---
+
+## 10. 交给别人或换机器
 
 需要带走的（可恢复运行的最小集合）：
 
 1. **代码**（git 仓库）
 2. **`config/` 三个 YAML**（策略参数 + 白名单）
 3. **`.env`**（凭据与开关）—— 敏感，离线传递
-4. **`secrets/wallet.enc`** —— 加密私钥；**丢了就要重建钱包**
-5. **口令（passphrase）** —— 不在任何文件里，**丢了私钥无法恢复**
-6. `data/lptrader.db` —— 可选；带上可保留仓位与决策历史
+4. **`secrets/wallet.enc`** —— 加密私钥（见 §9）
+5. **口令（passphrase）** —— 不在任何文件里；**与 `wallet.enc` 分开保管**
+6. **私钥本身**（`keystore:verify --export` 抄下来的）—— 口令丢了时唯一的退路
+7. `data/lptrader.db` —— 可选；带上可保留仓位与决策历史
+
+**4 和 5 不要放在同一个地方，6 不要和它们放在一起。** 三者全丢 = 资产永久丢失。
 
 **不要**把 `.env`、`wallet.enc`、口令放进 git、聊天工具或工单。
 
@@ -223,12 +261,16 @@ sqlite3 data/lptrader.db "select timestamp, action, result, reason from decision
 
 ---
 
-## 10. 速查卡
+## 11. 速查卡
 
 ```bash
 # 看状态
 npm run dev                          # 配置/白名单自检
 npm run telegram:check               # 审批通道是否可用
+
+# 私钥
+npm run keystore:verify              # ★ 验证备份可用（只打印地址）
+npm run keystore:verify -- --export  # 导出私钥做备份（敏感）
 
 # 看市场（免费）
 npm run smoke:read                   # 链上只读

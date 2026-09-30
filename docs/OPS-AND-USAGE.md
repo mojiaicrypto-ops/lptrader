@@ -261,16 +261,156 @@ journalctl -u lptrader -f
 |---|---|---|
 | `data/lptrader.db` | 仓位、交易记录、决策日志、审批记录、bot 状态 | **建议每日备份**（体积小，直接复制即可） |
 | `data/lptrader.db-wal` | SQLite WAL | 备份时一并复制 |
-| `secrets/wallet.enc` | 加密私钥 | **必须备份**；丢了等于丢了签名能力 |
+| `secrets/wallet.enc` | 加密私钥 | **必须备份** —— 完整做法与恢复演练见 §5.5 |
 | `.env` | 凭据与开关 | **必须离线备份**（含 Bot token，属敏感信息） |
 
-口令（passphrase）**不在任何文件里** —— 请单独用密码管理器保存。**口令丢了，私钥无法恢复。**
+**私钥备份是本项目最要紧的一件事，单独成节：见 §5.5。** 一句话版本：口令不在任何文件里，所以**只备份 `wallet.enc` 是不够的** —— 还要把私钥本身抄下来，并**实际验证一次能恢复**。
 
 ### 5.4 日志与告警
 
 - 进程日志：`stdout.log` / `stderr.log`（或 `journalctl`）
 - **重要事件会推到 Telegram**：风控线触发、脱锚、池子流动性崩塌、交易失败、审批请求
 - 启动时若发现上次有未完成的交易，会推一条 `warning` 提醒需要人工核查
+
+### 5.5 私钥的备份与恢复
+
+**这是整份文档里最需要认真对待的一节。** 钱包私钥是唯一能证明"这钱是你的"的东西，而且**没有找回机制** —— 没有客服、没有邮箱重置、没有"忘记密码"。
+
+#### 先理解三样东西，以及各自丢了会怎样
+
+| 东西 | 是什么 | 丢了会怎样 | 谁看过它 |
+|---|---|---|---|
+| **私钥**（64 位十六进制，`0x` 开头） | 钱包的全部控制权 | **资产永久丢失**，无任何找回途径 | 只有你 —— 程序只在内存里短暂持有 |
+| **口令（passphrase）** | 解开 `wallet.enc` 的密码 | `wallet.enc` 变成废纸；**但如果你另外存了私钥，仍能恢复** | 只有你 —— **不保存在任何文件里** |
+| **`secrets/wallet.enc`** | 用口令加密后的私钥（AES-256-GCM） | 用私钥＋口令重建即可 | 放在磁盘上，本身不构成泄露（没有口令解不开） |
+
+**关键推论：最保险的备份是"私钥本身"，因为口令丢了它也能救你。** `wallet.enc` 是方便日常运行的，不是终极备份。
+
+#### 备份：两条路线，建议都做
+
+**路线 A（必须）：离线抄下私钥** —— 这是唯一不依赖口令的备份。
+
+```bash
+npm run keystore:verify -- --export
+```
+
+会要求你输入口令，然后要求你**手打 `EXPORT`** 确认（防止手滑把私钥打到屏幕上）。之后打印私钥。
+
+**然后按这个顺序做：**
+
+1. **抄到纸上**（或金属助记板）—— 两份，放**两个不同的物理位置**（如家里 + 保险柜/银行）
+2. **或存进密码管理器**（1Password / Bitwarden 等），并确保它有云端备份
+3. **立刻清屏**：`clear`（若终端有 scroll-back，也要清）
+4. **确认没有录音、投屏、共享会话**
+
+> **不要**把私钥贴进聊天工具、工单、截图、云笔记、邮件。这些地方都会被索引或被别人看到。
+
+**路线 B（建议）：复制加密文件** —— 日常恢复用，方便但要配合口令。
+
+```bash
+cp -p secrets/wallet.enc /你的备份位置/wallet.enc
+```
+
+- 记录**创建时的 `KEYSTORE_CHAIN_ID`**（默认 56），恢复时必须一致
+- **口令单独保存**在密码管理器里 —— **绝不**和 `wallet.enc` 放在同一处
+- 可以用 U 盘/离线介质，但注意 U 盘也会坏，**别只留一份**
+
+**路线 B 的盲区（务必知道）**：文件损坏、口令记错、chain id 记错，任何一个都会让你打不开它。所以**路线 A 才是真正的保险**。
+
+#### **备份做完必须验证** —— 没验证过的备份不算备份
+
+这是本节的要点。很多人备份完从没试过恢复，真出事时才发现打不开。
+
+```bash
+npm run keystore:verify
+```
+
+**期望输出：**
+
+```text
+Verification PASSED. The passphrase decrypts this keystore.
+  address : 0x70997970C51812dc3A010C7d01b50e0d17dc79C8
+```
+
+**把打印出的 `address` 和你创建时记录下的地址（或钱包 App 里显示的地址）逐字符比对。** 一致 = 备份可用。
+
+默认模式下**不会打印私钥**，只打印地址 —— 因为地址足以证明"文件能解开、而且解出来的是这个钱包"，同时不会把私钥留在屏幕上。
+
+> **建议**：备份后的**当天**做一次完整恢复演练（下一小节），并且**每隔几个月重做一次**验证 —— 介质会老化，记忆会模糊。
+
+#### 恢复：三种场景
+
+**场景 1：同一台机器，文件被误删 / 需要重建**
+
+```bash
+mkdir -p secrets && chmod 700 secrets
+cp -p /你的备份位置/wallet.enc secrets/wallet.enc
+chmod 600 secrets/wallet.enc
+npm run keystore:verify            # 用口令验证
+```
+
+**场景 2：换到新机器**
+
+```bash
+# 1) 先按 OPS.md §2 部署代码并 npm ci
+# 2) 放回密钥与配置
+mkdir -p secrets && chmod 700 secrets
+cp -p /你的备份位置/wallet.enc secrets/wallet.enc
+chmod 600 secrets/wallet.enc
+cp /你的备份位置/.env .env && chmod 600 .env
+# 3) 确认 .env 里的 KEYSTORE_PATH / KEYSTORE_CHAIN_ID 与创建时一致
+# 4) 验证
+npm run keystore:verify
+```
+
+**场景 3：没有 `wallet.enc`，只有私钥（最需要预案的情况）**
+
+```bash
+npm run keystore:init              # 输入私钥 + 设置（新）口令
+```
+
+重新生成 `wallet.enc`。**地址会与原来完全一致**（私钥相同 ⇒ 地址相同），因此资金、仓位、审批配置都不用动。
+
+> 这种情况正是"路线 A 必须做"的原因 —— 口令忘了、文件坏了，只要私钥在纸上，钱包就还在你手里。
+
+#### 恢复演练（建议在**真正放钱之前**做一遍）
+
+用一个小额钱包走完整流程，确认每一步都通：
+
+```text
+1. 创建：      npm run keystore:init                → 记下打印的 address
+2. 备份：      npm run keystore:verify -- --export  → 抄下私钥
+                cp -p secrets/wallet.enc /tmp/wallet.enc.bak
+3. 销毁：      rm secrets/wallet.enc                （模拟丢失）
+4. 恢复 A：    npm run keystore:init                → 用抄下的私钥重建
+               npm run keystore:verify              → address 必须与第 1 步一致
+5. 销毁：      rm secrets/wallet.enc
+6. 恢复 B：    cp -p /tmp/wallet.enc.bak secrets/wallet.enc
+               npm run keystore:verify              → address 必须与第 1 步一致
+7. 收尾：      rm /tmp/wallet.enc.bak
+```
+
+**第 4 步和第 6 步的 address 都等于第 1 步，才算你真正拥有一个可用的备份。** 只在纸上抄了却从没验证过，等于没有备份。
+
+#### 验证工具会告诉你具体哪里错了
+
+`npm run keystore:verify` 对不同的失败给出**不同**的处置建议，因为在恢复现场，"口令错"和"文件坏"要采取的行动完全不同：
+
+| 输出 | 含义 | 你该做什么 |
+|---|---|---|
+| `no keystore at <path>` | 文件不在那儿 | 放回备份；注意 `KEYSTORE_PATH` 是否指对 |
+| `was created for a different chain id` | chain id 不一致 | 把 `KEYSTORE_CHAIN_ID` 改回创建时的值（BNB Chain = 56） |
+| `decryption failed. Either the passphrase is wrong, or the file is damaged` | 口令错**或**文件被改动 | 先换几个口令试；都不行 → **不要**去手改文件，改用私钥重建（场景 3） |
+| `does not match the address stored in the envelope` | 文件被手工编辑过 | 视为可疑，**不要使用**，从备份恢复 |
+| `Verification PASSED.` + 地址 | 一切正常 | 比对地址即可 |
+
+#### 安全提醒
+
+- **不要**把私钥写进 `.env`、源码、脚本或任何会被 git 追踪的文件。本项目**只**通过 `wallet.enc` + 交互式口令使用私钥
+- **不要**把 `wallet.enc` 和口令放在同一个位置（一份备份泄露不该等于私钥泄露）
+- 这个钱包**只放策略允许亏掉的钱**（基线 §92）。它是热钱包，私钥在联网机器上被解密使用
+- 换机器 / 交接时，用**离线介质**传 `wallet.enc` 与 `.env`，不要走聊天工具
+- 一旦怀疑私钥泄露：**立刻用新钱包转移资金**，重新 `keystore:init`，旧的 `wallet.enc` 删除。链上没有"改密码"这回事
 
 ---
 
@@ -715,16 +855,54 @@ sqlite3 data/lptrader.db "select timestamp, action, result, reason from decision
 
 ---
 
-## 9. 交给别人或换机器
+## 9. 私钥备份（**最重要的维护动作**）
+
+一句话：**只备份 `secrets/wallet.enc` 是不够的** —— 口令不在任何文件里，口令一忘文件就是废纸。所以要额外抄下私钥本身。
+
+```bash
+npm run keystore:verify -- --export    # 输入口令 → 手打 EXPORT 确认 → 打印私钥
+```
+
+拿到私钥后：
+
+1. **抄到纸上两份**，放**两个不同的物理位置**
+2. **或存密码管理器**（确保有云端备份）
+3. **清屏**，确认没在录屏/投屏
+4. **然后立刻验证备份可用**：
+
+```bash
+npm run keystore:verify               # 不打印私钥，只打印地址
+```
+
+打印出的 **address 必须和你创建时记录的一致** —— 一致才算备份有效。
+
+**恢复**（三种场景，详见 `docs/OPS.md` §5.5）：
+
+| 情况 | 怎么做 |
+|---|---|
+| 文件被误删 | 把备份的 `wallet.enc` 放回 `secrets/` → `npm run keystore:verify` |
+| 换新机器 | 按 `OPS.md` §2 部署 → 放回 `wallet.enc` 与 `.env` → verify |
+| **只有私钥，没有文件** | `npm run keystore:init` 重新输入私钥 → **地址不变**，资金仓位都不用动 |
+
+`keystore:verify` 会区分"口令错""chain id 不对""文件损坏""文件被手改"，并给出不同建议 —— 恢复时按它的提示走，**不要**手工去编辑 `wallet.enc`。
+
+**建议在真正放钱之前，用一个小额钱包把"备份→销毁→恢复"完整演练一遍。** 没验证过的备份不算备份。
+
+---
+
+## 10. 交给别人或换机器
 
 需要带走的（可恢复运行的最小集合）：
 
 1. **代码**（git 仓库）
 2. **`config/` 三个 YAML**（策略参数 + 白名单）
 3. **`.env`**（凭据与开关）—— 敏感，离线传递
-4. **`secrets/wallet.enc`** —— 加密私钥；**丢了就要重建钱包**
-5. **口令（passphrase）** —— 不在任何文件里，**丢了私钥无法恢复**
-6. `data/lptrader.db` —— 可选；带上可保留仓位与决策历史
+4. **`secrets/wallet.enc`** —— 加密私钥（见 §9）
+5. **口令（passphrase）** —— 不在任何文件里；**与 `wallet.enc` 分开保管**
+6. **私钥本身**（`keystore:verify --export` 抄下来的）—— 口令丢了时唯一的退路
+7. `data/lptrader.db` —— 可选；带上可保留仓位与决策历史
+
+**4 和 5 不要放在同一个地方，6 不要和它们放在一起。** 三者全丢 = 资产永久丢失。
 
 **不要**把 `.env`、`wallet.enc`、口令放进 git、聊天工具或工单。
 
@@ -732,12 +910,16 @@ sqlite3 data/lptrader.db "select timestamp, action, result, reason from decision
 
 ---
 
-## 10. 速查卡
+## 11. 速查卡
 
 ```bash
 # 看状态
 npm run dev                          # 配置/白名单自检
 npm run telegram:check               # 审批通道是否可用
+
+# 私钥
+npm run keystore:verify              # ★ 验证备份可用（只打印地址）
+npm run keystore:verify -- --export  # 导出私钥做备份（敏感）
 
 # 看市场（免费）
 npm run smoke:read                   # 链上只读
