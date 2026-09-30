@@ -186,6 +186,15 @@ sqlite3 data/lptrader.db "select timestamp, action, result, reason from decision
 **Q：`noopNotifier` / `fail closed` 是什么意思？**
 "通道不可用 ⇒ 拒绝执行"。没有 Telegram 时它**拒绝**建仓，而**不是**降级成自动执行 —— 沉默绝不被当成许可。
 
+**Q：启动报 `cannot read keystore file ... ENOENT`？**
+`.env` 里设了 `KEYSTORE_PATH=secrets/wallet.enc`，但文件还没创建。两种修法：**创建它**（`npm run keystore:init`），或**注释掉那一行**退回只读模式。这是 fail-closed 设计，不是故障。
+
+**Q：启动显示 `keystore: not configured` 正常吗？**
+正常。表示当前是**只读模式**（能监控/扫描/告警，不能建仓）。没创建钱包之前就应该长这样。
+
+**Q：从零到实盘该按什么顺序？**
+见 `docs/OPS.md` **§7 可执行顺序**（6 个阶段，每步带期望输出）。关键点：**先配置、再只读验证、最后才初始化钱包**，前三阶段完全免费。
+
 ---
 
 ## 8. 想调整策略参数
