@@ -55,6 +55,10 @@ import {
   stateStoreDecisionLogSink,
   type ApprovalGate,
 } from './execution/approvalGate.ts';
+import { PoolSnapshotStore } from './store/poolSnapshotStore.ts';
+import { verifyPostAllocation } from './strategy/allocation.ts';
+import { RiskWiring, describeRiskAction } from './execution/riskWiring.ts';
+import { RISK_ACTIONS } from './strategy/riskManager.ts';
 import { ActionHandlers } from './execution/actionHandlers.ts';
 import { PositionExecutor } from './execution/positionExecutor.ts';
 import { PortfolioMonitor } from './execution/portfolioMonitor.ts';
@@ -84,6 +88,23 @@ export interface StrategyRuntime {
   readonly txStore: TxStore;
   readonly stateStore: StateStore;
   readonly stateMachine: StateMachine;
+  /** §3.3 time series: the only source of the 24h history §59 needs. */
+  readonly poolSnapshots: PoolSnapshotStore;
+  /** Keep the latest scan's pools available to the risk beats (see `latestPoolByAddress`). */
+  readonly rememberScannedPools: (pools: readonly PoolSnapshot[]) => void;
+  /** Module 3 wiring: the risk verdict and the action it implies. */
+  readonly riskWiring: RiskWiring;
+  /**
+   * §65 high-water mark, carried across rounds.
+   *
+   * Mutable state on the runtime rather than a store lookup because the drawdown line is defined against
+   * the peak THIS process has observed; persisting it would invite the bot to inherit a peak from a
+   * different configuration and halt on it.
+   */
+  lastPeakNAV: number | null;
+  /** §3/§60 allocation check, exposed so a cadence can report it without re-deriving the limits. */
+  readonly monitorAllocation: () => Promise<{ readonly ok: boolean; readonly problems: readonly string[] }>;
+  readonly actionHandlers: ActionHandlers | null;
   /** `null` in read-only mode — the entire write path is unreachable without it. */
   readonly executor: PositionExecutor | null;
   readonly readOnly: boolean;
@@ -268,6 +289,47 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
       });
   }
 
+  const poolSnapshots = new PoolSnapshotStore(db);
+
+  /**
+   * The pools from the most recent scan, keyed by lowercased address.
+   *
+   * The risk beat needs the OPEN position's pool snapshot, and that snapshot comes from a scan that runs
+   * on its own cadence. Holding the last scan in memory is what connects the two beats — and it is
+   * deliberately in-memory: a snapshot from a previous process would carry a stale price into a live risk
+   * verdict, which is worse than reporting the position as unreadable.
+   */
+  const latestPoolByAddress = new Map<string, PoolSnapshot>();
+
+  // Module 3 wiring. The open position is read from the store and its pool snapshot is taken from the
+  // last scan, so the risk verdict is computed against the position we actually hold.
+  const riskWiring = new RiskWiring({
+    monitor,
+    config,
+    allocationLimits: { maxLpRatio: config.capital.maxLpRatio, reserveRatio: config.capital.reserveRatio },
+    openPosition: async () => {
+      const record = stateStore.openPosition(chainId);
+      if (record === null) return null;
+      const pool = latestPoolByAddress.get(record.poolAddress.toLowerCase());
+      if (pool === undefined) {
+        // Without the pool snapshot there is no price, no range position and no TVL history, so the
+        // verdict would be built from nothing. Reporting it as a missing input is the honest answer.
+        return null;
+      }
+      return {
+        record,
+        pool,
+        positionTokenId: BigInt(record.id),
+        liquidity: record.liquidity,
+        owner: walletAddressOf(env),
+      };
+    },
+    tvlSeries: (poolId) => poolSnapshots.tvlSeries(poolId),
+    // §58 conditions come from outside the pool data (a paused contract, a suspended issuer). Nothing
+    // observes them yet, so the domain is reported as a missing input rather than as "no emergency".
+    emergencyEvents: () => [],
+  });
+
   return {
     config,
     chain,
@@ -287,48 +349,67 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
     stateMachine,
     executor,
     readOnly,
+    poolSnapshots,
+    rememberScannedPools: (pools) => {
+      latestPoolByAddress.clear();
+      for (const pool of pools) latestPoolByAddress.set(pool.poolAddress.toLowerCase(), pool);
+    },
+    riskWiring,
+    lastPeakNAV: null,
+    actionHandlers: actionHandlersRef,
+    monitorAllocation: async () => {
+      const snapshotRound = await monitor.monitor({
+        walletAddress: monitor.walletAddress(),
+        now: new Date().toISOString(),
+        position: null,
+        pool: null,
+        benchmark: null,
+        initialNAV: config.capital.initialStrategyCapitalUsd,
+        reserveRatio: config.capital.reserveRatio,
+        priorPeakNAV: null,
+        realizedFees: 0,
+        gasCost: 0,
+        swapCost: 0,
+        slippageCost: 0,
+      });
+      const verdict = verifyPostAllocation({
+        navUsd: snapshotRound.snapshot.totalNAV,
+        lpValueUsd: snapshotRound.snapshot.lpPositionValue,
+        reserveUsd: snapshotRound.snapshot.walletStablecoinValue,
+        limits: { maxLpRatio: config.capital.maxLpRatio, reserveRatio: config.capital.reserveRatio },
+      });
+      return { ok: verdict.ok, problems: verdict.problems };
+    },
   };
 }
 
-/** §89 cadences, derived from `config.monitor`. Each one is independent; none decides anything. */
+/**
+ * §89 cadences, derived from `config.monitor`.
+ *
+ * Three beats, each with one job (architecture §2/§5):
+ * ```text
+ * pool-scan         (60m)  HTTP discovery + persist the time series  ← module 1
+ * pool-health       (15m)  the OPEN position's pool: TVL/range/peg    ← module 3, reads the chain
+ * portfolio-monitor (5m)   NAV, allocation, and the risk verdict      ← module 3
+ * ```
+ * `pool-health` was configured (`pool_health_interval_minutes`) but never registered, so the cadence the
+ * architecture describes did not exist. It is registered here rather than folded into the 5-minute beat
+ * because the two answer different questions at different costs: the portfolio beat values what we hold,
+ * the pool beat asks whether the pool itself is still healthy.
+ */
 export function buildCadences(runtime: StrategyRuntime): readonly SchedulerCadence[] {
   const { config } = runtime;
   return [
-    {
-      name: 'portfolio-monitor',
-      intervalSeconds: config.monitor.portfolioIntervalMinutes * 60,
-      run: async (at) => {
-        const result = await runtime.monitor.monitor({
-          walletAddress: runtime.monitor.walletAddress(),
-          now: at,
-          // The position/pool are supplied by the position-tracking task; until a position exists the
-          // monitor correctly values a reserve-only portfolio.
-          position: null,
-          pool: null,
-          benchmark: null,
-          initialNAV: config.capital.initialStrategyCapitalUsd,
-          reserveRatio: config.capital.reserveRatio,
-          priorPeakNAV: null,
-          realizedFees: 0,
-          gasCost: 0,
-          swapCost: 0,
-          slippageCost: 0,
-        });
-        // §96: an incomplete NAV is reported as degraded, never treated as merely a smaller NAV.
-        if (!result.complete) {
-          await runtime.notifier.send(
-            ALERT_SEVERITIES.WARNING,
-            'portfolio valuation incomplete',
-            result.problems.join('\n'),
-          );
-        }
-      },
-    },
     {
       name: 'pool-scan',
       intervalSeconds: config.monitor.poolScanIntervalMinutes * 60,
       run: async (at) => {
         const summary = await runtime.scanner.scan();
+
+        // Remember this scan for the risk beats. Only pools that passed the §16 filter are kept: the risk
+        // verdict must never be computed against a pool we would refuse to build in.
+        runtime.rememberScannedPools(summary.pools);
+
         if (!summary.complete) {
           // A partial scan must not look like a clean market: say which source failed.
           await runtime.notifier.send(
@@ -337,6 +418,35 @@ export function buildCadences(runtime: StrategyRuntime): readonly SchedulerCaden
             summary.blockers.join('\n'),
           );
         }
+
+        // architecture §3.3: persist what was just observed. This is the ONLY source of the 24h history
+        // §59 needs — the free APIs return only the current value, so a rate of change is unobtainable
+        // unless it is recorded as it passes.
+        try {
+          runtime.poolSnapshots.recordMany(
+            foundPools(summary).map((pool) => ({
+              poolId: pool.poolId,
+              sampledAt: at,
+              tvlUsd: pool.tvlUSD.stale ? null : pool.tvlUSD.value,
+              volume24hUsd: pool.volume24h.stale ? null : pool.volume24h.value,
+              volume7dUsd: pool.volume7d.stale ? null : pool.volume7d.value,
+              apr24h: pool.estimatedAPR1d.stale ? null : pool.estimatedAPR1d.value,
+              apr7d: pool.estimatedAPR7d.stale ? null : pool.estimatedAPR7d.value,
+              poolAgeDays: pool.poolAgeDays,
+              source: pool.marketDataSource,
+              // A degraded figure is recorded as stale rather than dropped: the sample is kept for
+              // diagnostics while `tvlSeries` excludes it, so it can never become a false baseline.
+              stale: pool.tvlUSD.stale,
+            })),
+          );
+        } catch (error) {
+          await runtime.notifier.send(
+            ALERT_SEVERITIES.WARNING,
+            'pool snapshot history could not be recorded',
+            `${error instanceof Error ? error.message : String(error)}\n\nTVL-collapse detection depends on this history; until it is fixed, §59 can only report insufficient-data.`,
+          );
+        }
+
         const outcome = filterPools(
           foundPools(summary),
           {
@@ -349,11 +459,11 @@ export function buildCadences(runtime: StrategyRuntime): readonly SchedulerCaden
           {
             evaluatedAt: at,
             whitelist: config.whitelist,
-            isOnchainVerified: (snapshot: PoolSnapshot) => summary.onchainVerifiedByPool[snapshot.poolId] === true,
+            // Module 1 makes no chain call (architecture §3), so nothing is on-chain verified yet. Passing
+            // `false` keeps `ONCHAIN_UNVERIFIED` honest; module 2 resolves it when it reads the pool.
+            isOnchainVerified: () => false,
           },
         );
-        // §96: a pool rejected because a figure was unavailable is a DATA problem, not a bad pool, and
-        // the operator must be told which one it is.
         if (!outcome.decisive) {
           await runtime.notifier.send(
             ALERT_SEVERITIES.WARNING,
@@ -363,8 +473,107 @@ export function buildCadences(runtime: StrategyRuntime): readonly SchedulerCaden
         }
       },
     },
+    {
+      name: 'portfolio-monitor',
+      intervalSeconds: config.monitor.portfolioIntervalMinutes * 60,
+      run: async (at) => {
+        const round = await runtime.riskWiring.round({
+          priorPeakNAV: runtime.lastPeakNAV,
+          realizedFees: 0,
+        });
+
+        if (round.nav !== undefined) {
+          runtime.lastPeakNAV = Math.max(runtime.lastPeakNAV ?? round.nav, round.nav);
+        }
+
+        // §96: an incomplete valuation is reported as degraded and NO drawdown verdict is derived from it.
+        if (round.valuationProblems !== undefined) {
+          await runtime.notifier.send(
+            ALERT_SEVERITIES.WARNING,
+            'portfolio valuation incomplete — no drawdown verdict this round',
+            round.valuationProblems.join('\n'),
+          );
+        }
+
+        // §3/§60: the allocation is reported every round because the operator funds the strategy manually
+        // and the ratios drift with each deposit. Monitoring is the bot's job; topping up is not (§68).
+        const allocation = await runtime.monitorAllocation();
+        if (!allocation.ok) {
+          await runtime.notifier.send(
+            ALERT_SEVERITIES.WARNING,
+            'allocation outside the configured bands',
+            allocation.problems.join('\n'),
+          );
+        }
+
+        await reportRiskRound(runtime, round, at);
+      },
+    },
+    {
+      name: 'pool-health',
+      intervalSeconds: config.monitor.poolHealthIntervalMinutes * 60,
+      run: async (at) => {
+        // Same wiring as the portfolio beat but on the pool's own cadence, so a pool problem is noticed
+        // within 15 minutes instead of waiting for the 5-minute valuation to surface it indirectly.
+        const round = await runtime.riskWiring.round({
+          priorPeakNAV: runtime.lastPeakNAV,
+          realizedFees: 0,
+        });
+        await reportRiskRound(runtime, round, at);
+      },
+    },
   ];
 }
+
+/**
+ * Send whatever the verdict warrants, and act only when the plan says it is automatic.
+ *
+ * Kept in one place so both risk beats behave identically: two cadences that alerted differently would
+ * make the operator's mental model depend on timing.
+ */
+async function reportRiskRound(
+  runtime: StrategyRuntime,
+  round: Awaited<ReturnType<StrategyRuntime['riskWiring']['round']>>,
+  at: IsoTimestamp,
+): Promise<void> {
+  const { plan } = round;
+  const actionable =
+    plan.action !== RISK_ACTIONS.HOLD && plan.action !== RISK_ACTIONS.ALERT;
+
+  if (!actionable) return;
+
+  const context = {
+    ...(round.nav === undefined ? {} : { nav: round.nav }),
+  };
+
+  await runtime.notifier.send(
+    plan.severity,
+    `risk: ${plan.action}`,
+    describeRiskAction(plan, context),
+  );
+
+  // §8.6: an automatic exit happens ONLY for the catastrophic verdicts. Price leaving the range goes to a
+  // human, because at that point the position is nearly all stock token and withdrawing sells the low.
+  if (plan.autoExit && runtime.executor !== null) {
+    await runtime.notifier.send(
+      ALERT_SEVERITIES.CRITICAL,
+      'automatic exit triggered',
+      `${plan.action} — closing the position without waiting for confirmation (§67).\n\n${plan.reasons.slice(0, 3).join('\n')}`,
+    );
+    // The exit itself runs through the same executor the manual path uses, so there is one code path for
+    // closing a position rather than two that can diverge.
+    const outcome = await runtime.actionHandlers?.exit();
+    if (outcome !== undefined && !outcome.ok) {
+      await runtime.notifier.send(
+        ALERT_SEVERITIES.CRITICAL,
+        'automatic exit FAILED — position still open',
+        outcome.message,
+      );
+    }
+  }
+  void at;
+}
+
 
 /**
  * Resolve the late-bound action handlers, or explain why an action cannot run.
