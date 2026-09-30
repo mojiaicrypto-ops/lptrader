@@ -99,6 +99,21 @@ export type PoolFilterCondition =
   | 'navDeviation'
   | 'swapImpact3500';
 
+/**
+ * Which §16 conditions can ONLY be evaluated with a chain read.
+ *
+ * The distinction exists because the two filter stages own different questions (architecture §4.2):
+ * ```text
+ * admission (module 1, HTTP)  → is this pool big/old/liquid enough to be worth looking at?
+ * screening (module 2, chain) → does it satisfy the two gates that need a live quote?
+ * ```
+ * At admission time `navDeviation` and `swapImpact3500` are **not yet measurable**, which is not the same as
+ * failing them. Treating "not yet measured" as a rejection is what produced a `warning` alert every hour,
+ * listing every candidate as rejected for `ONCHAIN_UNVERIFIED` — including the pools that are in fact
+ * eligible. Noise of that kind is how a real alert gets ignored.
+ */
+export const CHAIN_ONLY_CONDITIONS: readonly PoolFilterCondition[] = ['onchain', 'navDeviation', 'swapImpact3500'];
+
 export interface PoolFilterCheck {
   readonly condition: PoolFilterCondition;
   readonly code: PoolFilterCode;
@@ -109,6 +124,15 @@ export interface PoolFilterCheck {
   /** How the comparison is defined by §16 (`>=` or `<`). */
   readonly comparison: '>=' | '<' | 'in';
   readonly passed: boolean;
+  /**
+   * True when this condition is not applicable AT THIS STAGE rather than failed.
+   *
+   * Only the chain-only conditions can be deferred (see `CHAIN_ONLY_CONDITIONS`), and only when the caller
+   * says so explicitly via `deferChainOnly`. A deferred check is NOT a pass — it never contributes to
+   * `passed`, and `complete` stays false — it simply records "not measured yet" instead of "measured and
+   * too small", which are different facts and were being conflated.
+   */
+  readonly deferred: boolean;
   /** `field actual=… threshold=…` — one line, ready for the DecisionLog. */
   readonly message: string;
 }
@@ -151,6 +175,17 @@ export interface PoolFilterOptions {
   readonly onchainVerified?: boolean;
   /** Per-pool variant of `onchainVerified`, for batches verified one pool at a time. */
   readonly isOnchainVerified?: (snapshot: PoolSnapshot) => boolean;
+  /**
+   * Treat the chain-only conditions as NOT YET APPLICABLE instead of failed (architecture §4.2).
+   *
+   * Set this from the ADMISSION stage (module 1), which makes no chain call by design: there, `navDeviation`
+   * and `swapImpact3500` cannot have been measured, so reporting them as failures is a category error and
+   * turns every scan into an alert.
+   *
+   * Leave it unset for the SCREENING stage (module 2), which has the chain and therefore must judge those
+   * gates for real — §96 still applies, and an unmeasurable figure there is still a refusal.
+   */
+  readonly deferChainOnly?: boolean;
 }
 
 function formatUsd(value: number): string {
@@ -185,8 +220,12 @@ export function evaluatePoolFilters(
   options: PoolFilterOptions,
 ): PoolFilterEvaluation {
   const checks: PoolFilterCheck[] = [];
-  const push = (check: PoolFilterCheck): void => {
-    checks.push(check);
+  /**
+   * `deferred` defaults to false so a caller cannot forget it: only the three chain-only checks opt in, and
+   * they do so explicitly where they are built. Everything else is a real verdict by construction.
+   */
+  const push = (check: Omit<PoolFilterCheck, 'deferred'> & { readonly deferred?: boolean }): void => {
+    checks.push({ ...check, deferred: check.deferred === true });
   };
 
   // ---- §13/§15 identity: the snapshot must agree with itself.
@@ -299,6 +338,7 @@ export function evaluatePoolFilters(
   // ---- §15/§96 the raw on-chain fields carry no availability bit: gate them here.
   const onchainVerified =
     options.onchainVerified === true || options.isOnchainVerified?.(snapshot) === true;
+  const defer = options.deferChainOnly === true;
   push({
     condition: 'onchain',
     code: POOL_FILTER_CODES.ONCHAIN_UNVERIFIED,
@@ -306,9 +346,12 @@ export function evaluatePoolFilters(
     threshold: null,
     comparison: 'in',
     passed: onchainVerified,
+    deferred: defer && !onchainVerified,
     message: onchainVerified
       ? 'on-chain state read (tick/liquidity/fee verified via RPC, §15)'
-      : 'on-chain state NOT read: tick/liquidity/fee are unverified, so §16 swap impact and §34 tick alignment cannot be shown to hold — §96 fail closed',
+      : defer
+        ? 'on-chain state not read yet: this is the admission stage, which makes no chain call by design (architecture §4.2). module 2 reads it and judges §16 impact and §34 alignment there'
+        : 'on-chain state NOT read: tick/liquidity/fee are unverified, so §16 swap impact and §34 tick alignment cannot be shown to hold — §96 fail closed',
   });
 
   // ---- §16 TVL >= min_tvl_usd.
@@ -364,6 +407,10 @@ export function evaluatePoolFilters(
   // ---- §16 Token/NAV Deviation < max_nav_deviation.
   const navDeviation = usableNumeric(snapshot.tokenNAVDeviation);
   const navStale = snapshot.tokenNAVDeviation.stale;
+  // At the admission stage this figure comes from a chain read plus a reference price, so it cannot have
+  // been measured yet. Deferring it records "not measured" instead of "measured and too high" — and a
+  // genuinely unreadable figure at the SCREENING stage still fails, because `defer` is false there.
+  const navDeferred = defer && navDeviation === null;
   push({
     condition: 'navDeviation',
     code:
@@ -374,9 +421,12 @@ export function evaluatePoolFilters(
     threshold: thresholds.maxNavDeviation,
     comparison: '<',
     passed: navDeviation !== null && navDeviation < thresholds.maxNavDeviation,
+    deferred: navDeferred,
     message:
       navDeviation === null
-        ? `tokenNAVDeviation unavailable (source=${snapshot.tokenNAVDeviation.source}, stale=${String(navStale)}) — without a reference NAV the depeg condition cannot be satisfied (§57/§96)`
+        ? navDeferred
+          ? 'tokenNAVDeviation not measured yet: needs a chain price and a reference NAV, which the admission stage does not read (architecture §4.2); module 2 evaluates it'
+          : `tokenNAVDeviation unavailable (source=${snapshot.tokenNAVDeviation.source}, stale=${String(navStale)}) — without a reference NAV the depeg condition cannot be satisfied (§57/§96)`
         : `tokenNAVDeviation ${formatRatio(navDeviation)} < ${formatRatio(thresholds.maxNavDeviation)} → ${navDeviation < thresholds.maxNavDeviation ? 'pass' : 'FAIL'}`,
   });
 
@@ -392,13 +442,23 @@ export function evaluatePoolFilters(
     threshold: thresholds.maxSwapPriceImpact,
     comparison: '<',
     passed: impact !== null && impact < thresholds.maxSwapPriceImpact,
+    // Same reasoning as `navDeviation`: the $3500 impact needs an on-chain quote (QuoterV2), which the
+    // admission stage does not make. A MEASURED impact that is too high always fails, deferred or not.
+    deferred: defer && impact === null,
     message:
       impact === null
-        ? `swapImpact3500USD unavailable (source=${snapshot.swapImpact3500USD.source}, stale=${String(snapshot.swapImpact3500USD.stale)}) — no on-chain quote, so the §16 impact gate cannot be satisfied`
+        ? defer
+          ? 'swapImpact3500USD not measured yet: needs an on-chain quote, which the admission stage does not make (architecture §4.2); module 2 evaluates it'
+          : `swapImpact3500USD unavailable (source=${snapshot.swapImpact3500USD.source}, stale=${String(snapshot.swapImpact3500USD.stale)}) — no on-chain quote, so the §16 impact gate cannot be satisfied`
         : `$3500 swap price impact ${formatRatio(impact)} < ${formatRatio(thresholds.maxSwapPriceImpact)} → ${impact < thresholds.maxSwapPriceImpact ? 'pass' : 'FAIL'}`,
   });
 
-  const failed = checks.filter((check) => !check.passed);
+  /**
+   * A DEFERRED check is not a failure and not a pass: it is "not measured yet". Excluding it from `failed`
+   * is what stops an admission-stage scan from reporting every candidate as rejected — including the pools
+   * that are in fact eligible. It never counts toward `passed` either, so §96 is untouched.
+   */
+  const failed = checks.filter((check) => !check.passed && !check.deferred);
   const reasons = failed.map((check) => `[${check.code}] ${check.message}`);
   return {
     poolId: snapshot.poolId,
@@ -410,7 +470,17 @@ export function evaluatePoolFilters(
     poolAddress: snapshot.poolAddress,
     checks,
     failedCodes: failed.map((check) => check.code),
-    complete: onchainVerified && !failed.some((check) => check.code.endsWith('_UNAVAILABLE')),
+    /**
+     * `complete` says "every §16 figure was readable and the on-chain state was verified".
+     *
+     * A deferred check makes this false on purpose: the verdict is genuinely partial at the admission stage,
+     * and a caller that treats `complete: false` as "needs another look" is right to. What the deferral
+     * removes is the claim that the pool FAILED — the difference between "not yet judged" and "judged bad".
+     */
+    complete:
+      onchainVerified &&
+      !checks.some((check) => check.deferred) &&
+      !failed.some((check) => check.code.endsWith('_UNAVAILABLE')),
   };
 }
 

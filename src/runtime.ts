@@ -479,9 +479,13 @@ export function buildCadences(runtime: StrategyRuntime): readonly SchedulerCaden
           {
             evaluatedAt: at,
             whitelist: config.whitelist,
-            // Module 1 makes no chain call (architecture §3), so nothing is on-chain verified yet. Passing
-            // `false` keeps `ONCHAIN_UNVERIFIED` honest; module 2 resolves it when it reads the pool.
+            // Module 1 makes no chain call (architecture §3), so nothing is on-chain verified yet.
             isOnchainVerified: () => false,
+            // ...and the chain-only gates cannot have been MEASURED at this stage, so they are deferred
+            // rather than failed (architecture §4.2). Without this, every scan reported every candidate as
+            // rejected — including the eligible pools — and pushed a `warning` listing them all, once an
+            // hour. An alert that fires on a healthy market is how a real alert gets ignored.
+            deferChainOnly: true,
           },
         );
         if (!outcome.decisive) {
