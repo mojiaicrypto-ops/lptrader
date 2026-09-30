@@ -1,0 +1,409 @@
+# Iteration 2 架构：池子发现、筛选与持仓监控
+
+**状态**：待用户确认
+**取代/修订**：本文件修订 Iteration 1 的若干实现安排（不改产品语义，除第 6 节列出的范围问题）
+**基线**：`docs/product/stock-lp-auto-strategy-v1.md`
+
+> 本文件只描述**模块职责、数据契约、节奏与存储**。产品行为（阈值、风控等级、换池门槛）以基线为准，本文件不重新定义；凡与基线冲突之处，在 §6 单列待确认。
+
+---
+
+## 1. 为什么要重梳
+
+Iteration 1 把「池子发现」与「链上精读」混在一个 `PoolScanner` 里，导致：
+
+| 问题 | 实测/证据 |
+|---|---|
+| 每轮扫描对**全部候选组合**做链上 `factory.getPool()` 探测 | `enumerateCandidatePairs` = 5 股票 × 2 稳定币 × 2 DEX = 20 组合，再乘 fee tiers |
+| 组合监控对**全部 11 个白名单 token** 做 `uiMultiplier` 探测 | 11 × 3 次调用 = 33 次，且**探测缓存 TTL(5min) = 监控间隔(5min)**，每轮必然错过缓存 |
+| §99 交叉校验让每个请求发 **2 遍** | 首轮 `readWallet` ≈ 72 次 HTTP |
+| 池子**时序数据不落库** | 于是「TVL 24h 骤减」这个风控**永远算不出**（需要两个时间点） |
+| 风控逻辑**未被调度** | `tvlSeries` / `position` 在 `runtime.ts` 中零引用；`pool_health_interval_minutes` 未注册 |
+
+**结论**：不是"多花了一点请求"，而是**低成本层与高成本层没有分开**，且**风控判据缺数据源**。
+
+---
+
+## 2. 四模块划分
+
+```text
+┌─ 模块 1 · PoolScanner ──────────────────────────────── 纯 HTTP，无链上 ─┐
+│  输入：股票代币白名单                                                  │
+│  输出：该股票的所有 USDT/USDC 池 + 基础信息，落库                        │
+│  节奏：每 pool_scan_interval_minutes（默认 60）                         │
+└────────────────────────────────────────────────────────────────────┘
+                                  │ 候选池列表（按 APR 排序）
+                                  ▼
+┌─ 模块 2 · 逐池精筛（PoolScreener）──────────────────── 链上，串行短路 ──┐
+│  输入：候选池列表                                                      │
+│  输出：首个通过全部门槛的池 → 进入建仓                                  │
+│  节奏：仅在准备建仓时运行（非周期）                                     │
+│  关键：**首个合格即停止**，不遍历全部候选                               │
+└────────────────────────────────────────────────────────────────────┘
+                                  │ 选定的一个池
+                                  ▼
+┌─ 模块 3 · 持仓监控（PositionMonitor）───────────────── 链上，高频 ─────┐
+│  输入：当前持仓的池 + 仓位                                             │
+│  输出：实时权益、区间位置、未领手续费、脱锚、风控判定                     │
+│  节奏：每 portfolio_interval_minutes（默认 5）+ 池健康 15min             │
+└────────────────────────────────────────────────────────────────────┘
+                                  │ 风控触发
+                                  ▼
+┌─ 模块 4 · 换池（SwitchManager）─────────────────────── 链上，事件驱动 ─┐
+│  撤池 → 重新回到模块 2 找新池 → 建仓 → 回到模块 3                        │
+│  ⚠ 属基线 Phase 5，Iteration 1 已裁剪 —— 见 §6                            │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+**分层原则**：模块 1/2 是**筛选层**（便宜、可失败、可缓存）；模块 3/4 是**执行层**（贵、必须成功、涉及资金）。两者不共享代码路径，失败语义也不同。
+
+---
+
+## 3. 模块 1 · PoolScanner（纯 HTTP）
+
+### 3.1 职责
+
+**只做两件事**：发现池子、记录基础信息。**不做任何链上调用。**
+
+### 3.2 数据来源
+
+| 字段 | 来源 | 说明 |
+|---|---|---|
+| 池地址 / DEX / feeTier | GeckoTerminal `/tokens/{addr}/pools` | 权威发现 |
+| TVL | GeckoTerminal `reserve_in_usd` | canonical |
+| volume 24h | GeckoTerminal | |
+| volume 7d | DexPaprika `volume_usd_7d` | GT 无此字段 |
+| pool age / createdAt | GeckoTerminal `pool_created_at` | |
+| **APR 24h / 7d** | **本地计算**，见 §3.4 | **禁止用前端 APR**（基线 §17） |
+
+**冲突策略**：两源不一致时**取 GeckoTerminal 为 canonical**，另一值存入 `crossChecks` 供审计（实测两源 TVL 差约 3%）。**不得静默混用**。
+
+### 3.3 缓存与落库
+
+**两层**：
+
+```text
+① 短期缓存（内存）：同一轮内避免重复请求同一 token/池
+② 长期落库（SQLite）：每次采样写一行，形成时间序列
+```
+
+**落库表**（新增）：
+
+```sql
+CREATE TABLE pool_snapshots (
+  id            INTEGER PRIMARY KEY,
+  pool_id       TEXT NOT NULL,          -- §13: chainId:dex:poolAddress
+  sampled_at    TEXT NOT NULL,          -- ISO
+  tvl_usd       REAL,
+  volume_24h    REAL,
+  volume_7d     REAL,
+  apr_24h       REAL,                   -- 本地计算
+  apr_7d        REAL,                   -- 本地计算
+  pool_age_days REAL,
+  source        TEXT NOT NULL,          -- 'geckoterminal' | 'dexpaprika' | ...
+  stale         INTEGER NOT NULL        -- 0/1，数据源降级时必须记录
+);
+CREATE INDEX idx_pool_snapshots_lookup ON pool_snapshots(pool_id, sampled_at);
+```
+
+**为什么必须落库**：聚合 API **只给当前值**，不给"24 小时前的 TVL"。基线 §59 的「TVL 24h 跌幅 > 50%」需要**两个时间点** —— 只能靠自采样。**没有这张表，该风控永远无法触发。**
+
+**保留策略**：至少 30 天（覆盖 7d/30d 变化率与 §90 周报）。
+
+### 3.4 APR 计算（本地，基线 §17–§18）
+
+```text
+FeeAPR_d = (fees_d / avgTVL_d) × (365 / d)
+
+其中 fees_7d  由 volume_7d × feeTier 推导（免费 API 不直供 fees）
+     fees_24h 同理
+```
+
+**必须在数据上标注为 `derived`**（`Sourced<T>.source = 'derived'`），不得伪装成真实数据 —— 这是 §96 与 Iteration 1 已确立的规则。
+
+### 3.5 失败语义
+
+| 情况 | 行为 |
+|---|---|
+| 某字段拿不到 | 标 `stale: true` + `source: 'unavailable'`，**照常落库**（缺失本身是信息） |
+| 整个数据源失败 | 该轮记为失败，**不产出候选列表**，告警一次；**绝不当成"没有池子"** |
+| 429 限流 | 退避重试（已有实现，6 秒最小间隔 + 指数退避） |
+
+**关键区分**（Iteration 1 已实现，保留）：**「池子不存在」≠「读不到」**。前者是 `absent`（有链上 factory 零地址或 HTTP 明确无结果），后者是 `unverified`。
+
+### 3.6 输出契约
+
+```typescript
+interface PoolCandidate {
+  readonly poolId: PoolId;              // §13 身份
+  readonly dex: DexId;
+  readonly feeTier: FeeTier;
+  readonly token0: Address;             // 含股票腿与稳定币腿的地址
+  readonly token1: Address;
+  readonly tvlUsd: Sourced<number>;
+  readonly volume24h: Sourced<number>;
+  readonly volume7d: Sourced<number>;
+  readonly apr24h: Sourced<number>;     // derived
+  readonly apr7d: Sourced<number>;      // derived
+  readonly poolAgeDays: number;
+  /** HTTP 层能判定的硬门槛结论，链上项留 pending */
+  readonly prefilterVerdict: 'pass' | 'reject' | 'indeterminate';
+  readonly prefilterReasons: readonly string[];
+}
+```
+
+---
+
+## 4. 模块 2 · 逐池精筛（PoolScreener）
+
+### 4.1 职责
+
+从候选列表里**找出第一个可建仓的池**，然后**立即停止**。
+
+**核心约束：串行 + 短路。** 不遍历全部候选（那是浪费 —— 只需要一个池）。
+
+### 4.2 两段式过滤（关键设计）
+
+基线 §16 有 5 项硬门槛，但**它们的数据来源不同**：
+
+| §16 门槛 | 数据来源 | 在哪一段测 |
+|---|---|---|
+| 白名单（chain/DEX/token 地址） | 配置 | **模块 1**（无需请求） |
+| `TVL >= 500k` | HTTP | **模块 1** |
+| `7D 均日量 >= 250k` | HTTP | **模块 1** |
+| `pool age >= 7d` | HTTP | **模块 1** |
+| **`NAV deviation < 1%`** | **链上价格 + 参考价** | **模块 2** |
+| **`$3500 impact < 0.5%`** | **QuoterV2** | **模块 2** |
+
+```text
+模块 1（HTTP）：用能测的 3 项剔除大部分候选 → 得到"待精筛列表"
+模块 2（链上）：对每个候选依次测 2 项链上门槛 + 建仓数学
+              ├─ 全部通过 → 建仓，停止
+              └─ 任一不过 → 下一个候选
+```
+
+**为什么这样分**：`impact` 是小池子最容易挂的一项（Iteration 1 实测：Uniswap 的 QQQB/USDC 池 TVL/volume 达标，但因 `$3500 impact = 0.66% > 0.5%` 被淘汰）。若在模块 1 就尝试测 impact，等于对全部候选上链 —— 正是本次要消除的开销。
+
+### 4.3 排序
+
+**候选先按 `apr7d` 从高到低**（基线 §22 要求看 7d/30d，不能只看 1d）。
+
+⚠ **已知张力**：APR 最高的池往往流动性最差（小池子 fee 高）。缓解是**模块 1 已剔除 TVL/volume/age 不合格者**，所以排序时剩下的都是"够大"的池。**但仍建议**：先按 `apr7d` 排序，再按 `tvlUsd` 做**次级**排序，避免在同等 APR 时优先选更薄的池。
+
+**待确认**：是否需要"APR 权重 vs TVL 权重"的显式排序公式，还是简单两级排序即可（见 §7 问题 2）。
+
+### 4.4 每个候选的精筛步骤
+
+```text
+1. 链上读池状态：slot0（tick/price）、liquidity、feeTier、tickSpacing
+2. 校验池身份与模块 1 的记录一致（token0/token1/fee 与候选一致）
+   ——不一致视为"聚合站数据过期或错误"，跳过该候选并记日志
+3. 读参考价 → 算 tokenNAVDeviation → 判 §16 的 1% 门槛
+4. 用 QuoterV2 对"预算单量"报价 → 算 priceImpact → 判 §16 的 0.5% 门槛
+5. 计算建仓数学：区间（§33）、tick 对齐（§34）、最优比例（§36–§37）
+6. 全部通过 → 交给建仓流程（模块 3 的入口）
+```
+
+### 4.5 失败与终止
+
+| 情况 | 行为 |
+|---|---|
+| 某候选不合格 | 记录原因（供 §77 决策日志），取下一个 |
+| 候选耗尽 | **本轮不建仓**，告警一次「本轮无合格池」，等下一轮扫描 |
+| 链上读取失败（provider 故障） | 按 Iteration 1 的修复：**视为 transport 故障，切换端点**；两个端点都失败则该轮放弃（不跳过该候选继续测下一个 —— 因为无法区分"该池不行"与"读不到"） |
+| 数据源降级（`stale`） | **该候选判 `indeterminate`，跳过**（§96：无法验证即不通过） |
+
+⚠ **最后一条很重要**：`impact` 或 `deviation` 读不到时**不能当作通过**。Iteration 1 的 `POOL_FILTER_CODES` 已有 `*_UNAVAILABLE` 系列码，予以保留。
+
+### 4.6 是否需要上限
+
+若有 20 个候选且全部不合格，最坏是 20 次链上精筛。**建议不设硬上限**，理由：
+- 模块 2 **只在准备建仓时运行**（不是周期任务）
+- 模块 1 已剔除大部分
+- 设上限会漏掉后面的合格池
+
+但**必须记录耗时**，若某轮精筛超过预期（如 > 2 分钟），告警提示数据源或 RPC 异常。
+
+---
+
+## 5. 模块 3 · 持仓监控（PositionMonitor）
+
+### 5.1 与模块 1/2 的本质区别
+
+| | 模块 1/2 | 模块 3 |
+|---|---|---|
+| 对象 | 市场（很多池） | **自己的仓位（一个池）** |
+| 失败容忍 | 高（可以跳过候选） | **低**（读不到就该停手，不能瞎猜） |
+| 链上频率 | 低 | 高（5min / 15min） |
+| 涉及资金 | 否 | **是** |
+
+### 5.2 监控内容（基线 §46）
+
+```text
+钱包余额（当前持仓的 2 个 token + native）
+LP 仓位价值（amount0/amount1 由 liquidity + 当前 tick 反算）
+未领手续费（tokensOwed0/1）
+当前 tick / 区间位置（RangeProgress，§49）
+脱锚偏差（链上价 vs 参考价，§54）
+池 TVL 与流动性（§59，用模块 1 的时序 + 本次链上值）
+储备比例（§60）
+组合 NAV 与回撤（§65–§66）
+```
+
+### 5.3 优化：只读持仓相关的 token
+
+**当前问题**：`readWallet` 对全部 11 个白名单 token 做探测与余额批读。
+
+**改为**：
+
+```text
+必读（每轮）：持仓的股票代币 + 稳定币 + native
+        —— 这 2 个 token 决定全部 NAV 计算
+可选（低频）：其余白名单 token
+        —— 仅在"检查是否有其他资产"时读（如 每小时一次，或建仓前一次）
+```
+
+**理由**：NAV 的正确性只依赖**你实际持有的资产**；没持有时，其乘数算错也不影响任何数字。
+
+**风险**：若有资产转到钱包但不在"持仓 token"里，会被漏算。**缓解**：低频全量扫一次作为兜底（建议每 60 分钟或每次组合监控的每 N 轮）。
+
+⚠ **这一条需要你确认**（见 §7 问题 3）—— 它涉及"漏算资产"的风险权衡。
+
+### 5.4 探针缓存 TTL
+
+**当前**：`TokenReader.cacheTtlMs` 默认 **5 分钟**，**恰好等于监控间隔** → 每轮都错过缓存。
+
+**改为**：
+
+| token 类别 | TTL | 理由 |
+|---|---|---|
+| 持仓的 token | **每个监控轮次重新读**（或 30s） | 其 `uiMultiplier` 直接影响 NAV |
+| 非持仓的 token | **24 小时** | 不影响任何计算；企业行动有 `effectiveAt` 提前公告 |
+| 稳定币（无 BEP-677） | 永久（探测一次即可，结果不会变） | 实测 USDC/USDT 不支持 scaled UI amount |
+
+**实现方式**：`probeUiAmount` 增加一个"关键性"参数，或按 token 是否在持仓集合里决定 TTL。
+
+### 5.5 §99 交叉校验分级
+
+**当前**：所有 `readContract` 都双端点校验 → 请求 ×2。
+
+**建议**：按"读错是否立刻导致错误交易"分级：
+
+| 类别 | 例子 | 校验 |
+|---|---|---|
+| **关键**（读错立刻亏钱） | `slot0`、`liquidity`、报价、`tickSpacing` | **双读** |
+| **自愈**（下一轮会纠正） | 余额、`tokensOwed`、`uiMultiplier` | **单读** + 周期性双读抽查 |
+| **元数据** | `token0`/`token1`/`decimals`/`supportsInterface` | **单读并长期缓存** |
+
+**理由**：余额读错一次，下一轮就修正，不会导致错误交易；而 `tick` 读错会让区间与比例算错，是即时损失。
+
+⚠ **需你确认**（见 §7 问题 4）—— 这是安全性的权衡。
+
+---
+
+## 6. 模块 4 · 换池（范围问题，待确认）
+
+**这一块在 Iteration 1 被明确裁剪（见 `docs/decisions/D1-scope-and-stack.md`），属基线 Phase 5。**
+
+你现在描述的流程（风控触发 → 撤池 → 找新池 → 建仓 → 回到监控）**把它拉回来了**。需要你确认是否纳入 Iteration 2。
+
+### 6.1 触发条件（按基线，不由本文件重新定义）
+
+| 触发 | 基线依据 | 处置 |
+|---|---|---|
+| `FeeILRatio < 1`（收益覆盖不了无常损失） | §7 | 进入 `UNDERPERFORMING` |
+| `7D Net APR < 12%` 持续 72h | §28–§29 | 进入 `SEARCH_REPLACEMENT` |
+| TVL 24h 跌 > 50% | §59 | `RISK_REVIEW` |
+| TVL 24h 跌 > 70% | §59 | `EMERGENCY` |
+| 脱锚 > 3% | §55 | `EXIT_REVIEW` |
+| 脱锚 > 5% | §55 | `EMERGENCY_EXIT` |
+| 全局 NAV ≤ 初始 × 85% | §66 | `GLOBAL_RISK_OFF` |
+| **价格出下界** | §51 | ⚠ **`RISK_REVIEW`（人工）** —— 基线明确「不自动卖」 |
+
+### 6.2 换池门槛（基线 §29–§32，必须全部满足）
+
+```text
+新池净 APR >= 当前净 APR + 8 个百分点
+BreakEvenDays <= 14
+换池成本 <= 资本 × 0.75%
+冷却期已过（成功换池后 7 天）
+新池池分 > 当前池分
+```
+
+**风控事件豁免冷却期**（§32 明文列举：脱锚、合约风险、发行方风险、TVL 崩溃、流动性消失）。
+
+### 6.3 状态机
+
+```text
+MONITOR
+  ├─ 正常 → MONITOR
+  ├─ 收益不足（持续 72h）→ UNDERPERFORMING → SEARCH_REPLACEMENT
+  │                                            ├─ 找到更好的池 → SWITCH_POOL → MONITOR
+  │                                            └─ 没有 → MONITOR
+  └─ 风控事件 → RISK_REVIEW
+                  ├─ 正常（市场同步下跌，§53）→ MONITOR
+                  └─ 严重 → EXIT_POSITION → PAUSED
+```
+
+**注意**：撤池 ≠ 自动卖币。基线 §67 明确「不一定自动卖掉所有股票 Token；是否卖出由 RISK_REVIEW 决定」。
+
+### 6.4 撤池后的资金去向
+
+撤池得到的是**股票代币 + 稳定币**。回到模块 2 找新池时：
+- 若新池是同一股票 → 可直接建仓
+- 若换股票 → 需要 swap，**先评估成本**（§30 的 Switching Cost）
+
+---
+
+## 7. 待确认清单
+
+| # | 问题 | 选项 | 我的建议 |
+|---|---|---|---|
+| 1 | **模块 4 是否纳入 Iteration 2** | (a) 纳入；(b) 先只做模块 1–3 的接线与优化 | **(b) 先做 1–3**，因为模块 3 目前**根本没接线**，风控是名义上的；先把监控做成真的，再谈自动换池 |
+| 2 | **候选排序** | (a) 单纯 `apr7d` 降序；(b) `apr7d` 主 + `tvlUsd` 次 | **(b)** |
+| 3 | **模块 3 只读持仓 token** | (a) 只读持仓 2 个 + 低频全量兜底；(b) 保持全量读 | **(a)**，低频兜底设 60 分钟 |
+| 4 | **§99 交叉校验分级** | (a) 按"读错是否立刻亏钱"分级；(b) 保持全量双读 | **(a)**，可省约一半请求 |
+| 5 | **单池是硬约束吗** | (a) 检测到多持仓 → 停机告警；(b) 静默处理多持仓 | **(a)**，违反策略前提说明有 bug 或人工干预，此时停机问你更安全 |
+| 6 | **出下界是否破例自动撤** | (a) 按基线转人工；(b) 自动撤 | **(a)**，基线 §51/§53 明确"市场同步下跌应 HOLD"，盲撤会实亏 |
+
+---
+
+## 8. 对现有实现的改动清单
+
+| 模块 | 改动 | 影响面 |
+|---|---|---|
+| 模块 1 | **移除** `PoolScanner` 的链上 `factory.getPool()` 探测路径 | `src/data/poolScanner.ts`、`bscOnchainSource.findPool` |
+| 模块 1 | 新增 `pool_snapshots` 表与写入 | `src/store/**`（新迁移） |
+| 模块 1 | 新增本地 APR 计算 + `derived` 标注 | `src/data/**` |
+| 模块 2 | **新增** `PoolScreener`（串行精筛 + 短路） | 新文件 |
+| 模块 2 | 现有 `poolFilter` 拆为「宽筛（HTTP 项）」与「精筛（链上项）」 | `src/data/poolFilter.ts` |
+| 模块 3 | **接线**：`runtime` 喂真实 `position`/`pool`/`tvlSeries` 给 `evaluateRisk` | `src/runtime.ts`、`src/execution/portfolioMonitor.ts` |
+| 模块 3 | 注册缺失的 `pool_health_interval_minutes` cadence | `src/runtime.ts` |
+| 模块 3 | 探针 TTL 分级 + 只读持仓 token | `src/chain/tokenReader.ts`、`portfolioMonitor.ts` |
+| 模块 3 | §99 交叉校验分级 | `src/chain/adapter.ts`、`src/chain/rpc.ts` |
+| 模块 4 | （待定，见 §7 问题 1） | 新增 |
+
+---
+
+## 9. 不变量（本次梳理不改变的部分）
+
+以下来自 Iteration 1，**继续保持**：
+
+- **地址即身份**：token 只按合约地址识别，无 symbol 解析路径
+- **池身份 = `chainId:dex:poolAddress`**（§13）
+- **Fail closed**：未知/不可读 → 不动作，不猜
+- **禁止前端 APR**（§17）、**禁固定 50/50**（§35）、**NAV ≠ 钱包余额**（§5）
+- **写路径唯一**：`sendTransaction` 是唯一出口，且先过 guard + 写目标白名单（KI-21 已修）
+- **确认门**：建仓/换池需人工确认（D2），无通道时不可能执行
+- **provider 故障按 transport 类处理并可切换端点**（KI-19/KI-21 修复）
+- **错误文本脱敏**（凭据不入日志）
+
+---
+
+## 10. 待你确认后
+
+1. 你批注 §7 的 6 个问题（或直接说"按建议来"）
+2. 我据此更新本文件为 `confirmed`
+3. 然后按 §8 的清单动手，按模块 1 → 2 → 3 的顺序（模块 4 视问题 1 的结论）
+
+**先不动代码。**
