@@ -1006,10 +1006,11 @@ export function createNotifierFromConfig(
   env: NodeJS.ProcessEnv = process.env,
   deps: {
     readonly queryHandlers?: QueryHandlers;
-  /** Operator actions (§6.2). Absent ⇒ action commands are refused rather than silently ignored. */
-  readonly actionHandlers?: ActionHandlers;
-  /** TTL for an action's approval prompt; falls back to the query/approval default. */
-  readonly actionApprovalTtlMs?: number;
+    /**
+     * Operator actions (§6.2). Absent ⇒ `/exit` `/start` `/resume` are refused rather than silently
+     * ignored — an ignored command would look like the bot is stuck.
+     */
+    readonly actionHandlers?: ActionHandlers;
     readonly audit?: DecisionLogSink;
     readonly logger?: LoggerLike;
     readonly fetchImpl?: FetchLike;
@@ -1051,6 +1052,7 @@ export function createNotifierFromConfig(
     chatId: transport.chatId,
     allowedUserIds: transport.allowedUserIds,
     ...(deps.queryHandlers === undefined ? {} : { queryHandlers: deps.queryHandlers }),
+    ...(deps.actionHandlers === undefined ? {} : { actionHandlers: deps.actionHandlers }),
     ...(deps.audit === undefined ? {} : { audit: deps.audit }),
     ...(deps.fetchImpl === undefined ? {} : { fetchImpl: deps.fetchImpl }),
     ...(transport.apiBaseUrl === undefined ? {} : { apiBaseUrl: transport.apiBaseUrl }),
