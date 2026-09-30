@@ -158,7 +158,7 @@ async function main(): Promise<void> {
     if (/ENOENT|no such file/i.test(message)) {
       fail(
         `no keystore at ${absolutePath}. If you are restoring, put the backup at this path first ` +
-          '(see docs/OPS.md 「私钥备份与恢复」). If you are creating one, run `npm run keystore:init`.',
+          '(see docs/OPS.md §5.5). If you are creating one, run `npm run keystore:init`.',
       );
     }
     fail(`could not read the keystore: ${message}`);
