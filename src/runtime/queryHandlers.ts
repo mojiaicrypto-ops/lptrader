@@ -128,7 +128,7 @@ export function createQueryHandlers(deps: QueryHandlerDeps): QueryHandlers {
       ];
 
       if (admitted.length > 0) {
-        lines.push('', 'ADMITTED (passed the HTTP-measurable §16 gates):');
+        lines.push('', `ADMITTED (${admitted.length} passed the HTTP-measurable §16 gates):`);
         for (const pool of admitted.slice(0, POOL_LIST_LIMIT)) {
           lines.push(`  ${describePool(pool)}`);
         }
