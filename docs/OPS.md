@@ -246,6 +246,28 @@ npm run dry-run:build -- 7000
 npm run dev
 ```
 
+**启动输出会明确三件事**，请确认它们符合预期：
+
+```text
+  telegram        : DISABLED — no build or switch can be approved
+  keystore        : not configured (read-only monitor)
+  dry-run         : yes (no transaction will be sent)
+
+mode: READ-ONLY (no signer — no write path exists)
+cadences: pool-scan=60m portfolio-monitor=5m pool-health=15m
+Starting. Ctrl-C to stop.
+```
+
+- `mode` 是**只读**还是 **LIVE**（后者需要 keystore 且口令正确）
+- `cadences` 三个节拍是否都在
+- 若上一轮留下未决交易，会额外打出 `WARNING: N transaction(s) ... will NOT be re-sent`
+
+**首次启动后的 3–4 分钟内没有更多输出是正常的** —— 第一轮池扫描受数据源限流约束，约 3 分钟完成。
+
+**停止**：`Ctrl-C`（或 `SIGTERM`）会等当前节拍结束再退出，不会中断在半途。
+
+**口令**：配置了 keystore 时会**交互式要求输入**（不回显）。**口令错误 = 硬失败退出**，不会静默退化成只读 —— 否则你会以为机器人能交易而实际不能。
+
 ### 5.2 长驻运行（`systemd` 示例）
 
 ```ini
@@ -312,6 +334,11 @@ sqlite3 data/lptrader.db "select count(*), min(sampled_at), max(sampled_at) from
 ```
 
 `count` 应为正数且随时间增长，`max(sampled_at)` 应在最近一个扫描周期内。
+
+> **前置条件**：`data/lptrader.db` 只有在**进程真正跑过一轮扫描之后**才会出现。
+> `npm run dev` 启动时会**立即执行第一轮**（含池扫描），但**第一轮需要约 3 分钟**（池扫描受数据源
+> 6 秒限流约束）。所以在看到 `data/` 之前请先等 3–4 分钟 —— **不是卡住了**。
+> 只配置校验不建库：`npm run dev` 会启动完整运行时，而早期版本只打印摘要后退出。
 
 **保留期**：程序自动删除 **30 天**前的样本（每次扫描时顺带清理）。30 天覆盖了所有风控与周报需要的窗口（`§59` 的 24h、`§90` 的 7d/30d）。按观测规模，保留约 1.7 MiB，不清理则约 20 MiB/年。
 
@@ -837,6 +864,9 @@ candidate 56:pancakeswap-v3:0xe531fcb1...
 | `ExperimentalWarning: SQLite` | Node 内嵌 SQLite 的实验性提示 | **可忽略**（功能正常） |
 | 扫描很慢（3 分钟） | 数据源限流（6 秒/次） | **正常**，不要调低限流 |
 | 进程反复重启 | 配置错 / RPC 全挂 | `journalctl -u lptrader -n 200`；**不要**用 `Restart=always` 掩盖 |
+| 启动后 3–4 分钟没有任何新输出 | **正常** —— 第一轮池扫描受 6 秒/次限流，约 3 分钟 | 等待。之后每个节拍按各自间隔继续 |
+| 启动即要求输入口令 | keystore 已配置 | 输入创建时的口令。**错误即退出**（不降级为只读） |
+| `data/` 目录长时间不出现 | 首轮扫描未完成或失败 | 等满 4 分钟；仍无则看是否有扫描失败告警。**无 `data/` = 时序表不存在 = §59 不会生效** |
 | 启动时收到"有未完成交易"告警 | 上次崩溃时有交易在途 | **按提示去链上核查**，程序不会自动重发；确认状态后再决定 |
 | 首次启动看到 `NO_NEW_CAPITAL` / `info`，理由写着"尚未注资 / this is idle, not a loss" | **正常** —— 钱包还没有资金 | 无需处理。注资后该判定自动切换为真实的回撤评估 |
 | 日志里出现 `pool-health` 节拍 | 正常 —— 每 15 分钟的持仓池健康检查 | 无需处理（此节拍在早期版本中曾被配置但未生效，现已注册） |
