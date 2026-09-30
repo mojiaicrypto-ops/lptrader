@@ -15,15 +15,24 @@
 
 ## 功能接线状态
 
-**组件存在 ≠ 功能可用。** 以下断点已在 `docs/product/feature-list.md` 登记，实现状态见该文件：
+**组件存在 ≠ 功能可用。** 2026-09-30 之前本仓库有五处「写了但没接」，全部已修复：
 
-| 组件 | 文件 | 生产调用点 |
-|---|---|---|
-| `PositionExecutor.buildPosition` | `src/execution/positionExecutor.ts` | **无** |
-| `PoolScreener.screen` | `src/data/poolScreener.ts` | **无** |
-| `QueryHandlers` | `src/notify/telegram.ts`（接口） | **零注入** |
-| `approveRebuild` | `src/execution/actionHandlers.ts`（接口） | **无** |
-| `SELECT_POOL` 状态 | `src/types/state.ts` | **无消费者** |
+| 组件 | 文件 | 生产调用点 | 状态 |
+|---|---|---|---|
+| `PositionExecutor.buildPosition` | `src/execution/positionExecutor.ts` | `src/runtime.ts:466`（经 `BuildOrchestrator`） | ✅ |
+| `PoolScreener.screen` | `src/data/poolScreener.ts` | `src/strategy/buildOrchestrator.ts:142` | ✅ |
+| `QueryHandlers` | `src/notify/telegram.ts`（接口） | `src/runtime.ts:246` | ✅ |
+| `approveRebuild` | `src/execution/actionHandlers.ts`（接口） | `src/runtime.ts:305`（`decideRebuild`） | ✅ |
+| `/start` · `/exit` 的建仓动作 | `src/execution/actionHandlers.ts` | 调用 `deps.buildPosition` | ✅ |
+
+**新增的接线层**：
+
+| 文件 | 作用 |
+|---|---|
+| `src/strategy/buildOrchestrator.ts` | §45 建仓编排：精筛 → 计划 → 报价 → §40/§41/§3 门禁 → 交给执行器 |
+| `src/strategy/rebuildPolicy.ts` | §6.4 自动重建的成本上限（只约束自动重建，人工 `/exit` 永不拒绝） |
+| `src/runtime/queryCache.ts` | 查询命令的数据来源：最近一次观测，不做现场读取 |
+| `src/runtime/queryHandlers.ts` | `/status` `/position` `/pools` `/nav` `/risk` |
 
 ## 已实现（实际文件 → 导出 → 基线章节）
 
