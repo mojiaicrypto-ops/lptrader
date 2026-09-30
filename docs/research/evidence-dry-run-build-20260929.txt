@@ -16,3 +16,107 @@ lptrader — dry-run build (nothing is signed or sent)
 
 pool discovery + §16 hard filter (live data)
 --------------------------------------------
+  scan complete                    true
+  pools discovered                 11
+  passed §16                       3
+  rejected                         8
+  decisive                         false (false ⇒ some rejection came from missing data)
+    PASS                           56:pancakeswap-v3:0xe531fcb1f5a195de7608b9f4f9518544c2cdb693 tvl $575822 impact 0.1961%
+    PASS                           56:pancakeswap-v3:0xe9b9998b2ec5430d2246c7f1f8d9f298c97d7365 tvl $587686 impact 0.1872%
+    PASS                           56:uniswap-v3:0xfc4e77248b76fefc27c4cac7151a2ee5b5cc590e tvl $2065219 impact 0.0447%
+
+candidate 56:pancakeswap-v3:0xe531fcb1f5a195de7608b9f4f9518544c2cdb693
+----------------------------------------------------------------------
+  dex / feeTier                    pancakeswap-v3 / 100
+  tvl / vol24h                     $575822 / $6755607
+  tick / tickSpacing               66055 / 1
+  activeLiquidity                  1530638871334299299155578
+  price (§15)                      737.63877860
+  supportsAtomicBuild (§42)        true
+
+  position plan (§33-§38)
+-------------------------
+  §3 allocation                    OK — LP 4900.00 of NAV 7000.00 (cap 70%), reserve 2100.00
+  lowerPrice / upperPrice          628.0675 / 857.1275
+  lowerTick / upperTick            64429 / 67539
+  ticks aligned (§34)              true
+  liquidity (L)                    1206119504321355176726
+  amount0 / amount1 (raw)          3173040652595526888 / 2559831340110934189161
+  value token0 USD                 2342.47
+  value token1 USD                 2557.53
+  value sum USD                    4900.00
+  rangeProgress (§49)              0.483871
+  optimal vs fixed 50/50           4.389% (2342.47 vs 2450.00)
+  swap needed (§38)                2344569253665468079495 raw
+
+  quote + §40/§41 gates
+------------------------
+  amountOutRaw                     3172543929083923043
+  amountInUsd                      2344.57
+  priceImpact (adapter)            0.015636%
+  slippageTolerance                0.3000%
+  amountOutMinimumRaw              3163026297296671273
+  ttl (s)                          30
+  route                            USDT/QQQB 0.01%
+  priceImpact (independent)        0.015657%
+  impact agreement                 agree (delta 2.09e-7, tolerance 1.56e-6 = 1% of impact)
+  §40 limits in force              slippage 0.80% / impact 0.80%
+  §40 gate ok                      true
+  signable amountIn                2344569253665468079495
+  signable amountOutMinimum        3163026297296671273
+  shortfall/surplus (QQQB)         -0.0100% (-496723511603845 raw)
+  funding verdict                  within 1% of the plan — expected (mid-price solve vs fee-paying swap)
+  RESULT                           PASS — a live build would proceed to the approval gate
+  atomicity (§42)                  single transaction (swap + mint combined)
+
+candidate 56:uniswap-v3:0xfc4e77248b76fefc27c4cac7151a2ee5b5cc590e
+------------------------------------------------------------------
+  dex / feeTier                    uniswap-v3 / 3000
+  tvl / vol24h                     $2065219 / $1122325
+  tick / tickSpacing               66057 / 60
+  activeLiquidity                  2440064713492618848061145
+  price (§15)                      741.69390060
+  supportsAtomicBuild (§42)        false
+
+  position plan (§33-§38)
+-------------------------
+  §3 allocation                    OK — LP 4900.00 of NAV 7000.00 (cap 70%), reserve 2100.00
+  lowerPrice / upperPrice          628.2338 / 857.3544
+  lowerTick / upperTick            64440 / 67560
+  ticks aligned (§34)              true
+  liquidity (L)                    1202529078487272558219
+  amount0 / amount1 (raw)          3200844867339166477 / 2539958911225198709868
+  value token0 USD                 2362.99
+  value token1 USD                 2537.01
+  value sum USD                    4900.00
+  rangeProgress (§49)              0.483871
+  optimal vs fixed 50/50           3.551% (2362.99 vs 2450.00)
+  swap needed (§38)                2365739953820739934324 raw
+
+  quote + §40/§41 gates
+------------------------
+  amountOutRaw                     3191128868860615397
+  amountInUsd                      2365.74
+  priceImpact (adapter)            0.304469%
+  slippageTolerance                0.3000%
+  amountOutMinimumRaw              3181555482254033550
+  ttl (s)                          30
+  route                            USDC/QQQB 0.3%
+  priceImpact (independent)        0.304469%
+  impact agreement                 agree (delta 0.00e+0, tolerance 3.04e-5 = 1% of impact)
+  §40 limits in force              slippage 0.30% / impact 0.50%
+  §40 gate ok                      true
+  signable amountIn                2365739953820739934324
+  signable amountOutMinimum        3181555482254033550
+  shortfall/surplus (QQQB)         -0.3000% (-9715998478551080 raw)
+  funding verdict                  within 1% of the plan — expected (mid-price solve vs fee-paying swap)
+  RESULT                           PASS — a live build would proceed to the approval gate
+  atomicity (§42)                  two transactions (swap then mint) — a partial is possible, see §43
+
+RESULT
+------------------------
+Nothing was signed, sent, or approved. A live build additionally requires:
+  1. an approved BUILD_POSITION request (D2), which needs Telegram reachable and a human answer;
+  2. a signer (keystore passphrase at startup);
+  3. the current bot state to permit a capital-committing write (§44/§66).
+exit=0
