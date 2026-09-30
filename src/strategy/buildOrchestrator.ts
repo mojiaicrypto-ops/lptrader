@@ -307,7 +307,18 @@ export class BuildOrchestrator {
           amount1MinRaw: this.minimumFor(token1.address, buildQuote, intent),
           guard: this.deps.guard(),
           limits,
-          deadline: { kind: 'previous-blockhash', blockhash: '0x' },
+          /**
+           * A timestamp deadline, not `previous-blockhash`.
+           *
+           * The v3 `SwapRouter`/`NonfungiblePositionManager` expose only `multicall(bytes[])`, so the
+           * blockhash deadline the atomic SmartRouter accepts cannot be encoded for the two-transaction
+           * path — the adapter refuses it rather than substituting a clock-dependent value. A timestamp is
+           * therefore the only form that works on BOTH paths, which is why it is used here.
+           *
+           * The window is the quote's own TTL: if the quote has expired by the time the transaction lands,
+           * §41 already says it must not be executed, so a longer deadline would only authorise a stale trade.
+           */
+          deadline: { kind: 'timestamp', unixSeconds: Math.floor(Date.parse(now) / 1000) + config.swap.quoteTtlSeconds },
           idempotencyKey: `build:${pool.poolId}:${now}`,
           now,
         },

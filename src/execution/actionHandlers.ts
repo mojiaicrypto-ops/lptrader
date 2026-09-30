@@ -112,7 +112,13 @@ export class ActionHandlers {
       amount0MinRaw: 0n,
       amount1MinRaw: 0n,
       recipient: position.owner,
-      deadline: { kind: 'previous-blockhash', blockhash: '0x' },
+      /**
+       * A timestamp deadline. `previous-blockhash` is refused by the PancakeSwap v3 adapter because the
+       * `NonfungiblePositionManager` exposes only `multicall(bytes[])` and cannot take a blockhash — so
+       * passing it here meant **every `/exit` failed**. The adapter was right to refuse; this caller was
+       * wrong to ask.
+       */
+      deadline: { kind: 'timestamp', unixSeconds: Math.floor(Date.now() / 1000) + 600 },
       guard: emptyGuard(),
       idempotencyKey: `manual-exit:${position.poolId}:${position.positionTokenId.toString()}`,
     });
