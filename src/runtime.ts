@@ -42,7 +42,7 @@ import type { TokenReader } from './chain/tokenReader.ts';
 import { TokenReader as TokenReaderImpl } from './chain/tokenReader.ts';
 import type { DexAdapter, PoolDataProvider, ReferencePriceProvider } from './types/adapters.ts';
 import type { StrategyConfig } from './types/config.ts';
-import { DEX_IDS, type DexId, type IsoTimestamp, type UsdAmount } from './types/primitives.ts';
+import { DEX_IDS, type Address, type DexId, type IsoTimestamp, type UsdAmount } from './types/primitives.ts';
 import type { PoolSnapshot } from './types/market.ts';
 import { ALERT_SEVERITIES, type Notifier } from './types/notifier.ts';
 import type { DecryptedPrivateKey } from './security/keystore.ts';
@@ -55,6 +55,7 @@ import {
   stateStoreDecisionLogSink,
   type ApprovalGate,
 } from './execution/approvalGate.ts';
+import { ActionHandlers } from './execution/actionHandlers.ts';
 import { PositionExecutor } from './execution/positionExecutor.ts';
 import { PortfolioMonitor } from './execution/portfolioMonitor.ts';
 import { PoolScanner, foundPools } from './data/poolScanner.ts';
@@ -179,7 +180,18 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
   const referencePrice =
     options.referencePrice ?? createReferencePriceProvider({ chainId, registry: config.whitelist.registry });
 
-  const notifier = createNotifierFromConfig(config, env);
+  // The action handlers need the executor, which needs the approval gate, which needs the notifier, which
+  // needs the action handlers. That cycle is inherent to the design (each layer owns one concern), so it is
+  // broken with a late-bound reference rather than by weakening any of the four.
+  let actionHandlersRef: ActionHandlers | null = null;
+
+  const notifier = createNotifierFromConfig(config, env, {
+    actionHandlers: {
+      exit: async () => (await requireActionHandlers(actionHandlersRef)).exit().then((r) => r.message),
+      start: async () => (await requireActionHandlers(actionHandlersRef)).start().then((r) => r.message),
+      resume: async () => (await requireActionHandlers(actionHandlersRef)).resume().then((r) => r.message),
+    },
+  });
   const approvals = createSqliteApprovalGate(db, {
     notifier,
     timeoutMinutes: config.approvals.timeoutMinutes,
@@ -218,6 +230,29 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
         approvalGate: approvals,
         currentState: () => stateMachineRef.current,
       });
+
+  // §6.2: built after the executor so the late-bound reference above can be resolved. In read-only mode
+  // there is no executor, so the action handlers are absent and every action command is refused — which is
+  // the correct outcome for a monitor-only process.
+  if (executor !== null) {
+    actionHandlersRef = new ActionHandlers({
+      executor,
+      stateMachine,
+      positionReader,
+      dex,
+      openPosition: async () => {
+        const record = stateStore.openPosition(chainId);
+        if (record === null) return null;
+        return {
+          poolId: record.poolId,
+          positionTokenId: BigInt(record.id),
+          liquidity: record.liquidity,
+          owner: walletAddressOf(env),
+          dex: record.dex,
+        };
+      },
+    });
+  }
 
   if (unresolved.length > 0) {
     notifier
@@ -327,6 +362,34 @@ export function buildCadences(runtime: StrategyRuntime): readonly SchedulerCaden
       },
     },
   ];
+}
+
+/**
+ * Resolve the late-bound action handlers, or explain why an action cannot run.
+ *
+ * A read-only runtime (no signer) has no executor and therefore no action handlers. Refusing with a
+ * reason is what the operator needs: `/exit` on a monitor-only process should say so, not appear stuck.
+ */
+function requireActionHandlers(handlers: ActionHandlers | null): ActionHandlers {
+  if (handlers === null) {
+    throw new Error(
+      'no signer is attached, so operator actions cannot run: this process is a read-only monitor. ' +
+        'Configure KEYSTORE_PATH and start with a wallet to enable /exit /start /resume.',
+    );
+  }
+  return handlers;
+}
+
+/** §92: the wallet address an action should treat as the owner. Required for a funded run. */
+function walletAddressOf(env: NodeJS.ProcessEnv): Address {
+  const configured = env['STRATEGY_WALLET_ADDRESS'];
+  if (configured === undefined || configured === '') {
+    throw new Error(
+      'STRATEGY_WALLET_ADDRESS is not set: an operator action needs to know the owning wallet, and ' +
+        'guessing it would be worse than refusing',
+    );
+  }
+  return configured as Address;
 }
 
 /** The chain's token registry, reached through the whitelist (§8 identity source). */
