@@ -459,43 +459,234 @@ npm run telegram:check
 
 ---
 
-## 7. 从零到实盘：完整顺序
+## 7. 从零到实盘：可执行顺序
 
-```bash
-# ── 阶段 A：只读（不需要私钥、不花钱）──────────────────
-npm run dev                                       # 配置自检
-npm run smoke:read                                # 链上只读验证
-npm run smoke:quote                               # 报价验证
+**每一阶段都可以停。** 阶段 0–3 **不花钱、不需要私钥**。阶段 4 才开始碰真钱。
 
-# ── 阶段 B：配好参数与地址 ─────────────────────────────
-# 1. 改 config/strategy.yaml：initial_strategy_capital_usd ← 你的真实总额
-# 2. cp .env.example .env && chmod 600 .env
-# 3. 填 STRATEGY_WALLET_ADDRESS；DRY_RUN 保持 1
-npm run dev                                       # 再确认一次
-npm run smoke:scan                                # 看清当前哪些池合格（约 3 分钟）
-
-# ── 阶段 C：看"如果真建仓会长什么样"─────────────────────
-npm run dry-run:build -- <你的LP金额>              # 必须读懂输出，见 §8
-
-# ── 阶段 D：接审批通道 ─────────────────────────────────
-# BotFather 建 bot → 填 .env 三个变量 → strategy.yaml 里 telegram.enabled: true
-npm run telegram:check                            # 确认通道可用
-
-# ── 阶段 E：生成签名钱包（开始碰真钱）──────────────────
-npm run keystore:init                             # 交互输入口令；生成 secrets/wallet.enc
-# ⚠ 用独立钱包，只放允许亏掉的资金；钱包里备少量 BNB 作 gas
-# ⚠ 备份 wallet.enc 与口令（分开保存）
-# ⚠ 此时 DRY_RUN 仍建议为 1，再跑一次 dry-run:build 确认
-
-# ── 阶段 F：小额实盘 ───────────────────────────────────
-# 1. initial_strategy_capital_usd 设成第一笔真实金额
-# 2. .env 里 DRY_RUN=0
-# 3. 启动 → 扫描 → 建仓前 Telegram 弹出确认 → 你核对数字 → Approve
-```
-
-**阶段 F 之前的每一步都不花钱。请务必走完 C。**
+复制命令时请**整段复制**，不要只挑中间几行 —— 顺序本身是约束。
 
 ---
+
+### 阶段 0 · 检查 Node（只需一次）
+
+```bash
+node -p "process.config.variables.node_use_amaro"
+```
+
+**必须输出 `true`。** `false` 或报 `ERR_NO_TYPESCRIPT` = 你这个 Node 构建没编进 TS 支持
+（发行版自带的 `nodejs` 包常见），**任何参数都绕不过**，先修环境：
+
+```bash
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+exec $SHELL -l
+nvm install 24 && nvm use 24
+node -p "process.config.variables.node_use_amaro"    # ← 重新确认 true
+which node                                           # ← 必须指向 ~/.nvm/...，不是 /usr/bin/node
+```
+
+---
+
+### 阶段 1 · 安装与自检（只需一次）
+
+```bash
+cd <仓库目录>
+npm ci
+npm run typecheck        # 期望：无输出（0 错误）
+npm test                 # 期望：25 文件 / 725 测试全部通过
+```
+
+**不通过就不要继续。**
+
+---
+
+### 阶段 2 · 建配置文件（不需要私钥）
+
+```bash
+cp .env.example .env
+chmod 600 .env
+npm run dev
+```
+
+**期望输出**（关键三行）：
+
+```text
+  telegram        : DISABLED — no build or switch can be approved
+  keystore        : not configured
+  dry-run         : yes (no transaction will be sent)
+```
+
+> **`keystore: not configured` 是正常的。** 现在按设计是"只读模式"：能监控、能扫描、能告警，
+> 但无法建仓 —— 因为还没有签名钱包。
+
+**此时去改 `config/strategy.yaml`：**
+
+```yaml
+strategy:
+  capital:
+    initial_strategy_capital_usd: <你的真实总额>   # ★ 必改，见 §4
+```
+
+改完再跑一次 `npm run dev` 确认没报错。
+
+---
+
+### 阶段 3 · 只读验证（免费，建议全跑）
+
+```bash
+npm run smoke:read                          # 链上只读：池状态 / 余额 / bStock 换算
+npm run smoke:quote                         # 真实报价 + §40 闸门
+npm run smoke:scan                          # 扫全市场 + §16 过滤（约 3 分钟）
+npm run dry-run:build -- <你的LP金额>         # ★ 建仓预演：真建仓会长什么样
+```
+
+`dry-run:build` 的输出必须按 **§8 的判读表**逐项核对。
+
+**到这里为止不需要私钥、不花一分钱、不连你的钱包。** 建议真的走完再决定要不要继续。
+
+---
+
+### 阶段 4 · 初始化签名钱包（**从这里开始碰真钱**）
+
+```bash
+npm run keystore:init
+```
+
+交互流程（输入**不会回显**）：
+
+```text
+Private key (0x + 64 hex, hidden):        ← 粘贴你的私钥（0x + 64 位十六进制）
+Passphrase (hidden):                      ← 设置口令，至少 12 字符
+Repeat passphrase  :                      ← 再输一遍
+```
+
+成功后打印：
+
+```text
+Keystore created and verified.
+  file    : /path/to/secrets/wallet.enc (mode 0600)
+  address : 0x70997970C51812dc3A010C7d01b50e0d17dc79C8     ← ★ 记下这个地址
+```
+
+**先做的三件事（顺序别换）：**
+
+1. **`chmod 600 secrets/wallet.enc`** —— 脚本已设，但确认一下
+2. **记下打印的 `address`** —— 后面验证备份要用它比对
+3. **解除 `.env` 里的注释**，让程序能找到 keystore：
+
+```bash
+# 编辑 .env，把这行的 # 去掉
+KEYSTORE_PATH=secrets/wallet.enc
+```
+
+然后验证：
+
+```bash
+npm run dev
+```
+
+**期望**（注意两处变化）：
+
+```text
+  keystore        : secrets/wallet.enc
+  dry-run         : yes (no transaction will be sent)
+```
+
+> **现在仍未开启交易** —— `DRY_RUN=1`。程序能读到密钥，但仍拒绝广播。
+>
+> **这就是你刚遇到的报错的反面**：如果 `.env` 里设了 `KEYSTORE_PATH` 而文件不存在，启动会
+> `STARTUP ABORTED (fail closed): cannot read keystore file ...`。那不是故障，是 fail-closed 设计 ——
+> 两种修法：**创建它**（本节），或**注释掉 `KEYSTORE_PATH`** 退回只读模式。
+
+**钱包本身的要求**（§92）：
+
+- **独立钱包**，只放策略允许亏掉的钱；别用主钱包
+- 钱包里要有 **USDT 或 USDC**（建仓用）+ **少量 BNB**（gas，几美分足够）
+
+**备份（做完立刻做，别拖）：**
+
+```bash
+npm run keystore:verify -- --export     # 打印私钥 → 抄到纸上两份 / 存密码管理器 → 清屏
+npm run keystore:verify                 # 只打印地址 → 与上面记下的 address 比对
+```
+
+**地址一致才算备份有效。** 完整做法与销毁-恢复演练见 **§5.5**。
+
+---
+
+### 阶段 5 · 接审批通道（**实盘的前提**）
+
+```bash
+# 1) @BotFather → /newbot → 拿 token
+# 2) @userinfobot → 拿你的 user id
+# 3) 先给新建的 bot 发一条消息（否则 bot 无权主动找你）
+# 4) 取 chat id：
+curl -s "https://api.telegram.org/bot<token>/getUpdates" | python3 -m json.tool | head -40
+```
+
+`.env` 里填：
+
+```bash
+TELEGRAM_BOT_TOKEN=<token>
+TELEGRAM_CHAT_ID=<chat.id>
+TELEGRAM_ALLOWED_USER_IDS=<from.id>      # 只有这里的人能批准
+TELEGRAM_ENABLED=true
+```
+
+`config/strategy.yaml` 里：
+
+```yaml
+  telegram:
+    enabled: true
+```
+
+**两处都要改。** 然后：
+
+```bash
+npm run telegram:check
+```
+
+**期望**：`token: set`、`notifier: TelegramNotifier`、结论说通道可达。
+若仍显示 `noopNotifier` → 说明变量名/开关写错了；**配好之前建仓不可能执行**。
+
+---
+
+### 阶段 6 · 小额实盘
+
+```bash
+# 1) config/strategy.yaml: initial_strategy_capital_usd ← 第一笔真实金额
+# 2) .env: DRY_RUN=0
+npm run dev
+```
+
+**流程**：启动 → 扫描 → 找到合格池 → **Telegram 弹出带 Approve/Reject 的确认请求**
+（含金额、区间、ticks、滑点、价格影响）→ **你核对后点 Approve** → 才真正发交易。
+
+判读标准见 §6.1 与 §8。**拿不准就 Reject 或让它超时** —— 超时只是"这轮不建仓"。
+
+---
+
+### 一张表：每阶段要什么、花不花钱
+
+| 阶段 | 需要私钥 | 花钱 | 需要 TG | 能做 | 卡住的典型原因 |
+|---|---|---|---|---|---|
+| 0 Node 检查 | — | — | — | 确认环境 | `node_use_amaro=false` |
+| 1 安装自检 | — | — | — | 验证仓库完整 | 依赖没装 |
+| 2 建配置 | — | — | — | 自检配置 | `initial_strategy_capital_usd` 没改 |
+| 3 只读验证 | — | — | — | 看市场、建仓预演 | RPC 不通 / 数据源限流 |
+| 4 初始化钱包 | ✅ | — | — | 生成 keystore、备份 | **`KEYSTORE_PATH` 设了但文件不在** |
+| 5 接 TG | ✅ | — | — | 开启确认门 | 忘了给 bot 发消息 / 两处开关没改 |
+| 6 小额实盘 | ✅ | ✅ | ✅ | 真正建仓 | 白名单为空 / 池不合格 / 超过比例 |
+
+### 常见卡点速查
+
+| 报错 / 现象 | 原因 | 修法 |
+|---|---|---|
+| `ERR_NO_TYPESCRIPT` | Node 构建无 TS 支持 | 阶段 0 |
+| `cannot read keystore file ... ENOENT` | 设了 `KEYSTORE_PATH` 但文件不存在 | `npm run keystore:init`，或注释掉该变量退回只读 |
+| `keystore: not configured` | 正常（未创建钱包） | 无 —— 阶段 4 才需要 |
+| `telegram: DISABLED` | 未配通道 | 阶段 5 |
+| 建仓一直不发生 | 大多是 TG 未配 | `npm run telegram:check` |
+| 启动即 `STARTUP ABORTED` | 配置非法 | 看紧随其后的错误信息 |
 
 ## 8. `dry-run:build` 输出判读
 
