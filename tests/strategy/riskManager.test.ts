@@ -69,6 +69,9 @@ const RISK: RiskConfig = {
   tvlDropReview: 0.5,
   tvlDropEmergency: 0.7,
   minReserveBeforeNewLp: 0.25,
+  // Six 5-minute beats = half an hour of a genuinely losing pool before it is reported.
+  negativeContributionRounds: 6,
+  negativeContributionThresholdUsd: 1,
 };
 
 function pegAssessment(overrides: Partial<PegAssessment> = {}): PegAssessment {

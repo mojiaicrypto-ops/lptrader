@@ -77,6 +77,13 @@ strategy:
     tvl_drop_emergency: 0.70
     # §60 reserve floor below which no new LP may be added.
     min_reserve_before_new_lp: 0.25
+    # The pool's own contribution (actual minus holding the entry mix) must be negative for this many
+    # consecutive beats before it is reported. At the 5-minute beat, 6 rounds = 30 minutes of a genuinely
+    # losing pool; a single reading would act on block-to-block noise.
+    negative_contribution_rounds: 6
+    # Ignore negatives smaller than this many USD: the valuation has rounding error, so a one-cent
+    # negative is not evidence of anything.
+    negative_contribution_threshold_usd: 1
 
   fees:
     # §61 V1 never auto-compounds. This is a literal `false` in the schema.

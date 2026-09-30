@@ -79,6 +79,7 @@ function samplePosition(overrides: Partial<Position> = {}): Position {
     openedAt: '2026-09-29T00:00:00.000Z',
     initialNAV: 10_000,
     entryPrice: 745.5,
+    entryEquityUsd: 10_000,
     lowerPrice: 633.675,
     upperPrice: 864.78,
     lowerTick: -887_220,
@@ -120,7 +121,14 @@ function sampleSwap(overrides: Partial<SwapRecord> = {}): SwapRecord {
 }
 
 /** Migrations this layer owns; other modules register their tables at version >= 100. */
-const STORE_MIGRATION_IDS = ['positions', 'swap_records', 'decision_logs', 'runtime_state', 'tx_records'];
+const STORE_MIGRATION_IDS = [
+  'positions',
+  'swap_records',
+  'decision_logs',
+  'runtime_state',
+  'tx_records',
+  'positions_entry_equity',
+];
 
 /** Rows in `schema_migrations`. Registry-independent: peer modules may add their own at >= 100. */
 function migrationCount(db: Database): number {

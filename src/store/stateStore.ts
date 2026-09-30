@@ -255,6 +255,30 @@ registerMigration({
   },
 });
 
+registerMigration({
+  version: 7,
+  id: 'positions_entry_equity',
+  up: (db) => {
+    /**
+     * The equity baseline for a position.
+     *
+     * The product's headline number is `(current equity - entry equity) / entry equity` — the return on
+     * the money the operator actually committed. It cannot be reconstructed later: NAV at entry is a
+     * fact about the moment of opening, and the wallet's composition changes with every subsequent
+     * trade, so a value derived afterwards would silently be a different quantity.
+     *
+     * `entry_price` (migration 1) already records the STOCK price at entry, which is what separates
+     * "the stock moved" from "the pool structure cost us" — the attribution the operator needs to judge
+     * whether a particular pool is worth holding.
+     *
+     * Nullable because existing rows predate the column: a position opened before this migration has no
+     * recorded baseline, and reporting one would be inventing a measurement. Consumers must treat `null`
+     * as "unknown", never as zero.
+     */
+    db.exec('ALTER TABLE positions ADD COLUMN entry_equity_usd REAL');
+  },
+});
+
 export interface PositionQuery {
   readonly status?: BotState;
   /** Only positions that have not been closed (`closed_at IS NULL`). */
@@ -307,12 +331,12 @@ export class StateStore {
         this.#db,
         `INSERT INTO positions (
            id, chain_id, dex, pool_address, pool_id, token0, token1, token0_id, token1_id,
-           opened_at, closed_at, initial_nav, entry_price, lower_price, upper_price,
+           opened_at, closed_at, initial_nav, entry_price, entry_equity_usd, lower_price, upper_price,
            lower_tick, upper_tick,
            ${amountColumnList('initial_token0')}, ${amountColumnList('initial_token1')},
            liquidity, status, total_fees_usd, realized_pnl, unrealized_pnl, benchmark_value,
            fee_il_ratio, min_holding_until, cooldown_until, emergency_reason
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
            ${amountPlaceholders('initial_token0')}, ${amountPlaceholders('initial_token1')},
            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
@@ -329,6 +353,7 @@ export class StateStore {
           closedAt,
           position.initialNAV,
           position.entryPrice,
+          position.entryEquityUsd,
           position.lowerPrice,
           position.upperPrice,
           position.lowerTick,
@@ -401,6 +426,8 @@ export class StateStore {
     if (patch.status !== undefined) put('status', toBotState(patch.status, 'updatePosition'));
     if (patch.initialNAV !== undefined) put('initial_nav', patch.initialNAV);
     if (patch.entryPrice !== undefined) put('entry_price', patch.entryPrice);
+    // `null` is a meaningful value here ("no baseline recorded"), so it must be writable, not skipped.
+    if (patch.entryEquityUsd !== undefined) put('entry_equity_usd', patch.entryEquityUsd);
     if (patch.lowerPrice !== undefined) put('lower_price', patch.lowerPrice);
     if (patch.upperPrice !== undefined) put('upper_price', patch.upperPrice);
     if (patch.lowerTick !== undefined) put('lower_tick', patch.lowerTick);
@@ -580,7 +607,9 @@ export class StateStore {
 export interface PositionPatch {
   readonly status?: BotState;
   readonly initialNAV?: UsdAmount;
+  /** `null` clears the baseline; `undefined` leaves it alone. */
   readonly entryPrice?: UsdAmount;
+  readonly entryEquityUsd?: UsdAmount | null;
   readonly lowerPrice?: UsdAmount;
   readonly upperPrice?: UsdAmount;
   readonly lowerTick?: Tick;
@@ -614,6 +643,8 @@ function mapPosition(row: SqlRow): Position {
     openedAt: requiredString(row, 'opened_at'),
     initialNAV: requiredNumber(row, 'initial_nav'),
     entryPrice: requiredNumber(row, 'entry_price'),
+    // Optional: rows that predate migration 7 have no baseline, which is not zero.
+    entryEquityUsd: optionalNumber(row, 'entry_equity_usd'),
     lowerPrice: requiredNumber(row, 'lower_price'),
     upperPrice: requiredNumber(row, 'upper_price'),
     lowerTick: requiredNumber(row, 'lower_tick'),

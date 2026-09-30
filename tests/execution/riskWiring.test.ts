@@ -29,6 +29,7 @@ function positionRecord(over: Partial<Position> = {}): Position {
     openedAt: '2026-09-29T00:00:00.000Z',
     initialNAV: 10_000,
     entryPrice: 735.2,
+    entryEquityUsd: 10_000,
     lowerPrice: 624.9,
     upperPrice: 852.8,
     lowerTick: 64_424,

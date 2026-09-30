@@ -56,6 +56,7 @@ import {
   type ApprovalGate,
 } from './execution/approvalGate.ts';
 import { PoolSnapshotStore } from './store/poolSnapshotStore.ts';
+
 import { verifyPostAllocation } from './strategy/allocation.ts';
 import { RiskWiring, describeRiskAction } from './execution/riskWiring.ts';
 import { RISK_ACTIONS } from './strategy/riskManager.ts';
@@ -66,7 +67,13 @@ import { PoolScanner, foundPools } from './data/poolScanner.ts';
 import { PoolScreener } from './data/poolScreener.ts';
 import { BuildOrchestrator } from './strategy/buildOrchestrator.ts';
 import { decideRebuild } from './strategy/rebuildPolicy.ts';
-import { QueryCache, poolViewFrom, type PositionView, type StatusView } from './runtime/queryCache.ts';
+import {
+  computeReturn,
+  isPoolContributionNegative,
+  stockPriceOf,
+  valueEntryComposition,
+} from './strategy/returns.ts';
+import { QueryCache, poolViewFrom, type PositionView, type ReturnView, type StatusView } from './runtime/queryCache.ts';
 import { createQueryHandlers } from './runtime/queryHandlers.ts';
 import { buildTxGuard } from './chain/txState.ts';
 import { filterPools } from './data/poolFilter.ts';
@@ -77,6 +84,8 @@ import { DEX_PREFERENCE, createDexAdapter, type DexAdapterFactoryOptions } from 
 import { createNotifierFromConfig } from './notify/telegram.ts';
 import { type SchedulerCadence } from './execution/scheduler.ts';
 import { readKeystoreFile } from './security/keystore.ts';
+import { BOT_STATES } from './types/state.ts';
+import type { PortfolioSnapshot } from './types/portfolio.ts';
 
 /** Everything the cadences share; built once so no cadence rebuilds a client or a store. */
 export interface StrategyRuntime {
@@ -98,6 +107,13 @@ export interface StrategyRuntime {
   readonly poolSnapshots: PoolSnapshotStore;
   /** Keep the latest scan's pools available to the risk beats (see `latestPoolByAddress`). */
   readonly rememberScannedPools: (pools: readonly PoolSnapshot[]) => void;
+  /**
+   * The most recent scan's pools, keyed by lowercased address.
+   *
+   * Exposed so the portfolio beat can value a position's entry composition at today's prices without
+   * re-reading the chain or the scan: the snapshot it needs is already in memory from the last beat.
+   */
+  readonly latestPools: ReadonlyMap<string, PoolSnapshot>;
   /** Module 3 wiring: the risk verdict and the action it implies. */
   readonly riskWiring: RiskWiring;
   /**
@@ -415,6 +431,16 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
     // §58 conditions come from outside the pool data (a paused contract, a suspended issuer). Nothing
     // observes them yet, so the domain is reported as a missing input rather than as "no emergency".
     emergencyEvents: () => [],
+    // The pool's own contribution, from the SAME computation `/nav` shows. Two implementations would be
+    // two answers to "is this pool worth staying in", and the operator would be shown the wrong one.
+    poolContribution: () => {
+      const snap = queryCache.nav?.value;
+      if (snap === undefined) return { contributionUsd: null, rounds: 0 };
+      return {
+        contributionUsd: snap.returns?.poolContributionUsd ?? null,
+        rounds: snap.returns?.negativeContributionRounds ?? 0,
+      };
+    },
   });
 
   /**
@@ -464,6 +490,64 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
 
     queryCache.setScreen(decision.request.outcome, new Date().toISOString());
     const outcome = await executor.buildPosition(decision.request.input);
+
+    if (outcome.ok && outcome.positionTokenId !== undefined) {
+      // Record the position AND its entry baseline.
+      //
+      // Nothing wrote a position row before this: `insertPosition` had zero production callers, so a
+      // successful build left the bot believing it was flat — `/position` would report "no position" for
+      // a live one, and the risk beats would judge the wallet with no idea what it held.
+      //
+      // The baseline is captured HERE, at the only moment it exists. `entryEquityUsd` cannot be
+      // reconstructed afterwards: the wallet's composition changes with every trade, so a value derived
+      // later would be a different quantity wearing the same name.
+      const equityNow = queryCache.nav?.value.totalNavUsd ?? navUsd;
+      stateStore.insertPosition({
+        id: outcome.positionTokenId.toString(),
+        chainId,
+        dex: decision.request.pool.dex,
+        poolAddress: decision.request.pool.poolAddress,
+        poolId: decision.request.pool.poolId,
+        token0: decision.request.pool.token0,
+        token1: decision.request.pool.token1,
+        token0Id: decision.request.pool.token0Id,
+        token1Id: decision.request.pool.token1Id,
+        openedAt: decision.request.input.now,
+        initialNAV: navUsd,
+        entryEquityUsd: equityNow,
+        // The stock price at entry — the divisor that later separates "the stock moved" from "the pool
+        // structure cost us". Without it, a fall in equity cannot be attributed and so cannot be acted on.
+        entryPrice: decision.request.pool.stockReferencePrice.value,
+        lowerPrice: decision.request.plan.lowerPrice,
+        upperPrice: decision.request.plan.upperPrice,
+        lowerTick: decision.request.plan.lowerTick,
+        upperTick: decision.request.plan.upperTick,
+        initialToken0: {
+          tokenId: decision.request.pool.token0Id,
+          address: decision.request.pool.token0,
+          decimals: decision.request.pool.token0Decimals,
+          raw: decision.request.plan.amount0,
+          ui: decision.request.plan.amount0,
+          uiMultiplier: 10n ** 18n,
+        },
+        initialToken1: {
+          tokenId: decision.request.pool.token1Id,
+          address: decision.request.pool.token1,
+          decimals: decision.request.pool.token1Decimals,
+          raw: decision.request.plan.amount1,
+          ui: decision.request.plan.amount1,
+          uiMultiplier: 10n ** 18n,
+        },
+        liquidity: decision.request.plan.liquidity,
+        status: BOT_STATES.MONITOR,
+        totalFeesUSD: 0,
+        realizedPnL: 0,
+        unrealizedPnL: 0,
+        benchmarkValue: 0,
+        feeILRatio: null,
+      });
+    }
+
     return {
       ok: outcome.ok,
       message: outcome.ok
@@ -507,6 +591,7 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
       latestPoolByAddress.clear();
       for (const pool of pools) latestPoolByAddress.set(pool.poolAddress.toLowerCase(), pool);
     },
+    latestPools: latestPoolByAddress,
     riskWiring,
     lastPeakNAV: null,
     actionHandlers: actionHandlersRef,
@@ -567,6 +652,81 @@ function positionViewFrom(
     openedAt: record.openedAt,
   };
 }
+
+/**
+ * Compute the position's return and attribution for this round.
+ *
+ * Returns `null` when there is no position. Otherwise ALWAYS returns a view, even when the attribution is
+ * incomplete — with `incompleteReasons` populated. Silence would be worse than a partial answer: the
+ * operator needs to know that a figure is missing, not be shown a blank that reads as zero.
+ *
+ * The negative-contribution streak is carried in memory rather than derived, because "has this been
+ * negative for N rounds" is a fact about the sequence, not about the current reading.
+ */
+function computePositionReturn(
+  runtime: StrategyRuntime,
+  pools: ReadonlyMap<string, PoolSnapshot>,
+  snap: PortfolioSnapshot,
+  at: IsoTimestamp,
+): ReturnView | null {
+  const { stateStore } = runtime;
+  const chainId = runtime.chain.chainId;
+  const latestPoolByAddress = pools;
+  const record = stateStore.openPosition(chainId);
+  if (record === null) return null;
+
+  const pool = latestPoolByAddress.get(record.poolAddress.toLowerCase());
+  const currentStockPriceUsd = stockPriceOf(pool);
+  const price0Usd = pool === undefined ? null : pool.currentPrice.value;
+  // The stablecoin leg is the unit of account (§14 admits only stock × stablecoin pools), so its price is 1.
+  const holdEquityUsd =
+    pool === undefined
+      ? null
+      : valueEntryComposition({
+          initialToken0: record.initialToken0,
+          initialToken1: record.initialToken1,
+          price0Usd,
+          price1Usd: 1,
+        });
+
+  const report = computeReturn(
+    {
+      entryEquityUsd: record.entryEquityUsd,
+      entryStockPriceUsd: record.entryPrice,
+      openedAt: record.openedAt,
+    },
+    {
+      currentEquityUsd: snap.totalNAV,
+      currentStockPriceUsd: currentStockPriceUsd ?? 0,
+      holdEquityUsd,
+      at,
+    },
+    record.totalFeesUSD,
+  );
+
+  // Persist the recomputed figures so a restart keeps them and the decision log can quote them.
+  stateStore.updatePosition(record.id, {
+    unrealizedPnL: report.returnUsd ?? 0,
+    ...(report.poolContributionUsd === null ? {} : { benchmarkValue: holdEquityUsd ?? 0 }),
+  });
+
+  const negative = isPoolContributionNegative(report);
+  negativeContributionRounds = negative ? negativeContributionRounds + 1 : 0;
+
+  return {
+    returnRatio: report.returnRatio,
+    returnUsd: report.returnUsd,
+    marketContributionUsd: report.marketContributionUsd,
+    poolContributionUsd: report.poolContributionUsd,
+    poolContributionRatio: report.poolContributionRatio,
+    feesUsd: report.feesUsd,
+    incompleteReasons: report.incompleteReasons,
+    negativeContributionRounds,
+  };
+}
+
+/** §LP-contribution: consecutive rounds in which the pool's contribution was negative. */
+let negativeContributionRounds = 0;
 
 /** The `/status` view: what the process is doing, from the runtime's own configuration. */
 function statusView(runtime: StrategyRuntime, at: IsoTimestamp): StatusView {
@@ -819,6 +979,7 @@ export function buildCadences(runtime: StrategyRuntime): readonly SchedulerCaden
         // Publish what was just measured so the query commands can answer without a live read.
         if (round.snapshot !== undefined) {
           const snap = round.snapshot;
+          const returns = computePositionReturn(runtime, runtime.latestPools, snap, at);
           runtime.queryCache.setNav(
             {
               totalNavUsd: snap.totalNAV,
@@ -833,6 +994,7 @@ export function buildCadences(runtime: StrategyRuntime): readonly SchedulerCaden
               // §66: taken from the verdict, not recomputed — a second formula here could disagree with
               // the one that actually halts the bot.
               drawdown: round.report.drawdown?.drawdownFromPeak ?? 0,
+              ...(returns === null ? {} : { returns }),
             },
             at,
           );

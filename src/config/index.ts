@@ -432,6 +432,8 @@ function assembleStrategyConfig(
       tvlDropReview: risk.tvl_drop_review,
       tvlDropEmergency: risk.tvl_drop_emergency,
       minReserveBeforeNewLp: risk.min_reserve_before_new_lp,
+      negativeContributionRounds: risk.negative_contribution_rounds,
+      negativeContributionThresholdUsd: risk.negative_contribution_threshold_usd,
     },
     fees: {
       autoCompound: fees.auto_compound,

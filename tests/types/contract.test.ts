@@ -466,6 +466,7 @@ describe('type-level guarantees (compiled by tsc, asserted here for documentatio
       openedAt: 'now',
       initialNAV: usd,
       entryPrice: 1,
+      entryEquityUsd: 10_000,
       lowerPrice: 0.85,
       upperPrice: 1.16,
       lowerTick: tick,

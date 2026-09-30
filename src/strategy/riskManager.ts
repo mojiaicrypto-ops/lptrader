@@ -1062,6 +1062,111 @@ export interface MarketDeclineVerdict {
   readonly reason: string;
 }
 
+/** USD formatting for operator-facing reasons. Local so this module keeps its single dependency. */
+function usd(value: number): string {
+  return `$${value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+export interface PoolContributionVerdict {
+  readonly action: RiskAction;
+  readonly status: 'ok' | 'insufficient-data';
+  /** True when the pool's own contribution has been negative for the required number of rounds. */
+  readonly persistent: boolean;
+  readonly contributionUsd: UsdAmount;
+  readonly rounds: number;
+  readonly alertSeverity: AlertSeverity;
+  readonly reason: string;
+}
+
+/**
+ * The pool's own contribution, persisted long enough to act on.
+ *
+ * ## Why this rule exists, and why it is not Fee/IL Ratio
+ *
+ * The product is a savings product: the headline is total return on the money committed. But total return
+ * alone cannot be acted on, because it moves with the STOCK. A fall caused by the stock falling is not a
+ * reason to leave — selling would crystallise the same loss, and the operator wanted the exposure.
+ *
+ * This rule isolates the part the POOL is responsible for: the position's result minus what the entry
+ * composition would have been worth if simply held. A negative value means the pool earned less than it
+ * cost — the honest, and computable, form of "fees did not cover the impermanent loss".
+ *
+ * ## Why persistence, not a single reading
+ *
+ * Two block reads seconds apart can disagree by more than the pool's entire contribution. Acting on one
+ * reading would exit on measurement noise, and the round trip itself costs money — which is precisely what
+ * the operator is trying to avoid. The condition must hold for a configured number of consecutive rounds.
+ *
+ * ## Why it does not auto-exit
+ *
+ * This produces `RISK_REVIEW`, not `EMERGENCY_EXIT`. §67's automatic exit is reserved for conditions where
+ * waiting for a human is itself the risk (depeg, TVL collapse). A pool being slightly unprofitable is not
+ * that: it is a judgement call, and the operator may well prefer to wait for fees to accrue or for the
+ * price to return to range. The bot's job is to notice and say so.
+ */
+export function evaluatePoolContribution(
+  input: PoolContributionInput,
+  config: StrategyConfig,
+): PoolContributionVerdict {
+  if (input.contributionUsd === null) {
+    return {
+      action: RISK_ACTIONS.HOLD,
+      status: 'insufficient-data',
+      persistent: false,
+      contributionUsd: 0,
+      rounds: 0,
+      alertSeverity: ALERT_SEVERITIES.INFO,
+      // NOT `ok`: an unmeasurable contribution is not a healthy one, and saying otherwise would let a
+      // missing baseline read as a clean bill of health.
+      reason:
+        'the pool\'s own contribution could not be measured (no entry baseline, or the entry composition ' +
+        'could not be valued), so this rule has no verdict (§96)',
+    };
+  }
+
+  const required = config.risk.negativeContributionRounds;
+  const threshold = config.risk.negativeContributionThresholdUsd;
+  const negative = input.contributionUsd < -Math.abs(threshold);
+  const persistent = negative && input.rounds >= required;
+
+  if (!persistent) {
+    return {
+      action: RISK_ACTIONS.HOLD,
+      status: 'ok',
+      persistent: false,
+      contributionUsd: input.contributionUsd,
+      rounds: input.rounds,
+      alertSeverity: ALERT_SEVERITIES.INFO,
+      reason:
+        input.contributionUsd >= 0
+          ? `the pool has contributed ${usd(input.contributionUsd)} so far`
+          : `the pool's contribution is ${usd(input.contributionUsd)}, negative for ${input.rounds} of ` +
+            `${required} required rounds — below a rounding error, so nothing is concluded yet`,
+    };
+  }
+
+  return {
+    action: RISK_ACTIONS.RISK_REVIEW,
+    status: 'ok',
+    persistent: true,
+    contributionUsd: input.contributionUsd,
+    rounds: input.rounds,
+    alertSeverity: ALERT_SEVERITIES.WARNING,
+    reason:
+      `this pool has cost ${usd(Math.abs(input.contributionUsd))} relative to simply holding the same ` +
+      `tokens, for ${input.rounds} consecutive rounds. It is earning less than it costs, which is the ` +
+      'condition to leave on — review and use /exit if you agree.',
+  };
+}
+
+/** What the pool-contribution rule needs. */
+export interface PoolContributionInput {
+  /** The pool's own contribution, or `null` when it could not be measured. */
+  readonly contributionUsd: UsdAmount | null;
+  /** Consecutive rounds the contribution has been negative. */
+  readonly rounds: number;
+}
+
 /**
  * §53 ordinary market decline:
  *
@@ -1187,6 +1292,8 @@ export interface RiskInput {
   readonly range?: RangeBounds | null;
   readonly emergencyEvents?: readonly EmergencyEvent[] | null;
   readonly marketDecline?: MarketDeclineInput | null;
+  /** The pool's own contribution, once it has persisted long enough to act on. */
+  readonly poolContribution?: PoolContributionInput | null;
 }
 
 export interface RiskReport {
@@ -1219,6 +1326,7 @@ export interface RiskReport {
   readonly range: RangeRiskVerdict | null;
   readonly emergency: EmergencyVerdict | null;
   readonly marketDecline: MarketDeclineVerdict | null;
+  readonly poolContribution: PoolContributionVerdict | null;
   /** §54 deviation for `DecisionLog.tokenDeviation`. */
   readonly tokenDeviation: Ratio | null;
   /** §5 NAV for `DecisionLog.totalNAV`. */
@@ -1293,7 +1401,14 @@ export function evaluateRisk(input: RiskInput, config: StrategyConfig): RiskRepo
       ? (missingInputs.push('marketDecline'), null)
       : evaluateMarketDecline(input.marketDecline, config.risk);
 
-  for (const verdict of [peg, drawdown, tvl, reserve, range, emergency, marketDecline]) {
+  // Deliberately NOT pushed to `missingInputs` when absent: a bot with no position has no pool
+  // contribution to report, and listing it as missing would flag every flat round as incomplete.
+  const poolContribution =
+    input.poolContribution === undefined || input.poolContribution === null
+      ? null
+      : evaluatePoolContribution(input.poolContribution, config);
+
+  for (const verdict of [peg, drawdown, tvl, reserve, range, emergency, marketDecline, poolContribution]) {
     if (verdict !== null) verdicts.push({ action: verdict.action, severity: verdict.alertSeverity, reason: verdict.reason });
   }
 
@@ -1305,6 +1420,10 @@ export function evaluateRisk(input: RiskInput, config: StrategyConfig): RiskRepo
       ['reserve', reserve?.status],
       ['range', range?.status],
       ['marketDecline', marketDecline?.status],
+      // `insufficient-data` here means the contribution could not be MEASURED — no baseline, or an
+      // unpriceable entry mix. That must degrade the report, or a missing measurement would read as a
+      // healthy pool.
+      ['poolContribution', poolContribution?.status],
     ] as const
   )
     .filter(([, status]) => status === 'insufficient-data')
@@ -1350,6 +1469,7 @@ export function evaluateRisk(input: RiskInput, config: StrategyConfig): RiskRepo
     range,
     emergency,
     marketDecline,
+    poolContribution,
     tokenDeviation: peg?.deviation ?? input.marketDecline?.tokenDeviation ?? null,
     totalNav: drawdown?.currentNAV ?? null,
     suggestedActions: drawdown?.requiredActions.length

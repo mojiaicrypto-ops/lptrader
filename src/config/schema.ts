@@ -142,6 +142,15 @@ const riskSchema = z.strictObject({
   tvl_drop_emergency: ratioSchema.default(0.7),
   /** §60 reserve floor below which no new LP may be added. */
   min_reserve_before_new_lp: ratioSchema.default(0.25),
+  /**
+   * Consecutive beats the pool's own contribution must be negative before it is reported.
+   *
+   * Persistence, not a single reading: two block reads seconds apart can differ by more than the pool's
+   * entire contribution, so acting on one would exit on measurement noise and pay a round trip to do it.
+   */
+  negative_contribution_rounds: z.number().int().min(1).max(1000).default(6),
+  /** Ignore negatives smaller than this many USD — the valuation has rounding error. */
+  negative_contribution_threshold_usd: nonNegativeUsdSchema.default(1),
 });
 
 const feesSchema = z.strictObject({

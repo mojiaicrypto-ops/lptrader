@@ -88,6 +88,15 @@ export interface RiskWiringDeps {
   /** §58 conditions observed outside the pool data (contract paused, issuer suspended, …). */
   readonly emergencyEvents?: () => readonly EmergencyEvent[];
   /**
+   * The pool's own contribution and how many consecutive rounds it has been negative.
+   *
+   * Injected because answering it needs the entry baseline and the entry composition's current value —
+   * both facts about the position, not about this module's job.
+   */
+  readonly poolContribution?: (
+    open: OpenPositionView | null,
+  ) => { readonly contributionUsd: UsdAmount | null; readonly rounds: number };
+  /**
    * Has any capital ever been committed to this strategy?
    *
    * Needed to tell two situations apart that otherwise look identical to §66:
@@ -178,6 +187,10 @@ export class RiskWiring {
         tvlSeries: tvlSeries === null ? null : tvlSeries.map((point) => ({ asOf: point.asOf, tvlUsd: point.tvlUsd })),
         emergencyEvents: this.deps.emergencyEvents?.() ?? null,
         marketDecline: this.deps.marketDecline?.(at) ?? null,
+        // The pool's OWN contribution, supplied by the composition root: computing it needs the entry
+        // baseline and the position's entry composition, neither of which this module owns. Absent when
+        // there is no position, which is why it is not reported as a missing input.
+        poolContribution: this.deps.poolContribution?.(open) ?? null,
         // `peg` is intentionally NOT supplied here: it needs a trustworthy reference price, and the
         // PortfolioMonitor reports an unusable one as a valuation problem. Passing `null` makes the report
         // say "peg not evaluated" instead of implying "no depeg".

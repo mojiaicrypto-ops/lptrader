@@ -102,6 +102,21 @@ export interface RiskConfig {
   readonly tvlDropEmergency: Ratio;
   /** §60 `reserve < 25%` ⇒ no new LP. */
   readonly minReserveBeforeNewLp: Ratio;
+  /**
+   * How many consecutive rounds the pool's own contribution must be negative before it is reported.
+   *
+   * A single reading is noise: two block reads seconds apart can differ by more than the pool's entire
+   * contribution, and acting on that would exit on measurement error — paying a round trip to do so.
+   * At the 5-minute portfolio beat, 6 rounds is half an hour of a genuinely losing pool.
+   */
+  readonly negativeContributionRounds: number;
+  /**
+   * How negative, in USD, before it counts.
+   *
+   * A floor rather than a zero comparison: the valuation itself has rounding error, so a one-cent negative
+   * is not evidence of anything.
+   */
+  readonly negativeContributionThresholdUsd: UsdAmount;
 }
 
 export interface FeesConfig {

@@ -49,6 +49,28 @@ export interface PoolView {
   readonly indeterminate: boolean;
 }
 
+/** The headline return and its attribution, as shown on `/nav`. */
+export interface ReturnView {
+  /** `(current - entry) / entry`, as a fraction. `null` when no baseline was recorded. */
+  readonly returnRatio: number | null;
+  readonly returnUsd: number | null;
+  /** The part of the change explained by the stock price moving. */
+  readonly marketContributionUsd: number | null;
+  /**
+   * The pool's own contribution: actual minus "what holding the entry mix would be worth".
+   *
+   * Negative means the pool cost more than it earned. This is the number that answers "is this pool worth
+   * staying in", and it is the honest form of "fees did not cover the impermanent loss".
+   */
+  readonly poolContributionUsd: number | null;
+  readonly poolContributionRatio: number | null;
+  readonly feesUsd: number | null;
+  /** Why a complete attribution could not be produced. Empty when everything was computable. */
+  readonly incompleteReasons: readonly string[];
+  /** Consecutive rounds in which the pool's contribution has been negative, for the persistence rule. */
+  readonly negativeContributionRounds: number;
+}
+
 export interface NavView {
   readonly totalNavUsd: UsdAmount;
   readonly walletUsd: UsdAmount;
@@ -58,6 +80,8 @@ export interface NavView {
   readonly reserveRatio: number;
   readonly lpRatio: number;
   readonly drawdown: number;
+  /** Present once a position exists and the baseline could be read. */
+  readonly returns?: ReturnView;
 }
 
 export interface RiskView {

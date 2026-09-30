@@ -83,6 +83,17 @@ export interface Position {
   readonly openedAt: IsoTimestamp;
   /** NAV at the moment of opening; the §65 risk line is derived from this. */
   readonly initialNAV: UsdAmount;
+  /**
+   * Total equity (wallet + LP + unclaimed, all in USD) at the moment the position was opened.
+   *
+   * The headline return is `(current - entryEquityUsd) / entryEquityUsd`: this is a savings product, so
+   * "did the money grow" is the question, and everything else (IL, fee APR) is a means of answering it.
+   *
+   * `null` for positions opened before this was recorded. Read `null` as "unknown", never as zero — a
+   * zero baseline would make the return infinite and, worse, look like a real measurement.
+   */
+  readonly entryEquityUsd: UsdAmount | null;
+  /** Stock price per whole token at entry — the divisor that separates market moves from LP costs. */
   readonly entryPrice: UsdAmount;
   readonly lowerPrice: UsdAmount;
   readonly upperPrice: UsdAmount;

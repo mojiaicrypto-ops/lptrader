@@ -188,9 +188,41 @@ export function createQueryHandlers(deps: QueryHandlerDeps): QueryHandlers {
         '',
         'NAV = wallet + LP value + unclaimed fees. Realized fees are NOT added — they are already in the',
         'wallet, and adding them again would raise NAV and silently disable the §66 drawdown check.',
-        '',
-        `observed ${ageLabel(observed.at, nowMs())}`,
       ];
+
+      const r = n.returns;
+      if (r !== undefined) {
+        lines.push('', '--- return on the money committed ---');
+        if (r.returnRatio === null) {
+          lines.push('  total return   : unknown — no entry equity was recorded for this position');
+        } else {
+          lines.push(
+            `  total return   : ${r.returnUsd !== null && r.returnUsd >= 0 ? '+' : ''}${usd(r.returnUsd ?? 0)} ` +
+              `(${r.returnRatio >= 0 ? '+' : ''}${pct(r.returnRatio)})`,
+          );
+        }
+        if (r.marketContributionUsd !== null) {
+          lines.push(`  of which market: ${r.marketContributionUsd >= 0 ? '+' : ''}${usd(r.marketContributionUsd)}`);
+        }
+        if (r.poolContributionUsd !== null) {
+          const label = r.poolContributionUsd >= 0 ? 'earned' : 'cost us';
+          lines.push(
+            `  pool structure : ${r.poolContributionUsd >= 0 ? '+' : ''}${usd(r.poolContributionUsd)} (${label})`,
+          );
+        }
+        if (r.incompleteReasons.length > 0) {
+          lines.push('', '  The split between market move and pool cost is incomplete:');
+          for (const reason of r.incompleteReasons) lines.push(`    ${reason}`);
+        }
+        lines.push(
+          '',
+          '  "market" is what the entry composition would have moved by if the stock had simply been held;',
+          '  "pool structure" is what the position did beyond that. A negative pool structure means the',
+          '  pool earned less than it cost — that is the number worth acting on, not the total alone.',
+        );
+      }
+
+      lines.push('', `observed ${ageLabel(observed.at, nowMs())}`);
       return lines.join('\n');
     },
 
