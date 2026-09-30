@@ -42,7 +42,7 @@ import type { TokenReader } from './chain/tokenReader.ts';
 import { TokenReader as TokenReaderImpl } from './chain/tokenReader.ts';
 import type { DexAdapter, PoolDataProvider, ReferencePriceProvider, TxGuardChecks } from './types/adapters.ts';
 import type { StrategyConfig } from './types/config.ts';
-import { DEX_IDS, type Address, type DexId, type IsoTimestamp, type UsdAmount } from './types/primitives.ts';
+import { DEX_IDS, type Address, type DexId, type IsoTimestamp, type PoolId, type UsdAmount } from './types/primitives.ts';
 import type { PoolSnapshot } from './types/market.ts';
 import { ALERT_SEVERITIES, type Notifier } from './types/notifier.ts';
 import type { DecryptedPrivateKey } from './security/keystore.ts';
@@ -67,6 +67,14 @@ import { PoolScanner, foundPools } from './data/poolScanner.ts';
 import { PoolScreener } from './data/poolScreener.ts';
 import { BuildOrchestrator } from './strategy/buildOrchestrator.ts';
 import { decideRebuild } from './strategy/rebuildPolicy.ts';
+import {
+  FundingPlanner,
+  conversionGuard,
+  conversionKey,
+  describeConversion,
+  type FundingPlan,
+} from './strategy/funding.ts';
+import { evaluateSwapQuote, swapLimitsForPool } from './strategy/swapPlanner.ts';
 import {
   computeReturn,
   isPoolContributionNegative,
@@ -385,6 +393,19 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
   });
 
   /**
+   * Decides how the build is funded, BEFORE anything is quoted or approved.
+   *
+   * Absent in read-only mode: it exists to spend money, and a monitor has none to spend.
+   */
+  const fundingPlanner = readOnly
+    ? null
+    : new FundingPlanner({
+        config,
+        balanceOf: (token) => chain.getTokenBalanceOf(token, walletAddressOf(env)),
+        tokenMeta: (address) => config.whitelist.registry.getTokenByAddress(chainId, address),
+      });
+
+  /**
    * §45 build orchestration. Absent in read-only mode: a plan nothing can execute would still push an
    * approval request, and asking the operator to authorise a build that cannot run is worse than saying so.
    */
@@ -489,6 +510,36 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
     }
 
     queryCache.setScreen(decision.request.outcome, new Date().toISOString());
+
+    /*
+     * Fund the build before it is executed.
+     *
+     * Nothing checked the wallet at all before this: a build on an empty wallet travelled to the approval
+     * gate and would have reverted on chain after the operator approved it and after gas was spent. The
+     * checks below happen before anything is signed.
+     */
+    if (fundingPlanner !== null) {
+      const funding = await fundingPlanner.plan({
+        pool: decision.request.pool,
+        quoteTokenNeededRaw: decision.request.plan.amount1,
+        stockTokenNeededRaw: decision.request.plan.amount0,
+      });
+      if (!funding.ok) {
+        return { ok: false, message: `cannot fund this build — ${funding.message}` };
+      }
+
+      // A currency conversion is a SEPARATE transaction, deliberately: folding it into the §42 atomic
+      // build would either lose the all-or-nothing guarantee or need a multi-hop route the router may not
+      // support. A failed conversion leaves a different stablecoin, which is still money at par.
+      if (funding.plan.conversion !== null) {
+        const converted = await executeFundingConversion(
+          { config, dex, chainId, notifier, pools: latestPoolByAddress },
+          funding.plan,
+        );
+        if (!converted.ok) return converted;
+      }
+    }
+
     const outcome = await executor.buildPosition(decision.request.input);
 
     if (outcome.ok && outcome.positionTokenId !== undefined) {
@@ -748,6 +799,128 @@ function statusView(runtime: StrategyRuntime, at: IsoTimestamp): StatusView {
     // The caller stamps the Observed wrapper; this keeps the field honest for a reader that expects one.
     ...(at === undefined ? {} : {}),
   };
+}
+
+/**
+ * Execute the funding conversion: a separate, guarded swap of one stablecoin into the pool's quote token.
+ *
+ * ## Why a separate transaction rather than part of the atomic build
+ *
+ * The §42 atomic path covers swap+mint in ONE transaction, and its guarantee is about the position's own
+ * legs. Folding a currency conversion in would mean either losing that guarantee or requiring a multi-hop
+ * route the SmartRouter may not support. Separate sends keep each transaction's guarantee intact.
+ *
+ * ## Why a failure here is not a partial position
+ *
+ * If the conversion lands and the build is then refused, the wallet holds a different stablecoin — the same
+ * money, at par. That is categorically unlike §43's `PARTIAL_POSITION`, where a swap left the wallet
+ * holding a single volatile leg it never planned to hold. So this is a plain refusal, not a manual review.
+ *
+ * ## The conversion is gated like any other swap
+ *
+ * "It is only a stablecoin conversion" is exactly the reasoning that would let unbounded slippage through:
+ * a USDT/USDC pool can still be thin, and it is the operator's money either way.
+ */
+async function executeFundingConversion(
+  deps: {
+    readonly config: StrategyConfig;
+    readonly dex: DexAdapter;
+    readonly chainId: number;
+    readonly notifier: Notifier;
+    readonly pools: ReadonlyMap<string, PoolSnapshot>;
+  },
+  plan: FundingPlan,
+): Promise<{ readonly ok: boolean; readonly message: string }> {
+  const conversion = plan.conversion;
+  if (conversion === null) return { ok: true, message: 'no conversion needed' };
+
+  const quoteMeta = deps.config.whitelist.registry.getTokenByAddress(deps.chainId, plan.quoteToken);
+  const quoteSymbol = quoteMeta?.symbol ?? plan.quoteToken;
+
+  const conversionPoolId = resolveConversionPoolId(deps.pools, conversion.tokenIn, plan.quoteToken);
+  if (conversionPoolId === null) {
+    return {
+      ok: false,
+      message:
+        `no whitelisted pool trades ${conversion.meta.symbol} for ${quoteSymbol}, so the position cannot be ` +
+        "funded. Deposit the pool's own stablecoin instead.",
+    };
+  }
+
+  const quote = await deps.dex.quoteSwap({
+    poolId: conversionPoolId,
+    tokenIn: conversion.tokenIn,
+    tokenOut: plan.quoteToken,
+    amountIn: conversion.amountInRaw,
+    ttlSeconds: deps.config.swap.quoteTtlSeconds,
+  });
+
+  const limits = swapLimitsForPool(conversionPoolId, deps.config);
+  const gate = evaluateSwapQuote(quote, limits, new Date().toISOString());
+  if (!gate.ok) {
+    // Reported, not forced through: a conversion is only worth doing if it is cheap, which is the whole
+    // reason it is a separate step.
+    return {
+      ok: false,
+      message:
+        `the ${conversion.meta.symbol} → ${quoteSymbol} conversion was refused by the swap gate: ` +
+        `${gate.reasons.join('; ')}. The position was not built and nothing was spent.`,
+    };
+  }
+
+  await deps.notifier.send(
+    ALERT_SEVERITIES.INFO,
+    'funding the position',
+    describeConversion(conversion, quoteSymbol, quote),
+  );
+
+  try {
+    const result = await deps.dex.executeSwap({
+      quote,
+      deadline: {
+        kind: 'timestamp',
+        unixSeconds: Math.floor(Date.parse(quote.quotedAt) / 1000) + deps.config.swap.quoteTtlSeconds,
+      },
+      // Attributed to the build: it happens only to fund one, and a separate purpose code would
+      // imply an operation the operator could recognise on its own.
+      purpose: 'BUILD_POSITION',
+      // A separate key from the build's: the two are different transactions and a retry of one must not be
+      // mistaken for a retry of the other.
+      idempotencyKey: conversionKey(`build:${quote.poolId}:${quote.quotedAt}`),
+      guard: conversionGuard(deps.config, deps.chainId, deps.dex.dex),
+    });
+    return { ok: true, message: `conversion sent (${result.txHash}); funding the build` };
+  } catch (error) {
+    return {
+      ok: false,
+      message:
+        `the ${conversion.meta.symbol} → ${quoteSymbol} conversion failed: ` +
+        `${error instanceof Error ? error.message : String(error)}. Nothing was built; the wallet is ` +
+        'unchanged and you can retry.',
+    };
+  }
+}
+
+/**
+ * The whitelisted pool that trades `tokenIn` for `tokenOut`, or `null`.
+ *
+ * Searched from the last scan rather than assumed: the pool that trades the pair need not be the pool
+ * being built — that is the whole situation this exists for.
+ */
+function resolveConversionPoolId(
+  pools: ReadonlyMap<string, PoolSnapshot>,
+  tokenIn: Address,
+  tokenOut: Address,
+): PoolId | null {
+  const both = (pool: PoolSnapshot): boolean => {
+    const legs = new Set([pool.token0.toLowerCase(), pool.token1.toLowerCase()]);
+    return legs.has(tokenIn.toLowerCase()) && legs.has(tokenOut.toLowerCase());
+  };
+  const candidates = [...pools.values()].filter(both);
+  if (candidates.length === 0) return null;
+  // Deepest first: a thin pool is exactly where a "cheap" stablecoin conversion stops being cheap.
+  const best = [...candidates].sort((a, b) => b.tvlUSD.value - a.tvlUSD.value)[0];
+  return best?.poolId ?? null;
 }
 
 /**
