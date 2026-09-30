@@ -26,7 +26,7 @@
  * that returns zero pools with `complete === true` is a real "no candidate pool today", whereas
  * `complete === false` means "ask again / fix the data layer".
  */
-import type { DexAdapter, PoolDataProvider, PoolDiscoveryQuery } from '../types/adapters.ts';
+import type { PoolDataProvider, PoolDiscoveryQuery } from '../types/adapters.ts';
 import { DATA_SOURCES, type PoolSnapshot } from '../types/market.ts';
 import {
   DEX_IDS,
@@ -62,12 +62,30 @@ export function isKnownDex(value: string): value is DexId {
   return value === DEX_IDS.UNISWAP_V3 || value === DEX_IDS.PANCAKESWAP_V3;
 }
 
+/**
+ * What a scan concluded about one (stock × stablecoin × DEX × fee tier) combination.
+ *
+ * ## This vocabulary is about HTTP evidence, deliberately (architecture §3)
+ * Module 1 is **纯 HTTP** — it makes no chain calls. So "the pool does not exist" can only ever mean
+ * "the discovery source answered and listed no such pool", which is NOT the same as proof. That is why
+ * `ABSENT` is gone: it previously meant "the on-chain factory returned the zero address", and without a
+ * chain probe that claim cannot be made. Keeping the name while weakening the evidence is exactly the
+ * silent-semantics change the architecture forbids (§7.3).
+ *
+ * The distinction that MUST survive is the one that was always the point:
+ * ```text
+ * NOT_LISTED  — the source answered, this combination is not among its results
+ * UNVERIFIED  — the source failed / truncated, so a pool here might simply not have been seen
+ * ```
+ * Conflating those is how a data-source outage gets misread as "no pools exist" (and, in the other
+ * direction, how a pool that does exist gets treated as absent).
+ */
 export const POOL_EXISTENCE = {
-  /** Discovered (and, when possible, confirmed by the on-chain factory). */
+  /** Discovered through the HTTP discovery layer. */
   FOUND: 'found',
-  /** Proven absent: the on-chain factory returned the zero address. */
-  ABSENT: 'absent',
-  /** Unknown: nothing was discovered, and absence could not be proven. */
+  /** The source answered and listed no such pool. NOT a proof of non-existence (see above). */
+  NOT_LISTED: 'not-listed',
+  /** Unknown: nothing was discovered, and absence could not be asserted. */
   UNVERIFIED: 'unverified',
 } as const;
 export type PoolExistence = (typeof POOL_EXISTENCE)[keyof typeof POOL_EXISTENCE];
@@ -75,12 +93,8 @@ export type PoolExistence = (typeof POOL_EXISTENCE)[keyof typeof POOL_EXISTENCE]
 export const POOL_EXISTENCE_EVIDENCE = {
   /** Discovered through the HTTP discovery layer. */
   HTTP_DISCOVERY: 'http-discovery',
-  /** Confirmed independently by `factory.getPool(tokenA, tokenB, fee)`. */
-  ONCHAIN_FACTORY: 'onchain-factory',
-  /** The factory answered with the zero address — an authoritative absence. */
-  ONCHAIN_FACTORY_ABSENT: 'onchain-factory-absent',
-  /** No factory probe is wired, so absence cannot be asserted (fail closed). */
-  NO_FACTORY_PROBE: 'no-factory-probe',
+  /** The discovery source answered and listed no such pool. */
+  HTTP_NOT_LISTED: 'http-not-listed',
   /** The discovery source itself failed for this token. */
   DISCOVERY_FAILED: 'discovery-failed',
   /** Discovery reported more pages than were read: a valid pool may sit on a later page. */
@@ -100,7 +114,7 @@ export interface PoolProbe {
   readonly evidence: PoolExistenceEvidence;
   /** Present iff `existence === 'found'`. */
   readonly snapshot?: PoolSnapshot;
-  /** Present iff `existence === 'absent'` (the on-chain factory answer). */
+  /** Human-readable explanation, always present for a non-`found` probe. */
   readonly note?: string;
 }
 
@@ -117,9 +131,11 @@ export interface PoolScanSummary {
   /**
    * `PoolId` → whether the on-chain state (`tick`/`liquidity`/`fee`) was actually read for it.
    *
-   * `PoolSnapshot` has no availability bit on those raw fields, so §16's filter needs this beside
-   * the snapshot: a pool present in `pools` but `false` here must be rejected by
-   * `filterScannedPools` rather than evaluated against a placeholder `tick`/`liquidity` (§96).
+   * **Always `false` in module 1**, because module 1 makes no chain calls (architecture §3). It is kept
+   * rather than removed because it is the wire that forces §96 behaviour downstream: `filterScannedPools`
+   * rejects an unverified pool instead of evaluating a placeholder `tick`/`liquidity`. On-chain
+   * verification now happens in module 2 (`PoolScreener`), which is the only layer allowed to read the
+   * chain — and it must still refuse a pool whose tick/liquidity it could not read.
    */
   readonly onchainVerifiedByPool: Readonly<Record<PoolId, boolean>>;
   readonly failures: readonly PoolSourceFailure[];
@@ -134,27 +150,20 @@ export interface PoolScannerOptions {
   /** The §83 provider. `getPoolsDetailed` is used when available (it carries failure info). */
   readonly provider: PoolDataProvider;
   /**
-   * Per-DEX adapters, used for the authoritative `factory.getPool(...)` existence probe (§82).
-   * Optional: without it, "no pool discovered" stays `unverified` rather than becoming `absent`.
+   * Chains to scan. Defaults to `config.whitelist.chains`.
+   *
+   * Note the absence of any on-chain probe option: **module 1 does not call the chain** (architecture
+   * §3). An earlier version accepted `dexAdapters` / `findOnchainPool` to prove non-existence via
+   * `factory.getPool`; that fan-out (20 combinations × fee tiers) was the main reason a scan was
+   * expensive, and it produced a claim ("proven absent") whose only value was to distinguish it from
+   * "not listed" — a distinction HTTP already expresses, at no cost.
    */
-  readonly dexAdapters?: readonly DexAdapter[];
-  /**
-   * Raw on-chain factory probe, used when a `DexAdapter` is not wired for this DEX.
-   * `null` means "the factory answered with the zero address" = a proven absence.
-   */
-  readonly findOnchainPool?: (params: {
-    readonly chainId: ChainId;
-    readonly dex: DexId;
-    readonly tokenA: Address;
-    readonly tokenB: Address;
-    readonly feeTier: FeeTier;
-  }) => Promise<Address | null>;
-  /** Chains to scan. Defaults to `config.whitelist.chains`. */
   readonly chainIds?: readonly ChainId[];
   /**
-   * Fee tiers probed per DEX for the factory existence check. CLMM pools are fee-tier keyed, so
-   * "no pool exists" is only provable by probing the tiers the DEX supports (research §5:
-   * Pancake 100/500/2500/10000, Uniswap 500/3000/10000).
+   * Fee tiers to consider per DEX when matching a discovered pool to a candidate combination.
+   * CLMM pools are fee-tier keyed, so a discovered pool is only matched to a (pair, tier) entry when
+   * the tier is one this DEX actually deploys (research §5: Pancake 100/500/2500/10000,
+   * Uniswap 500/3000/10000). No chain call is involved — this is a lookup table.
    */
   readonly feeTiersByDex?: Readonly<Record<string, readonly FeeTier[]>>;
 }
@@ -213,24 +222,19 @@ export function enumerateCandidatePairs(options: {
  * §14/§15 scanner.
  *
  * One provider call per chain discovers *all* candidate pools at once (GeckoTerminal is queried per
- * stock token, DexPaprika per stock token, the chain once) — the per-(pair, feeTier) fan-out only
- * exists for the *existence* probe, which is a cheap `eth_call` to the factory.
+ * stock token, DexPaprika per stock token, the chain once). The per-(pair, feeTier) loop only *matches*
+ * discovered pools against candidate combinations — it performs no I/O, so the loop is pure bookkeeping
+ * rather than a request fan-out (architecture §3).
  */
 export class PoolScanner {
   readonly #config: StrategyConfig;
   readonly #provider: PoolDataProvider;
-  readonly #dexAdapters: ReadonlyMap<DexId, DexAdapter>;
-  readonly #findOnchainPool: PoolScannerOptions['findOnchainPool'];
   readonly #chainIds: readonly ChainId[];
   readonly #feeTiersByDex: Readonly<Record<string, readonly FeeTier[]>>;
 
   constructor(options: PoolScannerOptions) {
     this.#config = options.config;
     this.#provider = options.provider;
-    const adapters = new Map<DexId, DexAdapter>();
-    for (const adapter of options.dexAdapters ?? []) adapters.set(adapter.dex, adapter);
-    this.#dexAdapters = adapters;
-    this.#findOnchainPool = options.findOnchainPool;
     this.#chainIds = options.chainIds ?? options.config.whitelist.chains;
     this.#feeTiersByDex = options.feeTiersByDex ?? DEX_FEE_TIERS;
   }
@@ -339,66 +343,30 @@ export class PoolScanner {
               });
               continue;
             }
-            // Not discovered for this (pair, fee tier): absent, or simply not read?
-            const onchainAddress = await this.#proveExistence({
-              chainId,
-              dex,
-              feeTier,
-              pair,
-            });
-            // The probe answers three distinct things and they MUST NOT be conflated: a real
-            // address (the pool exists — `#proveExistence` passes it through, JSON-RPC lowercased),
-            // the `'absent'` sentinel (the factory answered the zero address = proven absence), and
-            // `null` (nothing wired / the probe failed). `typeof x === 'string'` is true for BOTH
-            // strings, so it would report a pool that was just FOUND as "proven absent".
-            if (onchainAddress === 'absent') {
-              probes.push({
-                chainId,
-                dex,
-                feeTier,
-                stockToken: pair.stockToken,
-                stablecoin: pair.stablecoin,
-                existence: POOL_EXISTENCE.ABSENT,
-                evidence: POOL_EXISTENCE_EVIDENCE.ONCHAIN_FACTORY_ABSENT,
-                note: `proven absent: factory.getPool returned the zero address for fee ${feeTier}`,
-              });
-              continue;
-            }
-            if (typeof onchainAddress === 'string') {
-              probes.push({
-                chainId,
-                dex,
-                feeTier,
-                stockToken: pair.stockToken,
-                stablecoin: pair.stablecoin,
-                existence: POOL_EXISTENCE.FOUND,
-                evidence: POOL_EXISTENCE_EVIDENCE.ONCHAIN_FACTORY,
-                note: `factory.getPool confirms this pool exists at ${onchainAddress} (fee ${feeTier}), but no snapshot could be composed during this scan`,
-              });
-              continue;
-            }
-            const noProbe =
-              this.#findOnchainPool === undefined && this.#dexAdapters.get(dex) === undefined;
+            // Not discovered for this (pair, fee tier). Module 1 makes NO chain call (architecture §3),
+            // so the only honest answer is one of two, and they must never be conflated:
+            //   · the source failed for this token  → UNVERIFIED (a pool here may simply be unread)
+            //   · the source answered               → NOT_LISTED (no such pool in its results)
+            const discoveryFailed = discoveryFailedByToken.has(pair.stockToken);
             probes.push({
               chainId,
               dex,
               feeTier,
               stockToken: pair.stockToken,
               stablecoin: pair.stablecoin,
-              existence: POOL_EXISTENCE.UNVERIFIED,
-              evidence: discoveryFailedByToken.has(pair.stockToken)
+              existence: discoveryFailed ? POOL_EXISTENCE.UNVERIFIED : POOL_EXISTENCE.NOT_LISTED,
+              evidence: discoveryFailed
                 ? POOL_EXISTENCE_EVIDENCE.DISCOVERY_FAILED
-                : noProbe
-                  ? POOL_EXISTENCE_EVIDENCE.NO_FACTORY_PROBE
-                  : discoveryTruncated
-                    ? POOL_EXISTENCE_EVIDENCE.DISCOVERY_TRUNCATED
-                    : POOL_EXISTENCE_EVIDENCE.NO_FACTORY_PROBE,
-              note: discoveryFailedByToken.has(pair.stockToken)
-                ? 'a discovery source failed for this stock token during this scan; absence cannot be asserted'
-                : noProbe
-                  ? 'no factory probe is wired, so absence cannot be proven (§96)'
-                  : 'discovery was incomplete, so absence cannot be asserted',
+                : discoveryTruncated
+                  ? POOL_EXISTENCE_EVIDENCE.DISCOVERY_TRUNCATED
+                  : POOL_EXISTENCE_EVIDENCE.HTTP_NOT_LISTED,
+              note: discoveryFailed
+                ? 'a discovery source failed for this stock token during this scan; whether this pool exists cannot be asserted'
+                : discoveryTruncated
+                  ? 'discovery reported more pages than were read, so this pool may exist beyond the pages read'
+                  : `the discovery source listed no ${dex} pool for this pair at fee ${feeTier}`,
             });
+            continue;
           }
         }
       }
@@ -461,45 +429,6 @@ export class PoolScanner {
     return null;
   }
 
-  /**
-   * Ask the chain whether the pool exists.
-   * Returns the pool address when found, the string `'absent'` for a proven zero-address answer,
-   * and `null` when existence could not be determined (nothing wired, or the probe failed).
-   */
-  async #proveExistence(params: {
-    chainId: ChainId;
-    dex: DexId;
-    feeTier: FeeTier;
-    pair: PoolCandidatePair;
-  }): Promise<Address | 'absent' | null> {
-    const adapter = this.#dexAdapters.get(params.dex);
-    if (adapter !== undefined) {
-      try {
-        const pool = await adapter.getPool(
-          params.pair.stockToken,
-          params.pair.stablecoin,
-          params.feeTier,
-        );
-        return pool === null ? 'absent' : pool.poolAddress;
-      } catch {
-        return null;
-      }
-    }
-    const probe = this.#findOnchainPool;
-    if (probe === undefined) return null;
-    try {
-      const found = await probe({
-        chainId: params.chainId,
-        dex: params.dex,
-        tokenA: params.pair.stockToken,
-        tokenB: params.pair.stablecoin,
-        feeTier: params.feeTier,
-      });
-      return found ?? 'absent';
-    } catch {
-      return null;
-    }
-  }
 }
 
 export function createPoolScanner(options: PoolScannerOptions): PoolScanner {
@@ -530,13 +459,19 @@ export function filterScannedPools(
   });
 }
 
-/** Proven-absent (pair, feeTier) probes, formatted for the operator log. */
-export function describeAbsences(summary: PoolScanSummary): readonly string[] {
+/**
+ * Combinations the discovery source listed no pool for, formatted for the operator log.
+ *
+ * Named `describeNotListed` rather than `describeAbsences` on purpose: without a chain probe there is no
+ * proof of absence (architecture §3), and a function named for proof would invite a caller to treat this
+ * as one.
+ */
+export function describeNotListed(summary: PoolScanSummary): readonly string[] {
   return summary.probes
-    .filter((probe) => probe.existence === POOL_EXISTENCE.ABSENT)
+    .filter((probe) => probe.existence === POOL_EXISTENCE.NOT_LISTED)
     .map(
       (probe) =>
-        `${probe.dex} ${probe.stockToken}/${probe.stablecoin} fee ${probe.feeTier}: ${probe.note ?? 'absent'}`,
+        `${probe.dex} ${probe.stockToken}/${probe.stablecoin} fee ${probe.feeTier}: ${probe.note ?? 'not listed'}`,
     );
 }
 

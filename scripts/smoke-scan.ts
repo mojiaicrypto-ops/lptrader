@@ -21,7 +21,7 @@ import { createReferencePriceProvider } from '../src/data/referencePrice.ts';
 import { LayeredPoolDataProvider } from '../src/data/poolDataProvider.ts';
 import {
   createPoolScanner,
-  describeAbsences,
+  describeNotListed,
   describeUnverified,
   filterScannedPools,
   type PoolScanSummary,
@@ -168,11 +168,8 @@ async function main(): Promise<void> {
     onchain,
     referencePrice: createReferencePriceProvider(),
   });
-  const scanner = createPoolScanner({
-    config,
-    provider,
-    findOnchainPool: async (params) => onchain.findPool(params),
-  });
+  // Module 1 is HTTP-only (architecture §3). The scanner takes no chain probe.
+  const scanner = createPoolScanner({ config, provider });
 
   section('scan');
   const startedAt = Date.now();
@@ -223,11 +220,13 @@ async function main(): Promise<void> {
     process.stdout.write('  no candidate pool was discovered\n');
   }
 
-  section('proven absences (factory answered the zero address)');
-  const absences = describeAbsences(summary);
-  if (absences.length === 0) process.stdout.write('  none\n');
-  for (const entry of absences.slice(0, 20)) process.stdout.write(`  ${entry}\n`);
-  if (absences.length > 20) process.stdout.write(`  … ${absences.length - 20} more\n`);
+  // Not "absences": module 1 makes no chain call, so it cannot prove a pool does not exist. What it can
+  // say is that the discovery source answered and listed no such pool — a different (and honest) claim.
+  section('not listed by the discovery source (NOT proof of absence — no chain call is made)');
+  const notListed = describeNotListed(summary);
+  if (notListed.length === 0) process.stdout.write('  none\n');
+  for (const entry of notListed.slice(0, 20)) process.stdout.write(`  ${entry}\n`);
+  if (notListed.length > 20) process.stdout.write(`  … ${notListed.length - 20} more\n`);
 
   section('unverifiable probes (these make a scan incomplete)');
   const unverified = describeUnverified(summary);

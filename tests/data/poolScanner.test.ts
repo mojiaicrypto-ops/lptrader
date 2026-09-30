@@ -30,7 +30,7 @@ import {
   POOL_EXISTENCE,
   POOL_EXISTENCE_EVIDENCE,
   PoolScanner,
-  describeAbsences,
+  describeNotListed,
   describeUnverified,
   enumerateCandidatePairs,
   filterScannedPools,
@@ -381,7 +381,7 @@ describe('trap 2: DexPaprika reports fee=null for V3 pools', () => {
  * Trap 3 — "the source failed" ≠ "the pool does not exist"
  * ------------------------------------------------------------------ */
 
-describe('trap 3: a failing source yields `unverified`, never `absent`', () => {
+describe('trap 3: a failing source yields `unverified`, never `not-listed` (see §7.3)', () => {
   it('reports an HTTP 500 discovery failure as DISCOVERY_FAILED / unverified', async () => {
     // Every stock token answers an empty page except QQQB, whose endpoint is broken.
     const clock = virtualClock();
@@ -396,8 +396,8 @@ describe('trap 3: a failing source yields `unverified`, never `absent`', () => {
       transport,
       clock,
     });
-    // No factory probe is wired: neither the HTTP layer nor the chain can speak for this token,
-    // so the only honest answer is "unknown" — and it must never be rendered as "absent".
+    // Module 1 is HTTP-only. When the source fails it cannot speak for this token, so the only honest
+    // answer is "unknown" — and it must never be rendered as "the pool is not there".
     const scanner = createPoolScanner({ config, provider });
 
     const summary = await scanner.scan();
@@ -408,18 +408,21 @@ describe('trap 3: a failing source yields `unverified`, never `absent`', () => {
     expect(qqqbProbes.every((probe) => probe.evidence === POOL_EXISTENCE_EVIDENCE.DISCOVERY_FAILED)).toBe(
       true,
     );
-    // The critical inversion: a source failure must not be reported as a proven absence.
-    expect(summary.probes.some((probe) => probe.existence === POOL_EXISTENCE.ABSENT && probe.stockToken === QQQB)).toBe(
-      false,
-    );
-    expect(describeAbsences(summary).some((line) => line.includes(QQQB))).toBe(false);
+    // The critical inversion, unchanged by the vocabulary rewrite: a source FAILURE must not be reported
+    // as "this combination is not listed". Conflating them is how an outage becomes "no pools exist".
+    expect(
+      summary.probes.some((probe) => probe.existence === POOL_EXISTENCE.NOT_LISTED && probe.stockToken === QQQB),
+    ).toBe(false);
+    expect(describeNotListed(summary).some((line) => line.includes(QQQB))).toBe(false);
     expect(describeUnverified(summary).some((line) => line.includes(QQQB))).toBe(true);
     // An incomplete scan: consumers must not act on it (§96).
     expect(summary.complete).toBe(false);
     expect(summary.blockers.some((blocker) => blocker.includes('discovery-failed'))).toBe(true);
   });
 
-  it('lets a proven factory absence outrank a broken HTTP layer (the chain is authoritative)', async () => {
+  it('reports a source failure for one token without letting it contaminate the others', async () => {
+    // Same shape as above, narrowed to the property that survives the vocabulary rewrite: a broken source
+    // for ONE token must not turn every other token's verdict into "unknown" either.
     const clock = virtualClock();
     const { transport } = mockTransport(
       emptyDiscoveryRoutes({
@@ -432,24 +435,24 @@ describe('trap 3: a failing source yields `unverified`, never `absent`', () => {
       transport,
       clock,
     });
-    // Here the chain DOES answer, and it answers "no such pool" — that is a fact, not an inference
-    // from the failed source, so `absent` is the correct verdict for these probes.
-    const summary = await createPoolScanner({
-      config,
-      provider,
-      findOnchainPool: async () => null,
-    }).scan();
+    const summary = await createPoolScanner({ config, provider }).scan();
 
     const qqqb = summary.probes.filter((probe) => probe.stockToken === QQQB);
-    expect(qqqb.every((probe) => probe.existence === POOL_EXISTENCE.ABSENT)).toBe(true);
-    expect(qqqb.every((probe) => probe.evidence === POOL_EXISTENCE_EVIDENCE.ONCHAIN_FACTORY_ABSENT)).toBe(
-      true,
-    );
-    // Still incomplete overall: the failed discovery source remains a blocker for the scan.
-    expect(summary.failures.some((failure) => failure.subject === QQQB)).toBe(true);
+    const others = summary.probes.filter((probe) => probe.stockToken !== QQQB);
+
+    expect(qqqb.every((probe) => probe.existence === POOL_EXISTENCE.UNVERIFIED)).toBe(true);
+    // The healthy tokens still get a definite answer: the source listed no pool for them.
+    expect(others.length).toBeGreaterThan(0);
+    expect(others.some((probe) => probe.existence === POOL_EXISTENCE.NOT_LISTED)).toBe(true);
+    // The scan as a whole is still not clean, and the reason names the failing source.
+    expect(summary.complete).toBe(false);
+    expect(summary.blockers.some((blocker) => blocker.includes('discovery-failed'))).toBe(true);
   });
 
-  it('reports a genuinely empty discovery plus a zero-address factory answer as `absent`', async () => {
+  it('reports an empty-but-healthy discovery as `not-listed` and COMPLETES', async () => {
+    // The important half of the old "proven absent" test: when every source answers and none lists a pool,
+    // the scan is COMPLETE and the answer is definite. No chain call is needed to say that — which is the
+    // whole point of moving this layer off-chain (architecture §3).
     const clock = virtualClock();
     const { transport } = mockTransport(emptyDiscoveryRoutes());
     const provider = new LayeredPoolDataProvider({
@@ -458,45 +461,28 @@ describe('trap 3: a failing source yields `unverified`, never `absent`', () => {
       transport,
       clock,
     });
-    const scanner = createPoolScanner({
-      config,
-      provider,
-      findOnchainPool: async () => null, // factory.getPool → zero address for every probe
-    });
+    const summary = await createPoolScanner({ config, provider }).scan();
 
-    const summary = await scanner.scan();
     expect(summary.probes.length).toBeGreaterThan(0);
+    expect(summary.probes.every((probe) => probe.existence === POOL_EXISTENCE.NOT_LISTED)).toBe(true);
     expect(
-      summary.probes.every(
-        (probe) =>
-          probe.existence === POOL_EXISTENCE.ABSENT &&
-          probe.evidence === POOL_EXISTENCE_EVIDENCE.ONCHAIN_FACTORY_ABSENT,
-      ),
+      summary.probes.every((probe) => probe.evidence === POOL_EXISTENCE_EVIDENCE.HTTP_NOT_LISTED),
     ).toBe(true);
     expect(summary.probes.some((probe) => probe.existence === POOL_EXISTENCE.UNVERIFIED)).toBe(false);
-    expect(summary.complete).toBe(true); // zero pools found, but every miss was PROVEN
+    // Zero pools found, but every miss is definite, so consumers may act on "there is nothing here".
+    expect(summary.complete).toBe(true);
     expect(describeUnverified(summary)).toEqual([]);
-    expect(describeAbsences(summary).length).toBe(summary.probes.length);
+    expect(describeNotListed(summary).length).toBe(summary.probes.length);
   });
 
-  it('leaves the probe `unverified` (NO_FACTORY_PROBE) when nothing can prove absence', async () => {
-    const clock = virtualClock();
-    const { transport } = mockTransport(emptyDiscoveryRoutes());
-    const provider = new LayeredPoolDataProvider({
-      chainId: 56,
-      registry: config.whitelist.registry,
-      transport,
-      clock,
-    });
-    // No `findOnchainPool`, no DexAdapter: absence is simply not provable.
-    const summary = await new PoolScanner({ config, provider }).scan();
+  // Truncation itself is covered at the layer that produces it: `tests/data/poolDataProvider.test.ts`
+  // asserts a truncated page is a fatal failure and never a verified absence, and that a DexPaprika
+  // enrichment failure is degraded-but-visible. Duplicating that here with a hand-built fixture would
+  // test the fixture, not the scanner. What the scanner owns is the MAPPING of a source failure onto
+  // `unverified` — which the tests above cover directly.
 
-    expect(summary.probes.every((probe) => probe.existence === POOL_EXISTENCE.UNVERIFIED)).toBe(true);
-    expect(
-      summary.probes.every((probe) => probe.evidence === POOL_EXISTENCE_EVIDENCE.NO_FACTORY_PROBE),
-    ).toBe(true);
-    expect(summary.complete).toBe(false);
-  });
+
+
 
   it('maps a discovery failure reported by the provider onto the affected token only', async () => {
     const summary = await createPoolScanner({
@@ -519,10 +505,10 @@ describe('trap 3: a failing source yields `unverified`, never `absent`', () => {
     expect(msftb.length).toBeGreaterThan(0);
     expect(msftb.every((probe) => probe.existence === POOL_EXISTENCE.UNVERIFIED)).toBe(true);
     expect(msftb.every((probe) => probe.evidence === POOL_EXISTENCE_EVIDENCE.DISCOVERY_FAILED)).toBe(true);
-    // A token whose discovery succeeded is NOT dragged along: with no probe wired its miss is a
-    // different, honest verdict (no proof of absence) rather than a fabricated failure.
+    // A token whose discovery succeeded is NOT dragged along by another token's failure: its miss is a
+    // definite "not listed" rather than a fabricated failure.
     const qqqb = summary.probes.filter((probe) => probe.stockToken === QQQB);
-    expect(qqqb.every((probe) => probe.evidence === POOL_EXISTENCE_EVIDENCE.NO_FACTORY_PROBE)).toBe(true);
+    expect(qqqb.every((probe) => probe.evidence === POOL_EXISTENCE_EVIDENCE.HTTP_NOT_LISTED)).toBe(true);
     expect(summary.complete).toBe(false);
   });
 
@@ -647,85 +633,51 @@ describe('trap 4: HTTP 429 is retried with backoff, a bounded number of times', 
 });
 
 /* ------------------------------------------------------------------ *
- * found ↔ absent: the D1 regression (the `typeof === 'string'` inversion)
+ * HTTP-found pools are reported FOUND; a blind source is never FOUND
  * ------------------------------------------------------------------ */
 
-describe('a specific on-chain projection is FOUND, never `absent`', () => {
-  it('factory.getPool returning a real address is reported as found by the factory', async () => {
-    // Discovery is empty (both HTTP layers are blind to this pool), but the chain knows it exists.
+describe('found is claimed only on HTTP evidence, and never on a guess', () => {
+  it('a pool the discovery layer returns is reported FOUND with the HTTP evidence', async () => {
+    // The D1 regression (a real pool reported as "proven absent" because `typeof x === 'string'` matched
+    // both sentinels) is now structurally impossible: module 1 has no chain probe to confuse. What still
+    // needs guarding is the reverse direction — that a discovered pool is never downgraded, and that its
+    // verdict is attributed to the HTTP source rather than to a chain call that no longer happens.
+    const summary = await createPoolScanner({
+      config,
+      provider: fakeProvider({
+        pools: [
+          snapshotFor({
+            poolAddress: UNISWAP_POOL,
+            dex: DEX_IDS.UNISWAP_V3,
+            // Must be a tier this DEX deploys, and the legs must match a whitelisted
+            // (stock × stablecoin) pair, or the scanner correctly refuses to match it.
+            feeTier: 500,
+          }),
+        ],
+      }),
+    }).scan();
+
+    const found = summary.probes.filter((probe) => probe.existence === POOL_EXISTENCE.FOUND);
+    expect(found.length).toBeGreaterThan(0);
+    expect(found.every((probe) => probe.evidence === POOL_EXISTENCE_EVIDENCE.HTTP_DISCOVERY)).toBe(true);
+    // No probe may claim on-chain evidence any more — that vocabulary is gone with the probe.
+    expect(summary.probes.some((probe) => probe.evidence.includes('onchain'))).toBe(false);
+    expect(summary.onchainVerifiedByPool).toEqual({});
+  });
+
+  it('never reports a pool as FOUND when no discovery source returned one', async () => {
+    // The mirror property: with every source answering emptily, nothing may be FOUND. A "found" verdict
+    // invented from anything other than a discovered pool would be a pool we cannot price or filter.
     const summary = await createPoolScanner({
       config,
       provider: fakeProvider({ pools: [], complete: true }),
-      findOnchainPool: async () => UNISWAP_POOL,
     }).scan();
 
-    expect(summary.probes.length).toBeGreaterThan(0);
-    // The regression: a real address is a string too, so `typeof x === 'string'` would have
-    // reported every one of these as proven-absent and printed "returned the zero address".
-    expect(summary.probes.some((probe) => probe.existence === POOL_EXISTENCE.ABSENT)).toBe(false);
-    const confirmed = summary.probes.filter(
-      (probe) => probe.evidence === POOL_EXISTENCE_EVIDENCE.ONCHAIN_FACTORY,
-    );
-    expect(confirmed.length).toBe(summary.probes.length);
-    expect(confirmed.every((probe) => probe.existence === POOL_EXISTENCE.FOUND)).toBe(true);
-    expect(confirmed[0]!.note).toContain(UNISWAP_POOL);
-    expect(confirmed[0]!.note).not.toContain('zero address');
-    expect(describeAbsences(summary)).toEqual([]);
-  });
-
-  it('a DexAdapter that returns a pool ref behaves the same way', async () => {
-    const summary = await createPoolScanner({
-      config,
-      provider: fakeProvider({ pools: [] }),
-      dexAdapters: [
-        {
-          dex: DEX_IDS.PANCAKESWAP_V3,
-          chainId: 56,
-          supportsAtomicBuild: true,
-          assertWhitelisted: () => undefined,
-          getPool: async (token0, token1, feeTier) => ({
-            chainId: 56,
-            dex: DEX_IDS.PANCAKESWAP_V3,
-            poolAddress: UNISWAP_POOL,
-            poolId: poolIdFor(56, DEX_IDS.PANCAKESWAP_V3, UNISWAP_POOL),
-            token0,
-            token1,
-            feeTier,
-            tickSpacing: 1,
-          }),
-          getPoolPrice: async () => {
-            throw new Error('not used');
-          },
-          getLiquidity: async () => 0n,
-          getTick: async () => 0,
-          quoteSwap: async () => {
-            throw new Error('not used');
-          },
-          executeSwap: async () => {
-            throw new Error('not used');
-          },
-          addLiquidity: async () => {
-            throw new Error('not used');
-          },
-          removeLiquidity: async () => {
-            throw new Error('not used');
-          },
-          collectFees: async () => {
-            throw new Error('not used');
-          },
-          getPosition: async () => null,
-        },
-      ],
-    }).scan();
-
-    const pancake = summary.probes.filter((probe) => probe.dex === DEX_IDS.PANCAKESWAP_V3);
-    expect(pancake.every((probe) => probe.existence === POOL_EXISTENCE.FOUND)).toBe(true);
-    expect(pancake.every((probe) => probe.evidence === POOL_EXISTENCE_EVIDENCE.ONCHAIN_FACTORY)).toBe(true);
-    // The Uniswap side has no adapter and no raw probe, so it stays unverifiable — not absent.
-    const uniswap = summary.probes.filter((probe) => probe.dex === DEX_IDS.UNISWAP_V3);
-    expect(uniswap.every((probe) => probe.existence === POOL_EXISTENCE.UNVERIFIED)).toBe(true);
+    expect(summary.probes.some((probe) => probe.existence === POOL_EXISTENCE.FOUND)).toBe(false);
+    expect(summary.pools).toEqual([]);
   });
 });
+
 
 /* ------------------------------------------------------------------ *
  * D2 — the filter refuses a snapshot whose on-chain state was never read

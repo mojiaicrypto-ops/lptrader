@@ -88,12 +88,7 @@ const provider = new LayeredPoolDataProvider({
   onchain,
   referencePrice: createReferencePriceProvider({ chainId: 56, registry: config.whitelist.registry }),
 });
-const scanner = createPoolScanner({
-  config,
-  provider,
-  dexAdapters: adapters,
-  findOnchainPool: async (params) => onchain.findPool(params),
-});
+const scanner = createPoolScanner({ config, provider });
 const scan = await scanner.scan();
 out('scan complete', scan.complete);
 for (const blocker of scan.blockers) out('  blocker', blocker);

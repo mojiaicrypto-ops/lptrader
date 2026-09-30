@@ -276,7 +276,9 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
     referencePrice,
     dex,
     provider: options.provider,
-    scanner: new PoolScanner({ config, provider: options.provider, dexAdapters: adapters }),
+    // Module 1 is HTTP-only (architecture §3): the scanner gets no adapters, because it must not call
+    // the chain. On-chain pool reading belongs to module 2.
+    scanner: new PoolScanner({ config, provider: options.provider }),
     monitor,
     notifier,
     approvals,
