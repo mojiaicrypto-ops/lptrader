@@ -548,33 +548,66 @@ npm run dry-run:build -- <你的LP金额>         # ★ 建仓预演：真建仓
 
 ---
 
-### 阶段 4 · 初始化签名钱包（**从这里开始碰真钱**）
+### 阶段 4 · 创建签名钱包（**从这里开始碰真钱**）
+
+**两条命令，按你的来源选一条：**
+
+| 你的情况 | 用哪条 | 你要提供什么 |
+|---|---|---|
+| **还没有钱包，想要一个新的** | `npm run keystore:generate` | **只需输入口令** —— 私钥由程序在本地生成 |
+| 已有钱包（硬件钱包/别处导出的私钥） | `npm run keystore:init` | 粘贴你的私钥 + 设置口令 |
+
+#### 推荐：让程序生成（你只输口令）
 
 ```bash
-npm run keystore:init
+npm run keystore:generate
 ```
 
-交互流程（输入**不会回显**）：
+交互流程（**口令不回显；私钥全程不显示**）：
 
 ```text
-Private key (0x + 64 hex, hidden):        ← 粘贴你的私钥（0x + 64 位十六进制）
-Passphrase (hidden):                      ← 设置口令，至少 12 字符
-Repeat passphrase  :                      ← 再输一遍
+Passphrase for the encrypted keystore (hidden):     ← 设置口令，至少 12 字符
+Repeat passphrase                    :             ← 再输一遍
 ```
 
 成功后打印：
 
 ```text
-Keystore created and verified.
+Wallet generated, encrypted and verified.
+
+  address : 0xaD4FAbE844BCB296f1aD01ceCbf75865aeEf9f4B     ← ★ 记下这个地址
   file    : /path/to/secrets/wallet.enc (mode 0600)
-  address : 0x70997970C51812dc3A010C7d01b50e0d17dc79C8     ← ★ 记下这个地址
 ```
 
-**先做的三件事（顺序别换）：**
+**私钥从哪里来**：`viem.generatePrivateKey()` → `node:crypto` 的 CSPRNG（操作系统熵源）。
+**无网络调用**，密钥不离开这台机器，**也不经过任何对话/日志/剪贴板** —— 这正是它比"去某个网站生成再粘贴回来"更安全的地方。
 
-1. **`chmod 600 secrets/wallet.enc`** —— 脚本已设，但确认一下
-2. **记下打印的 `address`** —— 后面验证备份要用它比对
-3. **解除 `.env` 里的注释**，让程序能找到 keystore：
+> ⚠️ **代价你必须知道**：生成后，**私钥的唯一副本就在 `wallet.enc` 里**。口令忘了 = 钱包永久丢失。
+> 所以脚本最后会要求你做备份（下方第 3 步）。
+
+#### 备选：导入已有私钥
+
+```bash
+npm run keystore:init
+```
+
+```text
+Private key (0x + 64 hex, hidden):        ← 粘贴你的私钥
+Passphrase (hidden):                      ← 设置口令
+Repeat passphrase  :
+```
+
+**先做的四件事（顺序别换）：**
+
+1. **记下打印的 `address`** —— 你要往它转钱，后面验证备份也要用它比对
+2. **`chmod 600 secrets/wallet.enc`** —— 脚本已设，但确认一下
+3. **备份私钥**（生成器不打印私钥，所以要显式导出一次）：
+
+```bash
+npm run keystore:verify -- --export    # 打印私钥 → 抄纸两份 / 存密码管理器 → 清屏
+```
+
+4. **解除 `.env` 里的注释**，让程序能找到 keystore：
 
 ```bash
 # 编辑 .env，把这行的 # 去掉
@@ -605,11 +638,10 @@ npm run dev
 - **独立钱包**，只放策略允许亏掉的钱；别用主钱包
 - 钱包里要有 **USDT 或 USDC**（建仓用）+ **少量 BNB**（gas，几美分足够）
 
-**备份（做完立刻做，别拖）：**
+**验证备份可用**（第 3 步之后）：
 
 ```bash
-npm run keystore:verify -- --export     # 打印私钥 → 抄到纸上两份 / 存密码管理器 → 清屏
-npm run keystore:verify                 # 只打印地址 → 与上面记下的 address 比对
+npm run keystore:verify                 # 只打印地址 —— 必须与上面记下的 address 一致
 ```
 
 **地址一致才算备份有效。** 完整做法与销毁-恢复演练见 **§5.5**。
@@ -676,7 +708,7 @@ npm run dev
 | 1 安装自检 | — | — | — | 验证仓库完整 | 依赖没装 |
 | 2 建配置 | — | — | — | 自检配置 | `initial_strategy_capital_usd` 没改 |
 | 3 只读验证 | — | — | — | 看市场、建仓预演 | RPC 不通 / 数据源限流 |
-| 4 初始化钱包 | ✅ | — | — | 生成 keystore、备份 | **`KEYSTORE_PATH` 设了但文件不在** |
+| 4 创建钱包 | 生成时不需要 | — | — | 生成/导入 keystore、备份 | **`KEYSTORE_PATH` 设了但文件不在** |
 | 5 接 TG | ✅ | — | — | 开启确认门 | 忘了给 bot 发消息 / 两处开关没改 |
 | 6 小额实盘 | ✅ | ✅ | ✅ | 真正建仓 | 白名单为空 / 池不合格 / 超过比例 |
 
@@ -685,7 +717,7 @@ npm run dev
 | 报错 / 现象 | 原因 | 修法 |
 |---|---|---|
 | `ERR_NO_TYPESCRIPT` | Node 构建无 TS 支持 | 阶段 0 |
-| `cannot read keystore file ... ENOENT` | 设了 `KEYSTORE_PATH` 但文件不存在 | `npm run keystore:init`，或注释掉该变量退回只读 |
+| `cannot read keystore file ... ENOENT` | 设了 `KEYSTORE_PATH` 但文件不存在 | `npm run keystore:generate`（或 `init`），或注释掉该变量退回只读 |
 | `keystore: not configured` | 正常（未创建钱包） | 无 —— 阶段 4 才需要 |
 | `telegram: DISABLED` | 未配通道 | 阶段 5 |
 | 建仓一直不发生 | 大多是 TG 未配 | `npm run telegram:check` |
@@ -830,7 +862,10 @@ npm run dry-run:build -- <LP金额>   # ★ 建仓预演
 npm run telegram:check
 
 # 私钥（开始碰真钱）
-npm run keystore:init        # --force 覆盖已有
+npm run keystore:generate    # 新建钱包，只需输入口令
+npm run keystore:init        # 导入已有私钥
+npm run keystore:verify      # 验证备份可用（只打印地址）
+npm run keystore:verify -- --export   # 导出私钥做备份（敏感）
 
 # 运行
 npm run dev                  # 前台
@@ -1055,9 +1090,28 @@ sqlite3 data/lptrader.db "select timestamp, action, result, reason from decision
 
 ---
 
-## 9. 私钥备份（**最重要的维护动作**）
+## 9. 创建钱包与私钥备份（**最重要的维护动作**）
 
-一句话：**只备份 `secrets/wallet.enc` 是不够的** —— 口令不在任何文件里，口令一忘文件就是废纸。所以要额外抄下私钥本身。
+**还没有钱包 → 让程序生成，你只输口令：**
+
+```bash
+npm run keystore:generate
+```
+
+私钥由 `node:crypto` 的 CSPRNG 在**本机生成、无网络、全程不显示**；你只需要设一个口令（≥12 字符）。
+成功后打印 `address` —— **那就是你要转钱的地址**。
+
+**已有私钥（如硬件钱包导出）→ 导入：**
+
+```bash
+npm run keystore:init
+```
+
+> ⚠️ **生成方式的代价**：私钥唯一的副本就在 `wallet.enc` 里，口令忘了就永久丢失。
+> **生成完必须立刻备份**（就是下面这段）。
+
+
+一句话：**只备份 `secrets/wallet.enc` 是不够的** —— 口令不在任何文件里，口令一忘文件就是废纸。所以要额外抄下私钥本身。（用 `keystore:generate` 生成的钱包尤其要：它的私钥除了这个文件之外**没有任何副本**。）
 
 ```bash
 npm run keystore:verify -- --export    # 输入口令 → 手打 EXPORT 确认 → 打印私钥
@@ -1118,6 +1172,8 @@ npm run dev                          # 配置/白名单自检
 npm run telegram:check               # 审批通道是否可用
 
 # 私钥
+npm run keystore:generate            # 新建钱包（只需输入口令）
+npm run keystore:init                # 导入已有私钥
 npm run keystore:verify              # ★ 验证备份可用（只打印地址）
 npm run keystore:verify -- --export  # 导出私钥做备份（敏感）
 

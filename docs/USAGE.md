@@ -215,9 +215,28 @@ sqlite3 data/lptrader.db "select timestamp, action, result, reason from decision
 
 ---
 
-## 9. 私钥备份（**最重要的维护动作**）
+## 9. 创建钱包与私钥备份（**最重要的维护动作**）
 
-一句话：**只备份 `secrets/wallet.enc` 是不够的** —— 口令不在任何文件里，口令一忘文件就是废纸。所以要额外抄下私钥本身。
+**还没有钱包 → 让程序生成，你只输口令：**
+
+```bash
+npm run keystore:generate
+```
+
+私钥由 `node:crypto` 的 CSPRNG 在**本机生成、无网络、全程不显示**；你只需要设一个口令（≥12 字符）。
+成功后打印 `address` —— **那就是你要转钱的地址**。
+
+**已有私钥（如硬件钱包导出）→ 导入：**
+
+```bash
+npm run keystore:init
+```
+
+> ⚠️ **生成方式的代价**：私钥唯一的副本就在 `wallet.enc` 里，口令忘了就永久丢失。
+> **生成完必须立刻备份**（就是下面这段）。
+
+
+一句话：**只备份 `secrets/wallet.enc` 是不够的** —— 口令不在任何文件里，口令一忘文件就是废纸。所以要额外抄下私钥本身。（用 `keystore:generate` 生成的钱包尤其要：它的私钥除了这个文件之外**没有任何副本**。）
 
 ```bash
 npm run keystore:verify -- --export    # 输入口令 → 手打 EXPORT 确认 → 打印私钥
@@ -278,6 +297,8 @@ npm run dev                          # 配置/白名单自检
 npm run telegram:check               # 审批通道是否可用
 
 # 私钥
+npm run keystore:generate            # 新建钱包（只需输入口令）
+npm run keystore:init                # 导入已有私钥
 npm run keystore:verify              # ★ 验证备份可用（只打印地址）
 npm run keystore:verify -- --export  # 导出私钥做备份（敏感）
 

@@ -18,7 +18,14 @@
  */
 import { mkdir, chmod, stat } from 'node:fs/promises';
 import path from 'node:path';
-import { createInterface } from 'node:readline';
+import {
+  MIN_PASSPHRASE_LENGTH,
+  SECRETS_DIR_MODE,
+  SECRETS_FILE_MODE,
+  fail,
+  fileExists,
+  promptSecret,
+} from './lib/prompt.ts';
 import {
   DEFAULT_KEYSTORE_CHAIN_ID,
   decryptPrivateKey,
@@ -30,105 +37,6 @@ import { privateKeyToAccount } from 'viem/accounts';
 import type { Hex } from '../src/types/primitives.ts';
 
 const DEFAULT_KEYSTORE_PATH = path.join('secrets', 'wallet.enc');
-const MIN_PASSPHRASE_LENGTH = 12;
-/** Directory mode for the secrets folder; the file itself is 0600. */
-const SECRETS_DIR_MODE = 0o700;
-const SECRETS_FILE_MODE = 0o600;
-
-/**
- * Piped (non-TTY) input is drained ONCE into a queue. Creating a fresh readline per prompt does not
- * work: closing an interface consumes the remaining buffered chunk, so the second prompt would see
- * end-of-stream instead of the next line. Echo suppression is unnecessary here because a pipe does
- * not echo.
- */
-const pipedLines: string[] = [];
-let pipedLinesLoaded = false;
-
-async function ensurePipedLines(): Promise<void> {
-  if (pipedLinesLoaded) return;
-  pipedLinesLoaded = true;
-  const rl = createInterface({ input: process.stdin, terminal: false });
-  for await (const line of rl) {
-    pipedLines.push(line);
-  }
-}
-
-async function readLineFromPipe(prompt: string): Promise<string> {
-  process.stdout.write(prompt);
-  await ensurePipedLines();
-  const next = pipedLines.shift();
-  if (next === undefined) {
-    throw new Error('stdin closed before a value was provided');
-  }
-  return next;
-}
-
-/** Read a secret from a TTY with echo disabled (raw mode; no private readline API involved). */
-function readHiddenFromTty(prompt: string): Promise<string> {
-  const { promise, resolve } = Promise.withResolvers<string>();
-  const stdin = process.stdin;
-  process.stdout.write(prompt);
-  const previousRaw = stdin.isRaw === true;
-  stdin.setRawMode(true);
-  stdin.resume();
-  const decoder = new TextDecoder('utf-8');
-  let value = '';
-  let done = false;
-
-  const cleanup = (): void => {
-    if (done) return;
-    done = true;
-    stdin.off('data', onData);
-    stdin.setRawMode(previousRaw);
-    stdin.pause();
-  };
-
-  const onData = (chunk: Buffer): void => {
-    const text = decoder.decode(chunk, { stream: true });
-    for (const char of text) {
-      if (char === '\u0003') {
-        // Ctrl-C
-        cleanup();
-        process.stdout.write('\n');
-        process.exit(130);
-      } else if (char === '\r' || char === '\n') {
-        cleanup();
-        process.stdout.write('\n');
-        resolve(value);
-        return;
-      } else if (char === '\u007f' || char === '\b') {
-        value = [...value].slice(0, -1).join('');
-      } else if (char >= ' ') {
-        value += char;
-      }
-    }
-  };
-
-  stdin.on('data', onData);
-  return promise;
-}
-
-/** Prompt without echoing the answer (TTY) or read a piped line (non-TTY). */
-async function promptSecret(prompt: string): Promise<string> {
-  if (process.stdin.isTTY === true) {
-    return readHiddenFromTty(prompt);
-  }
-  return readLineFromPipe(prompt);
-}
-
-function fail(message: string): never {
-  process.stderr.write(`\nERROR: ${message}\n`);
-  process.exit(1);
-}
-
-async function fileExists(filePath: string): Promise<boolean> {
-  try {
-    await stat(filePath);
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 async function main(): Promise<void> {
   const force = process.argv.includes('--force');

@@ -28,8 +28,8 @@
  *
  * Run from the repository root. Use the same `KEYSTORE_PATH` / `KEYSTORE_CHAIN_ID` as the bot.
  */
-import { createInterface } from 'node:readline';
 import path from 'node:path';
+import { fail, promptSecret, promptVisible } from './lib/prompt.ts';
 import { privateKeyToAccount } from 'viem/accounts';
 import {
   DEFAULT_KEYSTORE_CHAIN_ID,
@@ -42,87 +42,6 @@ const DEFAULT_KEYSTORE_PATH = path.join('secrets', 'wallet.enc');
 
 /** Typed verbatim to unlock `--export`. Not a passphrase check — a "are you somewhere private" check. */
 const EXPORT_CONFIRMATION = 'EXPORT';
-
-const pipedLines: string[] = [];
-let pipedLinesLoaded = false;
-
-/**
- * Piped input is drained ONCE into a queue: creating a fresh readline per prompt loses buffered lines
- * when more than one prompt is answered from a pipe.
- */
-async function ensurePipedLines(): Promise<void> {
-  if (pipedLinesLoaded) return;
-  pipedLinesLoaded = true;
-  const rl = createInterface({ input: process.stdin });
-  for await (const line of rl) pipedLines.push(line);
-  rl.close();
-}
-
-async function promptHidden(prompt: string): Promise<string> {
-  if (!process.stdin.isTTY) {
-    await ensurePipedLines();
-    const line = pipedLines.shift();
-    if (line === undefined) throw new Error('no more piped input for the passphrase prompt');
-    return line;
-  }
-  process.stdout.write(prompt);
-  return new Promise<string>((resolve, reject) => {
-    const stdin = process.stdin;
-    const wasRaw = stdin.isRaw;
-    stdin.setRawMode(true);
-    stdin.resume();
-    let value = '';
-    const onData = (chunk: Buffer | string): void => {
-      const text = chunk.toString('utf8');
-      for (const char of text) {
-        if (char === '\u0003') {
-          cleanup();
-          reject(new Error('interrupted'));
-          return;
-        }
-        if (char === '\r' || char === '\n') {
-          cleanup();
-          process.stdout.write('\n');
-          resolve(value);
-          return;
-        }
-        if (char === '\u007f' || char === '\b') {
-          value = value.slice(0, -1);
-          continue;
-        }
-        value += char;
-      }
-    };
-    const cleanup = (): void => {
-      stdin.removeListener('data', onData);
-      stdin.setRawMode(wasRaw ?? false);
-      stdin.pause();
-    };
-    stdin.on('data', onData);
-  });
-}
-
-async function promptVisible(prompt: string): Promise<string> {
-  if (!process.stdin.isTTY) {
-    await ensurePipedLines();
-    const line = pipedLines.shift();
-    if (line === undefined) throw new Error('no more piped input for the confirmation prompt');
-    return line;
-  }
-  process.stdout.write(prompt);
-  return new Promise<string>((resolve) => {
-    const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: false });
-    rl.once('line', (line) => {
-      rl.close();
-      resolve(line);
-    });
-  });
-}
-
-function fail(message: string): never {
-  process.stderr.write(`\nFAILED: ${message}\n`);
-  process.exit(1);
-}
 
 async function main(): Promise<void> {
   const exportMode = process.argv.includes('--export');
@@ -182,7 +101,7 @@ async function main(): Promise<void> {
     }
   }
 
-  const passphrase = await promptHidden('Passphrase (hidden): ');
+  const passphrase = await promptSecret('Passphrase (hidden): ');
   if (passphrase.length === 0) {
     fail('no passphrase supplied');
   }

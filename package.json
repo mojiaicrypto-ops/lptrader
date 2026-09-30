@@ -19,7 +19,8 @@
     "smoke:scan": "node --experimental-strip-types --env-file-if-exists=.env scripts/smoke-scan.ts",
     "smoke:quote": "node --experimental-strip-types --env-file-if-exists=.env scripts/smoke-quote.ts",
     "dry-run:build": "node --experimental-strip-types --env-file-if-exists=.env scripts/dry-run-build.ts",
-    "keystore:verify": "node --experimental-strip-types --env-file-if-exists=.env scripts/keystore-verify.ts"
+    "keystore:verify": "node --experimental-strip-types --env-file-if-exists=.env scripts/keystore-verify.ts",
+    "keystore:generate": "node --experimental-strip-types --env-file-if-exists=.env scripts/keystore-generate.ts"
   },
   "dependencies": {
     "@pancakeswap/chains": "0.10.0",
