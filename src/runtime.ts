@@ -325,6 +325,10 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
       };
     },
     tvlSeries: (poolId) => poolSnapshots.tvlSeries(poolId),
+    // §pre-funding: "has this strategy ever been funded?" answered from evidence rather than from intent.
+    // ANY position row (open or closed) proves capital was committed at some point; an empty table means
+    // the operator has not started. This is what separates "idle" from "wiped out" at NAV 0.
+    hasCommittedCapital: () => stateStore.listPositions({ chainId }).length > 0,
     // §58 conditions come from outside the pool data (a paused contract, a suspended issuer). Nothing
     // observes them yet, so the domain is reported as a missing input rather than as "no emergency".
     emergencyEvents: () => [],

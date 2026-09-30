@@ -88,6 +88,21 @@ export interface RiskWiringDeps {
   /** §58 conditions observed outside the pool data (contract paused, issuer suspended, …). */
   readonly emergencyEvents?: () => readonly EmergencyEvent[];
   /**
+   * Has any capital ever been committed to this strategy?
+   *
+   * Needed to tell two situations apart that otherwise look identical to §66:
+   * ```text
+   * NAV == 0, nothing ever deposited  → the strategy is idle (a fresh install) — NOT a drawdown
+   * NAV == 0, capital was committed   → genuinely wiped out — MUST halt
+   * ```
+   * Without this, an unfunded wallet satisfies `0 <= initialNAV × 0.85` literally and the bot reports
+   * `GLOBAL_RISK_OFF` at `critical` on day zero. Found in the Step 4 live regression.
+   *
+   * Defaults to "funded" when absent, so the safe reading (do evaluate the line) is the one you get if a
+   * caller forgets: an unnecessary alert costs a glance, a suppressed halt costs the account.
+   */
+  readonly hasCommittedCapital?: () => boolean;
+  /**
    * Derived §53 input: did the underlying stock fall, and did the reference NAV fall with it?
    * Absent ⇒ the market-decline domain is not evaluated, which the report surfaces as a missing input
    * rather than as "no decline".
@@ -130,12 +145,19 @@ export class RiskWiring {
     // The reserve-side checks still run so a drawdown is noticed even while flat.
     const valuation = await this.value(open, options, at);
 
+    // §pre-funding: an untouched wallet is idle, not breached. Distinguished by whether capital was ever
+    // committed, because `initialNAV` is a CONFIGURED intent figure and cannot answer that question.
+    const funded = this.deps.hasCommittedCapital?.() ?? true;
+    const unfunded = !funded && valuation.snapshot.totalNAV === 0;
+
     const tvlSeries = open === null ? null : this.deps.tvlSeries(open.pool.poolId);
 
     const report = evaluateRisk(
       {
         asOf: at,
-        drawdown: valuation.drawdown,
+        // Suppressed ONLY for the empty, never-funded case. A funded strategy at zero NAV still gets the
+        // verdict — that one is a real wipe-out and must halt.
+        drawdown: unfunded ? null : valuation.drawdown,
         reserveRatio: valuation.snapshot.reserveRatio,
         range:
           open === null || !Number.isFinite(open.pool.currentPrice.value)
@@ -156,9 +178,29 @@ export class RiskWiring {
       this.deps.config,
     );
 
+    // When the drawdown domain is suppressed, say so: an operator seeing no verdict must be able to tell
+    // "idle" from "the check is broken".
+    // `evaluateRisk` already records `drawdown` as a missing input when it is null, so this only adds the
+    // REASON. Pushing the name again produced `missingInputs: [..., 'drawdown', 'drawdown']`, which reads
+    // as two separate gaps and would make any "is this domain missing?" check unreliable.
+    const withReason = unfunded
+      ? {
+          ...report,
+          alertSeverity:
+            // A fresh, unfunded wallet must not page at `critical`. The reserve is 0% only because there is
+            // no money yet — an alert that fires on every install is an alert nobody reads.
+            report.alertSeverity === 'critical' ? ('info' as const) : report.alertSeverity,
+          reasons: [
+            `drawdown: the strategy has not been funded yet (NAV 0 and no capital committed), so there is ` +
+              'no drawdown to measure — this is idle, not a loss',
+            ...report.reasons,
+          ],
+        }
+      : report;
+
     return {
-      report,
-      plan: planFor(report, open !== null),
+      report: withReason,
+      plan: planFor(withReason, open !== null),
       ...(valuation.snapshot.totalNAV === undefined ? {} : { nav: valuation.snapshot.totalNAV }),
       ...(valuation.problems.length === 0 ? {} : { valuationProblems: valuation.problems }),
     };

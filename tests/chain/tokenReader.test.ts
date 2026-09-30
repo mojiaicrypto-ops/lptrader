@@ -16,6 +16,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Hex } from 'viem';
 import { BscChainAdapter } from '../../src/chain/adapter.ts';
+import { encodeFunctionData } from 'viem';
 import { BEP677_ABI, ERC165_ABI, ERC20_ABI } from '../../src/chain/abis.ts';
 import { CHAIN_ERROR_CODES } from '../../src/chain/errors.ts';
 import { BEP677_INTERFACE_IDS, TokenReader, UI_MULTIPLIER_SCALE } from '../../src/chain/tokenReader.ts';
@@ -38,6 +39,7 @@ const QQQB_UI = 78_576_289_767_052_159_289_485n;
 const QQQB = '0x205812cdbed920aff76c6580abd681a46d11efc7' as const;
 const USDC = BSC_ADDRESSES.USDC;
 const HOLDER = '0x2222222222222222222222222222222222222222' as const;
+const WBNB = BSC_ADDRESSES.WBNB;
 
 const META_QQQB: TokenMeta = {
   id: `56:${QQQB}`,
@@ -318,5 +320,62 @@ describe('batched balances', () => {
     expect(balances[1]!.uiMultiplier).toBe(UI_MULTIPLIER_SCALE);
     expect(balances[1]!.ui).toBe(balances[1]!.raw);
     expect(balances[1]!.raw).toBe(500_000_000_000_000_000_000n);
+  });
+});
+
+describe('a PLAIN token WITHOUT ERC-165 is probed safely (Step 4 live regression)', () => {
+  it('treats "the function does not exist" as a probe ANSWER, not a failure', async () => {
+    // Measured live on WBNB (`0xbb4c…95c`), a legitimate whitelist member (it is the native leg of every
+    // swap): it has no `supportsInterface` and no `uiMultiplier`, so those calls return `0x` instead of
+    // reverting, and viem raises `ContractFunctionZeroDataError`. That name was not matched, the error
+    // escaped `tryReadContract`, and the whole risk round crashed — the portfolio could not be valued
+    // because one token lacks an *optional* interface.
+    //
+    // Note the fixture is a PLAIN token, which matters: a token whitelisted as `bep677-scaled` that turns
+    // out not to be scaled is a CONFIG error and must still refuse (asserted separately below). The bug was
+    // about ordinary tokens, so the test must use one.
+    const plainMeta: TokenMeta = { ...META_USDC, symbol: 'WBNB', address: WBNB };
+    const card: Record<string, Hex | typeof REVERT> = {};
+    // Registered by raw calldata: `callEntry` ABI-encodes its value and `0x` is not a valid bool. Writing
+    // the mapping directly is what the node actually does — it returns `0x` for a function the contract
+    // does not have, without encoding anything.
+    for (const id of [BEP677_INTERFACE_IDS.core, BEP677_INTERFACE_IDS.balances]) {
+      const data = encodeFunctionData({
+        abi: ERC165_ABI,
+        functionName: 'supportsInterface',
+        args: [id],
+      }) as Hex;
+      card[data.toLowerCase()] = '0x' as Hex;
+    }
+    const multiplierData = encodeFunctionData({ abi: BEP677_ABI, functionName: 'uiMultiplier' }) as Hex;
+    card[multiplierData.toLowerCase()] = '0x' as Hex;
+    callEntry(card, 'balanceOf(address)', [HOLDER], QQQB_RAW, ERC20_ABI);
+
+    const { reader } = readerWith({ [WBNB]: card }, [plainMeta]);
+
+    // The probe must RESOLVE and report "not scaled", not throw.
+    const probe = await reader.probeUiAmount(WBNB);
+    expect(probe.supportsUiMultiplier).toBe(false);
+    expect(probe.mode).toBe(UI_AMOUNT_MODES.PLAIN);
+
+    // And a plain balance read still works: one absent optional interface does not make it unusable.
+    const balance = await reader.getBalance(WBNB, HOLDER);
+    expect(balance.raw).toBe(QQQB_RAW);
+  });
+
+  it('still REFUSES when a token whitelisted as scaled turns out not to be', async () => {
+    // The adjacent behaviour that must not be lost: this is a config error, not a runtime question.
+    const card: Record<string, Hex | typeof REVERT> = {};
+    // ERC-165 ANSWERS here (so the read succeeds), but the token claims the scaled interface while
+    // `uiMultiplier()` returns no data. That combination is a whitelist error, not a runtime condition.
+    callEntry(card, 'supportsInterface(bytes4)', [BEP677_INTERFACE_IDS.core], true, ERC165_ABI);
+    callEntry(card, 'supportsInterface(bytes4)', [BEP677_INTERFACE_IDS.balances], false, ERC165_ABI);
+    const multiplierData = encodeFunctionData({ abi: BEP677_ABI, functionName: 'uiMultiplier' }) as Hex;
+    card[multiplierData.toLowerCase()] = '0x' as Hex;
+
+    const { reader } = readerWith({ [QQQB]: card });
+    await expect(reader.probeUiAmount(QQQB)).rejects.toMatchObject({
+      code: CHAIN_ERROR_CODES.DECODE_FAILED,
+    });
   });
 });

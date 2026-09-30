@@ -693,12 +693,37 @@ function sleep(ms: number): Promise<void> {
  * The distinction is load-bearing for probing: a revert means "this contract has no such function"
  * (a legitimate answer), while an unreachable node means "unknown" and must propagate.
  */
+/**
+ * Does this error mean "the contract answered, and the answer is: no such function"?
+ *
+ * Three distinct viem errors all mean that, and ALL must be treated as a probe answer rather than a
+ * failure — the caller of `tryReadContract` is asking "does this contract implement X?", and "no" is a
+ * valid answer:
+ *
+ * | error                                   | what happened on chain                        |
+ * |-----------------------------------------|-----------------------------------------------|
+ * | `ExecutionRevertedError`                | the function exists and reverted              |
+ * | `ContractFunctionRevertedError`         | same, wrapped by the contract layer           |
+ * | `ContractFunctionZeroDataError`         | the function does NOT exist — the call returns|
+ * |                                         | `0x` instead of reverting                     |
+ *
+ * The third is the one that bit us, measured live: **WBNB** (`0xbb4c…95c`) has no `supportsInterface`,
+ * so probing it for ERC-165 returned `0x` and threw `ContractFunctionZeroDataError`. Because that name
+ * was not matched, the error propagated out of `tryReadContract`, and an ordinary BEP-677 probe crashed
+ * the whole risk round — the portfolio could not be valued because one token does not implement an
+ * *optional* interface. Treating "no such function" as a hard failure also contradicts the intent of a
+ * `try*` helper: its whole purpose is to answer a question, not to assert a capability.
+ */
 function classifyRevert(error: unknown): boolean {
   let cursor: unknown = error;
   for (let depth = 0; cursor !== undefined && cursor !== null && depth < 8; depth += 1) {
     if (typeof cursor === 'object') {
       const name = (cursor as { name?: unknown }).name;
-      if (name === 'ExecutionRevertedError' || name === 'ContractFunctionRevertedError') {
+      if (
+        name === 'ExecutionRevertedError' ||
+        name === 'ContractFunctionRevertedError' ||
+        name === 'ContractFunctionZeroDataError'
+      ) {
         return true;
       }
     }
