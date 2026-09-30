@@ -388,6 +388,15 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
 }
 
 /**
+ * How long the pool time series is kept (§3.3).
+ *
+ * Long enough for every window the risk rules ask about (24h for §59, 7d/30d for §90 reporting) and short
+ * enough that the table cannot grow without bound on a long-running server. At the observed scan size this
+ * is ~1.7 MiB retained versus ~20 MiB/year unpruned.
+ */
+export const POOL_SNAPSHOT_RETENTION_DAYS = 30;
+
+/**
  * §89 cadences, derived from `config.monitor`.
  *
  * Three beats, each with one job (architecture §2/§5):
@@ -442,6 +451,13 @@ export function buildCadences(runtime: StrategyRuntime): readonly SchedulerCaden
               // diagnostics while `tvlSeries` excludes it, so it can never become a false baseline.
               stale: pool.tvlUSD.stale,
             })),
+          );
+
+          // Retention. `pruneBefore` existed but nothing called it, so the table grew without bound — the
+          // "runs fine for a year, then doesn't" shape. 30 days is the longest window any §59/§90 calculation
+          // needs, and pruning here (rather than on a cadence of its own) keeps it tied to the writer.
+          runtime.poolSnapshots.pruneBefore(
+            new Date(Date.parse(at) - POOL_SNAPSHOT_RETENTION_DAYS * 86_400_000).toISOString(),
           );
         } catch (error) {
           await runtime.notifier.send(
