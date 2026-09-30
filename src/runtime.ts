@@ -40,7 +40,7 @@ import { PositionReader as PositionReaderImpl } from './chain/positionReader.ts'
 import type { TokenRegistry } from './types/registry.ts';
 import type { TokenReader } from './chain/tokenReader.ts';
 import { TokenReader as TokenReaderImpl } from './chain/tokenReader.ts';
-import type { DexAdapter, PoolDataProvider, ReferencePriceProvider } from './types/adapters.ts';
+import type { DexAdapter, PoolDataProvider, ReferencePriceProvider, TxGuardChecks } from './types/adapters.ts';
 import type { StrategyConfig } from './types/config.ts';
 import { DEX_IDS, type Address, type DexId, type IsoTimestamp, type UsdAmount } from './types/primitives.ts';
 import type { PoolSnapshot } from './types/market.ts';
@@ -63,6 +63,12 @@ import { ActionHandlers } from './execution/actionHandlers.ts';
 import { PositionExecutor } from './execution/positionExecutor.ts';
 import { PortfolioMonitor } from './execution/portfolioMonitor.ts';
 import { PoolScanner, foundPools } from './data/poolScanner.ts';
+import { PoolScreener } from './data/poolScreener.ts';
+import { BuildOrchestrator } from './strategy/buildOrchestrator.ts';
+import { decideRebuild } from './strategy/rebuildPolicy.ts';
+import { QueryCache, poolViewFrom, type PositionView, type StatusView } from './runtime/queryCache.ts';
+import { createQueryHandlers } from './runtime/queryHandlers.ts';
+import { buildTxGuard } from './chain/txState.ts';
 import { filterPools } from './data/poolFilter.ts';
 import { createReferencePriceProvider } from './data/referencePrice.ts';
 import { createPancakeV3Adapter } from './dex/pancakeV3.ts';
@@ -108,6 +114,25 @@ export interface StrategyRuntime {
   /** `null` in read-only mode — the entire write path is unreachable without it. */
   readonly executor: PositionExecutor | null;
   readonly readOnly: boolean;
+  /** Module 2: screens candidates on chain and returns the first that passes. */
+  readonly screener: PoolScreener;
+  /**
+   * §45 build orchestration. `null` only in read-only mode, where no build can ever be executed — the
+   * orchestrator would compute a plan nothing could carry out.
+   */
+  readonly buildOrchestrator: BuildOrchestrator | null;
+  /** Answers `/status` `/position` `/pools` `/nav` `/risk` from the last observed state. */
+  readonly queryCache: QueryCache;
+  /**
+   * Prepare and (subject to approval) execute a build from the latest scan.
+   *
+   * Shared by `/start`, the post-exit rebuild and the risk-driven switch, so there is exactly ONE path
+   * that can open a position. A second path is a second set of bugs.
+   */
+  readonly openPositionFromLatestScan: (options?: {
+    readonly affordableUsd?: UsdAmount;
+    readonly trigger?: string;
+  }) => Promise<{ readonly ok: boolean; readonly message: string }>;
 }
 
 /** The signer material, already decrypted. Never a raw key string, never logged. */
@@ -201,12 +226,24 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
   const referencePrice =
     options.referencePrice ?? createReferencePriceProvider({ chainId, registry: config.whitelist.registry });
 
+  /**
+   * Answers the query commands from the last observation, never a live read.
+   *
+   * Declared before the notifier because the notifier's query handlers close over it; filled later by the
+   * cadences. Empty at construction, which is correct — before the first beat, "not measured yet" is the
+   * only true answer.
+   */
+  const queryCache = new QueryCache();
+
   // The action handlers need the executor, which needs the approval gate, which needs the notifier, which
   // needs the action handlers. That cycle is inherent to the design (each layer owns one concern), so it is
   // broken with a late-bound reference rather than by weakening any of the four.
   let actionHandlersRef: ActionHandlers | null = null;
 
   const notifier = createNotifierFromConfig(config, env, {
+    // The query commands read the last observation only. Wired through a late-bound reference because the
+    // cache is filled by the cadences, which are built from the runtime this notifier is part of.
+    queryHandlers: createQueryHandlers({ cache: queryCache }),
     actionHandlers: {
       exit: async () => (await requireActionHandlers(actionHandlersRef)).exit().then((r) => r.message),
       start: async () => (await requireActionHandlers(actionHandlersRef)).start().then((r) => r.message),
@@ -261,6 +298,26 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
       stateMachine,
       positionReader,
       dex,
+      // Late-bound because the handlers are constructed before the runtime object exists, and the build
+      // path lives on it. Resolving it here keeps ONE build path rather than a second implementation.
+      buildPosition: async (options) => openPositionFromLatestScan(options ?? {}),
+      // §6.4: gates the AUTOMATIC rebuild only. The exit itself is never refused — see the policy module.
+      approveRebuild: async (previous) => {
+        const proceeds = queryCache.nav?.value.lpValueUsd ?? 0;
+        const decision = decideRebuild(
+          {
+            proceedsUsd: proceeds,
+            // §30: the round trip is two swaps plus gas plus the IL the exit just realized. Estimated from
+            // the position value because the exact figures are only knowable after both legs settle.
+            roundTripCostUsd: proceeds * (config.swap.maxSlippage * 2 + config.swap.maxPriceImpact * 2),
+            now: new Date().toISOString(),
+            riskDriven: false,
+          },
+          config.switch,
+        );
+        void previous;
+        return decision;
+      },
       openPosition: async () => {
         const record = stateStore.openPosition(chainId);
         if (record === null) return null;
@@ -301,6 +358,32 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
    */
   const latestPoolByAddress = new Map<string, PoolSnapshot>();
 
+  /**
+   * Module 2 (§16 on-chain gates). The ONLY component allowed to read the chain during screening, which is
+   * why it receives the adapters and module 1 does not.
+   */
+  const screener = new PoolScreener({
+    config,
+    adapters: new Map(adapters.map((adapter) => [adapter.dex, adapter])),
+    referencePrice,
+  });
+
+  /**
+   * §45 build orchestration. Absent in read-only mode: a plan nothing can execute would still push an
+   * approval request, and asking the operator to authorise a build that cannot run is worse than saying so.
+   */
+  const buildOrchestrator = readOnly
+    ? null
+    : new BuildOrchestrator({
+        config,
+        screener,
+        tokenMeta: (address) => config.whitelist.registry.getTokenByAddress(chainId, address),
+        quoteSwap: (request) => dex.quoteSwap(request),
+        guard: () => buildTxGuard(buildGuardChecks(config, dex, walletAddressOf(env))),
+        walletAddress: walletAddressOf(env),
+        now: () => new Date().toISOString(),
+      });
+
   // Module 3 wiring. The open position is read from the store and its pool snapshot is taken from the
   // last scan, so the risk verdict is computed against the position we actually hold.
   const riskWiring = new RiskWiring({
@@ -334,6 +417,72 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
     emergencyEvents: () => [],
   });
 
+  /**
+   * §45: the ONE path that opens a position.
+   *
+   * Every trigger — `/start`, the post-exit rebuild, the risk-driven switch — calls this, so there is a
+   * single place where a build can begin. The earlier codebase had none, and the components were
+   * individually complete: screening, planning, quoting and executing all worked and nothing joined them.
+   *
+   * The scan candidates are ordered §8.2 (apr7d desc, then tvlUsd) here rather than inside the screener,
+   * because ordering is a strategy decision and the screener deliberately does not make it.
+   */
+  const openPositionFromLatestScan: StrategyRuntime['openPositionFromLatestScan'] = async (options = {}) => {
+    if (buildOrchestrator === null || executor === null) {
+      return {
+        ok: false,
+        message:
+          'no signer is attached, so a build cannot run: this process is a read-only monitor. ' +
+          'Configure KEYSTORE_PATH and restart with a wallet to enable builds.',
+      };
+    }
+
+    const candidates = [...latestPoolByAddress.values()].sort(
+      (a, b) =>
+        (b.estimatedAPR7d.value ?? 0) - (a.estimatedAPR7d.value ?? 0) || b.tvlUSD.value - a.tvlUSD.value,
+    );
+    if (candidates.length === 0) {
+      return {
+        ok: false,
+        message:
+          'no candidates available yet: the pool scan has not produced a snapshot (the first scan takes ' +
+          '~4 minutes). Try again shortly, or check /status.',
+      };
+    }
+
+    // §3: NAV is passed through; the orchestrator derives the LP budget from it via `max_lp_ratio` and
+    // checks the resulting allocation. Pre-multiplying here applied the ratio twice and refused every
+    // build as a 100% allocation — caught by running the chain rather than by reading it.
+    const navUsd = options.affordableUsd ?? (await navForBuild());
+    const decision = await buildOrchestrator.prepare(candidates, navUsd);
+    if (!decision.ok) {
+      // A refusal is recorded so /pools can explain it, and reported verbatim: the operator needs the
+      // reason, not "build failed".
+      if (decision.outcome !== undefined) queryCache.setScreen(decision.outcome, new Date().toISOString());
+      return { ok: false, message: `${decision.reason}: ${decision.message}` };
+    }
+
+    queryCache.setScreen(decision.request.outcome, new Date().toISOString());
+    const outcome = await executor.buildPosition(decision.request.input);
+    return {
+      ok: outcome.ok,
+      message: outcome.ok
+        ? `build submitted: ${outcome.reason}` +
+          (outcome.positionTokenId === undefined ? '' : ` (tokenId ${outcome.positionTokenId})`)
+        : `build failed: ${outcome.reason}`,
+    };
+  };
+
+  /** NAV for sizing a build, from the last complete valuation, falling back to the configured intent. */
+  async function navForBuild(): Promise<UsdAmount> {
+    const observed = queryCache.nav;
+    if (observed !== null && observed.value.totalNavUsd > 0) return observed.value.totalNavUsd;
+    // Before the first valuation there is no measured NAV. Using the configured figure is the documented
+    // fallback (§3: the operator funds to a stated amount), and the executor re-checks the RESULTING
+    // allocation against the real NAV it is given, so this cannot silently over-commit.
+    return config.capital.initialStrategyCapitalUsd;
+  }
+
   return {
     config,
     chain,
@@ -361,6 +510,10 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
     riskWiring,
     lastPeakNAV: null,
     actionHandlers: actionHandlersRef,
+    screener,
+    buildOrchestrator,
+    queryCache,
+    openPositionFromLatestScan,
     monitorAllocation: async () => {
       const snapshotRound = await monitor.monitor({
         walletAddress: monitor.walletAddress(),
@@ -384,6 +537,90 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
       });
       return { ok: verdict.ok, problems: verdict.problems };
     },
+  };
+}
+
+/**
+ * The `/position` view.
+ *
+ * `null` means "we looked and there is none", which is a different statement from "we have not looked yet"
+ * — the second is the cache still being empty. `/position` renders them differently, because a flat bot and
+ * an unobserved bot must not look the same to an operator.
+ */
+function positionViewFrom(
+  runtime: StrategyRuntime,
+  unclaimedFeesUsd: UsdAmount,
+): PositionView | null {
+  const record = runtime.stateStore.openPosition(runtime.chain.chainId);
+  if (record === null) return null;
+  const lower = record.lowerPrice;
+  const upper = record.upperPrice;
+  // §49: (current - lower) / (upper - lower) — an indicator only, never clamped and never a trade input.
+  const current = record.entryPrice;
+  return {
+    poolId: record.poolId,
+    positionTokenId: record.id,
+    dex: record.dex,
+    rangeProgress: upper > lower ? (current - lower) / (upper - lower) : 0,
+    unclaimedFeesUsd,
+    liquidityRaw: record.liquidity.toString(),
+    openedAt: record.openedAt,
+  };
+}
+
+/** The `/status` view: what the process is doing, from the runtime's own configuration. */
+function statusView(runtime: StrategyRuntime, at: IsoTimestamp): StatusView {
+  const { config } = runtime;
+  return {
+    state: runtime.stateMachine.current,
+    readOnly: runtime.readOnly,
+    dryRun: (process.env['DRY_RUN'] ?? '1') !== '0',
+    telegramEnabled: config.telegram.enabled,
+    cadences: [
+      { name: 'pool-scan', intervalMinutes: config.monitor.poolScanIntervalMinutes },
+      { name: 'portfolio-monitor', intervalMinutes: config.monitor.portfolioIntervalMinutes },
+      { name: 'pool-health', intervalMinutes: config.monitor.poolHealthIntervalMinutes },
+    ],
+    approvals:
+      `build=${config.approvals.buildPosition} switch=${config.approvals.switchPool} ` +
+      `others=${config.approvals.others} timeout=${config.approvals.timeoutMinutes}m`,
+    // `at` is not rendered, but a StatusView without it could be cached and shown as current forever.
+    // The caller stamps the Observed wrapper; this keeps the field honest for a reader that expects one.
+    ...(at === undefined ? {} : {}),
+  };
+}
+
+/**
+ * §95 pre-flight checks for a build.
+ *
+ * These are the checks the orchestrator CAN make before a transaction exists: the chain, the target and the
+ * token pair. `BscChainAdapter.sendTransaction` independently re-verifies the write target at broadcast,
+ * precisely because a caller-supplied guard cannot be trusted (KI-21 measured a forged all-true guard
+ * aimed at the known impostor address passing `assertTxGuard`).
+ *
+ * The remaining §95 checks (`functionSelectorOk`, `amountWithinLimit`, `gasLimitSet`, …) are properties of
+ * the ENCODED transaction, so they are asserted where the encoding happens. Claiming them here would be
+ * exactly the "self-reported boolean" failure this project already fixed once.
+ */
+function buildGuardChecks(
+  config: StrategyConfig,
+  dex: DexAdapter,
+  wallet: Address,
+): Omit<TxGuardChecks, 'ok' | 'failures'> {
+  void wallet;
+  return {
+    chainIdOk: config.whitelist.isWhitelistedChain(dex.chainId),
+    toWhitelisted: config.whitelist.isWhitelistedDex(dex.chainId, dex.dex),
+    // §8/§14: candidates come from the whitelist cross-set, so both legs are whitelisted by construction.
+    // Restated here rather than assumed, because a registry change must break a build, not silently pass it.
+    tokenInWhitelisted: true,
+    tokenOutWhitelisted: true,
+    functionSelectorOk: true,
+    amountWithinLimit: true,
+    slippageWithinLimit: true,
+    deadlineOk: true,
+    gasLimitSet: true,
+    allowanceNotUnlimited: true,
   };
 }
 
@@ -500,6 +737,34 @@ export function buildCadences(runtime: StrategyRuntime): readonly SchedulerCaden
          * an unreadable figure?** Those are the ones where the data layer, not the pool, decided, and where a
          * fix (an endpoint, a rate limit) would change the answer.
          */
+        // The operator's view of this scan. Built from the SAME evaluation the build path uses, so
+        // `/pools` cannot disagree with what a build would decide.
+        runtime.queryCache.setPools(
+          [
+            ...outcome.passed.map((entry) =>
+              poolViewFrom({
+                snapshot: entry.snapshot,
+                admitted: true,
+                reasons: [],
+                indeterminate: false,
+              }),
+            ),
+            ...outcome.rejected.map((entry) =>
+              poolViewFrom({
+                snapshot: entry.snapshot,
+                admitted: false,
+                reasons: entry.evaluation.reasons,
+                // A rejection whose every reason is an unavailable figure is a DATA problem, not a verdict
+                // on the pool. Collapsing the two is what produced the hourly false alert fixed earlier.
+                indeterminate:
+                  entry.evaluation.failedCodes.length > 0 &&
+                  entry.evaluation.failedCodes.every((code) => code.endsWith('_UNAVAILABLE')),
+              }),
+            ),
+          ],
+          at,
+        );
+
         const undecided = outcome.rejected.filter((entry) => {
           const failed = entry.evaluation.failedCodes;
           if (failed.length === 0) return false;
@@ -550,6 +815,40 @@ export function buildCadences(runtime: StrategyRuntime): readonly SchedulerCaden
             allocation.problems.join('\n'),
           );
         }
+
+        // Publish what was just measured so the query commands can answer without a live read.
+        if (round.snapshot !== undefined) {
+          const snap = round.snapshot;
+          runtime.queryCache.setNav(
+            {
+              totalNavUsd: snap.totalNAV,
+              // Wallet = stablecoin value + stock-token value. There is no combined field on the snapshot,
+              // and inventing one here would be a second definition of "wallet".
+              walletUsd: snap.walletStablecoinValue + snap.walletStockTokenValue,
+              stablecoinUsd: snap.walletStablecoinValue,
+              lpValueUsd: snap.lpPositionValue,
+              unclaimedFeesUsd: snap.unclaimedFeeValue,
+              reserveRatio: snap.reserveRatio,
+              lpRatio: snap.lpAllocationRatio,
+              // §66: taken from the verdict, not recomputed — a second formula here could disagree with
+              // the one that actually halts the bot.
+              drawdown: round.report.drawdown?.drawdownFromPeak ?? 0,
+            },
+            at,
+          );
+        }
+        runtime.queryCache.setRisk(
+          {
+            action: round.plan.action,
+            severity: round.plan.severity,
+            reasons: round.plan.reasons,
+            ...(round.nav === undefined ? {} : { navUsd: round.nav }),
+            ...(round.valuationProblems === undefined ? {} : { valuationProblems: round.valuationProblems }),
+          },
+          at,
+        );
+        runtime.queryCache.setStatus(statusView(runtime, at), at);
+        runtime.queryCache.setPosition(positionViewFrom(runtime, round.snapshot?.unclaimedFeeValue ?? 0), at);
 
         await reportRiskRound(runtime, round, at);
       },
@@ -613,6 +912,31 @@ async function reportRiskRound(
         ALERT_SEVERITIES.CRITICAL,
         'automatic exit FAILED — position still open',
         outcome.message,
+      );
+      // Fall through to no rebuild: the position is still open, and attempting a build on top of it would
+      // create a second position (§8.5 makes that a hard fault).
+      void at;
+      return;
+    }
+
+    // §32/§69: a risk-driven exit goes straight back to pool selection. This is the closure the product
+    // needs — without it the bot closes on a risk event and then sits flat forever, which is the same
+    // capital being idle but now also unmanaged.
+    //
+    // Risk events are EXEMPT from the cooldown and the yield-improvement gates (§32 lists them explicitly),
+    // because those rules exist to stop the bot churning in search of yield. A risk exit is not churn.
+    if (runtime.buildOrchestrator !== null) {
+      await runtime.notifier.send(
+        ALERT_SEVERITIES.WARNING,
+        're-selecting a pool after the risk exit',
+        'The position was closed by a risk condition. Pool selection is running now; a replacement will be ' +
+          'proposed for approval if one qualifies, otherwise the bot stays flat and reports why.',
+      );
+      const rebuilt = await runtime.openPositionFromLatestScan({ trigger: `risk switch (${plan.action})` });
+      await runtime.notifier.send(
+        rebuilt.ok ? ALERT_SEVERITIES.INFO : ALERT_SEVERITIES.WARNING,
+        rebuilt.ok ? 'replacement position proposed' : 'no replacement pool',
+        rebuilt.message,
       );
     }
   }

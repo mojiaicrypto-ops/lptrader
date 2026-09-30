@@ -20,7 +20,7 @@
  * plainly and leaves the bot flat, waiting for `/start` — rather than retrying in a loop or, worse,
  * building into a pool that failed the filters.
  */
-import type { Address, PoolId } from '../types/primitives.ts';
+import type { Address, PoolId, UsdAmount } from '../types/primitives.ts';
 import type { PositionExecutor } from './positionExecutor.ts';
 import type { StateMachine } from '../strategy/stateMachine.ts';
 import type { PositionReader } from '../chain/positionReader.ts';
@@ -40,6 +40,15 @@ export interface ActionHandlerDeps {
   readonly openPosition: () => Promise<OpenPosition | null>;
   /** §6.4: may a rebuild proceed after a manual exit? Injected so the cost policy is testable alone. */
   readonly approveRebuild?: (previous: OpenPosition) => Promise<RebuildDecision>;
+  /**
+   * The ONE path that opens a position (§45). Injected rather than reimplemented so `/start`, the post-exit
+   * rebuild and the risk-driven switch all take the same route — a second build path would be a second set
+   * of bugs, and the first one would keep working while the second silently diverged.
+   */
+  readonly buildPosition?: (options?: {
+    readonly affordableUsd?: UsdAmount;
+    readonly trigger?: string;
+  }) => Promise<{ readonly ok: boolean; readonly message: string }>;
   /** Wired to the notifier so a handler can report what it decided. */
   readonly notify?: (severity: 'info' | 'warning' | 'critical', title: string, body: string) => Promise<void>;
 }
@@ -116,8 +125,9 @@ export class ActionHandlers {
       };
     }
 
-    // §6.2: a manual exit re-runs pool selection. Whether a build actually happens is decided by the
-    // rebuild policy (§6.4) and then by the screener finding a qualified pool.
+    // §6.2/§6.4: a manual exit re-runs pool selection. The policy only gates the AUTOMATIC rebuild — the
+    // exit itself already happened, because refusing to close a position the operator wants closed would
+    // be worse than whatever the round trip costs.
     const rebuild = await this.deps.approveRebuild?.(position);
     if (rebuild !== undefined && !rebuild.allowed) {
       await this.notify(
@@ -132,12 +142,26 @@ export class ActionHandlers {
       };
     }
 
+    // Actually rebuild. This used to return a message SAYING it would — and nothing consumed the
+    // SELECT_POOL state, so the bot sat flat while the text promised otherwise.
+    if (this.deps.buildPosition === undefined) {
+      return {
+        ok: true,
+        message: 'position closed. No build path is wired, so send /start when you want to re-enter.',
+        nextState: BOT_STATES.IDLE,
+      };
+    }
+
+    await this.notify('info', 'rebuilding after exit', 'Position closed. Selecting a replacement pool…');
+    const built = await this.deps.buildPosition({ trigger: 'post-exit rebuild' });
     return {
       ok: true,
-      message:
-        'position closed. Re-running pool selection: if a pool qualifies the bot will build, ' +
-        'otherwise it stays flat and you can build later with /start.',
-      nextState: BOT_STATES.SELECT_POOL,
+      message: built.ok
+        ? `position closed; replacement build started — ${built.message}`
+        : `position closed; rebuild did not proceed — ${built.message}`,
+      // Same reasoning as `/start`: the position IS closed, so the bot is flat. A submitted build is still
+      // behind its approval gate and owns its own transition.
+      nextState: BOT_STATES.IDLE,
     };
   }
 
@@ -160,12 +184,33 @@ export class ActionHandlers {
       };
     }
 
+    // §6.2: `/start` needs no confirmation of its own — the command IS the authorisation. The build it
+    // triggers goes through the same approval gate as any other, because the gate protects the money being
+    // committed, not the intent to commit it.
+    if (this.deps.buildPosition === undefined) {
+      return {
+        ok: false,
+        message: 'no build path is wired: this process cannot open a position',
+        nextState: this.state(),
+      };
+    }
+
+    await this.notify('info', 'build requested', '/start received. Screening pools…');
+    const built = await this.deps.buildPosition({ trigger: '/start' });
     return {
-      ok: true,
-      message:
-        'starting pool selection: if a pool passes the hard filters the bot will build, otherwise it ' +
-        'stays flat and reports why',
-      nextState: BOT_STATES.SELECT_POOL,
+      ok: built.ok,
+      message: built.ok
+        ? `build started — ${built.message}`
+        : `no position was opened — ${built.message}`,
+      /**
+       * The state the bot is actually in, not the state a build might eventually reach.
+       *
+       * `nextState` describes where the bot stands once this handler returns. A build that was submitted is
+       * still awaiting its approval gate, so the bot is in its current state — reporting `PREPARE_POSITION`
+       * would name a state the state machine has not entered, and from `IDLE` it is not even a legal edge.
+       * The build path owns its own transitions.
+       */
+      nextState: this.state(),
     };
   }
 

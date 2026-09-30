@@ -27,8 +27,11 @@ function harness(options: {
   readonly state?: (typeof BOT_STATES)[keyof typeof BOT_STATES];
   readonly exitResult?: ExecutionOutcome;
   readonly rebuild?: { readonly allowed: boolean; readonly reason: string };
+  readonly build?: { readonly ok: boolean; readonly message: string };
+  readonly noBuildPath?: boolean;
 } = {}) {
   const exitPosition = vi.fn(async () => options.exitResult ?? ok());
+  const buildPosition = vi.fn(async () => options.build ?? { ok: true, message: 'approval requested' });
   const deps: ActionHandlerDeps = {
     executor: { exitPosition } as never,
     stateMachine: { current: options.state ?? BOT_STATES.MONITOR } as never,
@@ -38,21 +41,41 @@ function harness(options: {
     ...(options.rebuild === undefined
       ? {}
       : { approveRebuild: vi.fn(async () => options.rebuild!) }),
+    ...(options.noBuildPath === true ? {} : { buildPosition }),
     notify: vi.fn(async () => {}),
   };
-  return { handlers: new ActionHandlers(deps), exitPosition, deps };
+  return { handlers: new ActionHandlers(deps), exitPosition, buildPosition, deps };
 }
 
 describe('/exit (manual close, architecture §6.2)', () => {
   it('closes the position and moves to pool re-selection', async () => {
-    const { handlers, exitPosition } = harness();
+    const { handlers, exitPosition, buildPosition } = harness();
     const outcome = await handlers.exit();
 
     expect(outcome.ok).toBe(true);
     expect(exitPosition).toHaveBeenCalledTimes(1);
     // §6.2: a manual exit re-runs pool selection — "exit" means stop this position, not stop trading.
-    expect(outcome.nextState).toBe(BOT_STATES.SELECT_POOL);
-    expect(outcome.message).toMatch(/Re-running pool selection/);
+    // This used to be a MESSAGE claiming a rebuild would happen; SELECT_POOL had no consumer, so the bot
+    // sat flat while the text promised otherwise. The build path is now actually invoked.
+    expect(buildPosition).toHaveBeenCalledTimes(1);
+    expect(outcome.nextState).toBe(BOT_STATES.IDLE);
+    expect(outcome.message).toMatch(/replacement build started/);
+  });
+
+  it('stays flat and says so when no build path is wired', async () => {
+    // A read-only process has no build path. Reporting SELECT_POOL would claim a selection that cannot run.
+    const { handlers, buildPosition } = harness({ noBuildPath: true });
+    const outcome = await handlers.exit();
+    expect(buildPosition).not.toHaveBeenCalled();
+    expect(outcome.nextState).toBe(BOT_STATES.IDLE);
+    expect(outcome.message).toMatch(/No build path is wired/);
+  });
+
+  it('reports a failed rebuild instead of claiming success', async () => {
+    const { handlers } = harness({ build: { ok: false, message: 'NO_QUALIFIED_POOL: nothing passed' } });
+    const outcome = await handlers.exit();
+    expect(outcome.nextState).toBe(BOT_STATES.IDLE);
+    expect(outcome.message).toMatch(/rebuild did not proceed/);
   });
 
   it('refuses when there is nothing open', async () => {
@@ -106,21 +129,40 @@ describe('/exit (manual close, architecture §6.2)', () => {
   });
 
   it('rebuilds when the cost policy allows it', async () => {
-    const { handlers } = harness({ rebuild: { allowed: true, reason: 'same stock leg' } });
+    const { handlers, buildPosition } = harness({ rebuild: { allowed: true, reason: 'same stock leg' } });
     const outcome = await handlers.exit();
-    expect(outcome.nextState).toBe(BOT_STATES.SELECT_POOL);
+    expect(buildPosition).toHaveBeenCalledTimes(1);
+    // IDLE is where the bot actually is: the build is behind its approval gate and owns its own transition.
+    expect(outcome.nextState).toBe(BOT_STATES.IDLE);
   });
 });
 
 describe('/start (manual build, architecture §6.2)', () => {
   it('starts pool selection from flat without needing an approval', async () => {
-    const { handlers, exitPosition } = harness({ position: null });
+    const { handlers, exitPosition, buildPosition } = harness({ position: null });
     const outcome = await handlers.start();
 
     expect(outcome.ok).toBe(true);
-    expect(outcome.nextState).toBe(BOT_STATES.SELECT_POOL);
+    // The command IS the authorisation (§6.2), so no approval is requested for /start itself — but the
+    // build it triggers runs, which is what this previously only claimed in a message.
+    expect(buildPosition).toHaveBeenCalledTimes(1);
+    // The bot stays in its current state; the build path owns the transition.
+    expect(outcome.nextState).toBe(BOT_STATES.MONITOR);
     // /start must not touch the exit path.
     expect(exitPosition).not.toHaveBeenCalled();
+  });
+
+  it('stays flat and idle when no pool qualifies', async () => {
+    const { handlers } = harness({
+      position: null,
+      build: { ok: false, message: 'NO_QUALIFIED_POOL: no pool passed the hard filters' },
+    });
+    const outcome = await handlers.start();
+    expect(outcome.ok).toBe(false);
+    expect(outcome.message).toMatch(/no position was opened/);
+    // The bot stays where it was. Reporting SELECT_POOL claimed a selection that never happened — the bug
+    // this whole change removes.
+    expect(outcome.nextState).toBe(BOT_STATES.MONITOR);
   });
 
   it('refuses when a position is already open, and points at /exit', async () => {

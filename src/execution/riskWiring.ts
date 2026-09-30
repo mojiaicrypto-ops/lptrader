@@ -32,7 +32,7 @@ import type { AlertSeverity } from '../types/notifier.ts';
 import type { BotState } from '../types/state.ts';
 import type { StrategyConfig } from '../types/config.ts';
 import type { PoolSnapshot } from '../types/market.ts';
-import type { Position } from '../types/portfolio.ts';
+import type { PortfolioSnapshot, Position } from '../types/portfolio.ts';
 import {
   RISK_ACTIONS,
   evaluateRisk,
@@ -116,6 +116,14 @@ export interface RiskWiringingRound {
   readonly plan: RiskActionPlan;
   /** The snapshot the verdict was based on, present only when the valuation was complete. */
   readonly nav?: UsdAmount;
+  /**
+   * The full valuation, present only when it was complete.
+   *
+   * Exposed so the operator-facing `/nav` command reports the SAME numbers the risk verdict was computed
+   * from. Re-deriving them would create a second formula that could disagree with the one that halts the
+   * bot — and the operator would be shown the wrong one.
+   */
+  readonly snapshot?: PortfolioSnapshot;
   /** Set when the valuation was incomplete, in which case no §65/§66 verdict was produced. */
   readonly valuationProblems?: readonly string[];
 }
@@ -202,6 +210,9 @@ export class RiskWiring {
       report: withReason,
       plan: planFor(withReason, open !== null),
       ...(valuation.snapshot.totalNAV === undefined ? {} : { nav: valuation.snapshot.totalNAV }),
+      // Only when the valuation was COMPLETE. A partial snapshot has placeholder values that would read as
+      // real measurements on `/nav` — a subset of the portfolio presented as the whole.
+      ...(valuation.problems.length === 0 ? { snapshot: valuation.snapshot } : {}),
       ...(valuation.problems.length === 0 ? {} : { valuationProblems: valuation.problems }),
     };
   }
