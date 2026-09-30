@@ -488,11 +488,32 @@ export function buildCadences(runtime: StrategyRuntime): readonly SchedulerCaden
             deferChainOnly: true,
           },
         );
-        if (!outcome.decisive) {
+        /*
+         * Alert only when missing data ACTUALLY determined an outcome.
+         *
+         * `decisive: false` alone is too coarse to alert on: on a real market some long-tail pool nearly
+         * always has an unreadable 7d volume, so it is false almost every scan. Alerting on it meant a
+         * `warning` listing every rejected pool each hour — with reasons like `TVL_BELOW_MINIMUM`, which the
+         * operator can do nothing about and which had nothing to do with missing data.
+         *
+         * The question worth waking someone for is narrower: **was a pool rejected where the ONLY reason was
+         * an unreadable figure?** Those are the ones where the data layer, not the pool, decided, and where a
+         * fix (an endpoint, a rate limit) would change the answer.
+         */
+        const undecided = outcome.rejected.filter((entry) => {
+          const failed = entry.evaluation.failedCodes;
+          if (failed.length === 0) return false;
+          const allUnavailable = failed.every((code) => code.endsWith('_UNAVAILABLE'));
+          return allUnavailable;
+        });
+        if (undecided.length > 0) {
           await runtime.notifier.send(
             ALERT_SEVERITIES.WARNING,
-            'pool filter could not decide on its merits',
-            outcome.rejected.map((entry) => `${entry.snapshot.poolId}: ${entry.evaluation.reasons.join('; ')}`).join('\n'),
+            `${undecided.length} pool(s) could not be judged because a figure was unreadable`,
+            undecided
+              .map((entry) => `${entry.snapshot.poolId}: ${entry.evaluation.reasons.join('; ')}`)
+              .join('\n') +
+              '\n\nThese were rejected for missing DATA, not for being unsuitable. Check the data sources.',
           );
         }
       },
