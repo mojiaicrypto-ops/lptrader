@@ -39,6 +39,9 @@
 
 | KI-29 | P2 | open | **持仓期缺少「TVL 绝对下限」风控，导致启动后头 24h 无人看守**：§59 的判据是**24h 相对跌幅**，需要两个时间点；而池子时序表（迁移 6）刚建，且进程刚启动时必然没有 24h 历史 → 该规则只能返回 `insufficient-data`（fail closed 告警但不触发动作）。**提案**（待用户定阈值）：① 当前 TVL < §16 准入阈值 → `RISK_REVIEW`；② 当前 TVL < 准入阈值 × 0.5 → `EMERGENCY`。绝对值只需当前值、立即可用，且能抓「长期阴跌但单日跌幅不超 50%」的情形；相对跌幅仍保留（抓突发）。**阈值倾向用准入阈值的倍数**，避免第二处魔数漂移。 | 用户 2026-09-30 提问 + 集成分析 | §59 / §16 |
 
+| KI-30 | P1 | **resolved** | ~~`ContractFunctionZeroDataError` 未被 `classifyRevert` 匹配 → **非 ERC-165 的 token（如 WBNB）会让整个风控回合崩溃**~~。**实测活链复现**：WBNB `0xbb4c…95c` 无 `supportsInterface`，调用返回 `0x`（不是 revert），viem 抛 `ContractFunctionZeroDataError`；该名字不在匹配列表里 → 错误逃出 `tryReadContract` → **组合无法估值，只因为某个 token 缺少一个「可选」接口**。WBNB 是白名单成员（每个 swap 的 native 腿），所以任何非 BEP-677 白名单 token 都会踩到。**已修复**：`classifyRevert` 增加该名字，并有 2 条测试（普通 token 探测应解析为「非 scaled」；而**声明为 scaled 却实际不是**仍是配置错误、必须拒绝 —— 这条相邻行为也加了测试锁定）。 | Step 4 活链回归 | §96 / tokenReader |
+| KI-31 | P1 | **resolved** | ~~**未注资的钱包被判为 `GLOBAL_RISK_OFF` / `critical`**~~。**实测**：空钱包 `totalNAV=0`，而 §66 的判据 `totalNAV <= initialNAV × 0.85` 字面上成立（`0 <= 8500`）→ 判定全局停机 + critical 告警。**这不是保守的误报，而是每次全新安装都会误报**，而日复一日的 critical 会把操作者训练成忽略 critical。**根因**：`initialNAV` 是**配置出来的意图值**，无法区分「还没开始」与「已经亏光」。**已修复**：判据改为**证据驱动** —— 只要存在任何 position 行（无论开/平）= 曾投入过资本；空表 = 尚未开始。`hasCommittedCapital` 缺省为 `true`（安全方向：多一次告警只是看一眼，少一次停机是账户损失）。**注资后 NAV 归零仍会停机**（有专门测试）。顺带修掉同一路径的两个假象：`missingInputs` 里 `drawdown` 重复出现、以及空钱包仍报 critical（现为 `info`）。 | Step 4 活链回归 | §66 / §65 |
+
 ## 已登记待处理（Onboarding 阶段产生）
 
 > 以下为待 Phase 3 实现前必须收敛的**已知缺口**，不是缺陷：
