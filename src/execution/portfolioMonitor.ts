@@ -33,6 +33,11 @@ import type {
 import type { ReferencePriceProvider } from '../types/adapters.ts';
 import type { Whitelist } from '../types/registry.ts';
 import type { TokenAmount, TokenMeta } from '../types/token.ts';
+import {
+  verifyPostAllocation,
+  type AllocationLimits,
+  type AllocationVerification,
+} from '../strategy/allocation.ts';
 import { buildDrawdownState, buildPortfolioSnapshot } from '../strategy/nav.ts';
 import type { BenchmarkPosition, PriceTable } from '../strategy/nav.ts';
 import { liquidityToAmounts } from '../strategy/positionPlanner.ts';
@@ -66,6 +71,12 @@ export interface MonitorInputs {
 
 export interface MonitorResult {
   readonly snapshot: PortfolioSnapshot;
+  /**
+   * §3/§60 allocation check on the OBSERVED balances: is LP inside `max_lp_ratio`, is the reserve at or
+   * above `reserve_ratio`? Reported every round because the user funds the strategy manually and the
+   * ratios drift with every deposit — the monitor's job here is to notice, not to act (§68).
+   */
+  readonly allocation: AllocationVerification;
   /**
    * §65 drawdown, or `null` when the valuation was incomplete.
    *
@@ -116,6 +127,8 @@ export interface PortfolioMonitorOptions {
   readonly stablecoinPrice?: (token: TokenMeta) => Promise<Sourced<PriceUsd | null>>;
   /** §46 monitoring cadence, recorded as the observation window on each drawdown reading. */
   readonly windowSeconds?: UnixSeconds;
+  /** §3 allocation limits, read from config. Absent ⇒ the allocation check is skipped, not faked. */
+  readonly allocationLimits?: AllocationLimits;
 }
 
 export class PortfolioMonitor {
@@ -371,6 +384,22 @@ export class PortfolioMonitor {
 
     return {
       snapshot: result.snapshot,
+      allocation:
+        this.options.allocationLimits === undefined
+          ? verifyPostAllocation({
+              // Without configured limits there is nothing to compare against, so the check reports
+              // itself unjudgeable rather than passing.
+              navUsd: Number.NaN,
+              lpValueUsd: result.snapshot.lpPositionValue,
+              reserveUsd: result.snapshot.walletStablecoinValue,
+              limits: { maxLpRatio: 1, reserveRatio: 0 },
+            })
+          : verifyPostAllocation({
+              navUsd: result.snapshot.totalNAV,
+              lpValueUsd: result.snapshot.lpPositionValue,
+              reserveUsd: result.snapshot.walletStablecoinValue,
+              limits: this.options.allocationLimits,
+            }),
       // §65 is only assessed on a COMPLETE valuation: an unpriced leg makes `totalNAV` a floor, so a
       // breach verdict derived from it would be a claim about a number we know is wrong.
       drawdown:

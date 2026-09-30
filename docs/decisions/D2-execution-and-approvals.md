@@ -38,6 +38,15 @@
 
 实现方式：长轮询 `getUpdates`（避免公网 webhook 暴露，符合 AGENTS.md「公网部署需确认」）。依赖：仅 `fetch`（Node 内置），不引入 Telegram SDK。
 
+## D3 — 后续三项用户裁定（2026-09-30）
+
+| # | 议题 | 裁定 | 落地 |
+|---|---|---|---|
+| D5 | NAV 算法 | **哪种更合理就用哪种；产品文档不合理就先改文档** → `Realized Fees` **不**作为 NAV 加项（重复计入会静默关闭 §66） | 产品基线 §5/§64 已改；实现早已如此；KI-15 关闭 |
+| D6 | 资金与比例 | **不需要程序化金额阶梯**；资金由用户**手动逐步增加**。系统职责 = **严格按配置比例执行 + 持续监控** | 新增 `src/strategy/allocation.ts`：`lpBudgetUsd` / `checkBuildAllocation`（按**结果态**校验，两次合规建仓不得合起来超比例）/ `verifyPostAllocation`（每轮监控）；执行器加 `ALLOCATION_EXCEEDED` 门；监控器每轮输出 allocation；KI-13 关闭 |
+| D7 | L3 评审独立性 | **暂不需要**配置独立模型 | review-report 记明"同模型 + 隔离会话"，不再作为待决项 |
+| D8 | §16 与 §40 阈值 | **分离**：§16 = 池准入（池深），§40 = 单笔执行容忍度，且**可按池覆盖**（例如某池 0.8% 或 1%） | 产品基线 §16/§40/§85 已改；`strategy.yaml` 新增 `pool_overrides`（key 为 §13 池标识）；`swapLimitsForPool()` 接入门禁；启动时校验覆盖值不得低于准入阈值；KI-28 关闭 |
+
 ## 未决
 
 - 用户需提供真实 `TELEGRAM_BOT_TOKEN` 与 chat/user id 才能做真实联调；在那之前 T13 以单测 + 本地假服务器验证。

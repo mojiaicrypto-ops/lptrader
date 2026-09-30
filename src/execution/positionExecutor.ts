@@ -37,6 +37,7 @@ import type { TxStore } from '../store/txStore.ts';
 import type { StateMachine } from '../strategy/stateMachine.ts';
 import { APPROVAL_KINDS } from '../types/notifier.ts';
 import { SWAP_PURPOSES } from '../types/adapters.ts';
+import { checkBuildAllocation, type AllocationLimits } from '../strategy/allocation.ts';
 import { checkWriteAllowed, WRITE_ACTIONS } from '../strategy/stateMachine.ts';
 import { evaluateSwapQuote, planSwapIntent, type SwapLimits } from '../strategy/swapPlanner.ts';
 import type { PositionPlan } from '../strategy/positionPlanner.ts';
@@ -45,6 +46,7 @@ import { canOpenNewAttempt, RAW_TX_FORMATS, TX_PURPOSES } from '../store/txStore
 /** A build refuses for a named reason; it never throws for a business refusal. */
 export const BUILD_REFUSALS = {
   GUARD_FAILED: 'tx_guard_failed',
+  ALLOCATION_EXCEEDED: 'allocation_exceeded',
   WRITE_BLOCKED: 'write_blocked_by_state',
   QUOTE_REJECTED: 'swap_gate_rejected',
   APPROVAL_DENIED: 'approval_denied',
@@ -55,7 +57,18 @@ export type BuildRefusal = (typeof BUILD_REFUSALS)[keyof typeof BUILD_REFUSALS];
 
 export interface BuildPositionInput {
   readonly pool: PoolSnapshot;
+  /**
+   * LP capital to commit. Must be produced by `lpBudgetUsd(nav, limits)` — §3 caps LP at
+   * `max_lp_ratio × NAV`, and `navUsd`/`currentLpValueUsd` below exist so the executor can verify the
+   * RESULTING allocation rather than trusting that this number was derived correctly.
+   */
   readonly capitalUsd: UsdAmount;
+  /** NAV the allocation is judged against (§3). */
+  readonly navUsd: UsdAmount;
+  /** LP value already deployed; the cap applies to the total, not to this increment alone. */
+  readonly currentLpValueUsd: UsdAmount;
+  /** §3 allocation limits, read from config; passed in so the executor restates no constant. */
+  readonly allocationLimits: AllocationLimits;
   readonly walletAddress: Address;
   /** Output of `planPosition` — the §38 optimal ratio, already computed from the live price. */
   readonly plan: PositionPlan;
@@ -127,6 +140,23 @@ export class PositionExecutor {
 
     const gate = this.checkState(WRITE_ACTIONS.SWAP_BUILD);
     if (gate !== null) return gate;
+
+    // §3: the LP cap applies to the TOTAL allocation, so two individually-compliant builds must not be
+    // able to breach the ratio together. Checked before the quote so an over-budget build never reaches
+    // the point of being quoted or approved.
+    const allocation = checkBuildAllocation({
+      navUsd: input.navUsd,
+      currentLpValueUsd: input.currentLpValueUsd,
+      requestedUsd: input.capitalUsd,
+      limits: input.allocationLimits,
+    });
+    if (!allocation.ok) {
+      return {
+        ok: false,
+        refusal: BUILD_REFUSALS.ALLOCATION_EXCEEDED,
+        reason: `allocation refused: ${allocation.reason ?? 'unspecified'}`,
+      };
+    }
 
     const quoteVerdict = evaluateSwapQuote(input.quote, input.limits, input.now);
     if (!quoteVerdict.ok) {

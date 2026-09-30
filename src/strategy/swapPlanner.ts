@@ -21,6 +21,33 @@ import type { PositionPlan } from './positionPlanner.ts';
 import type { IsoTimestamp, PriceUsd, Ratio, UsdAmount, Address } from '../types/primitives.ts';
 import { applyFloorRatio, toFloat } from '../util/decimal.ts';
 
+/**
+ * Resolve the §40 limits that apply to ONE pool (§13 identity).
+ *
+ * A per-pool override exists because depth is a property of the venue and the pair, not of the strategy:
+ * the same token pair on two fee tiers can differ by an order of magnitude. Falling back to the global
+ * defaults keeps the common case zero-config.
+ */
+export function swapLimitsForPool(
+  poolId: string,
+  config: {
+    readonly swap: { readonly maxSlippage: number; readonly maxPriceImpact: number; readonly quoteTtlSeconds: number };
+    readonly poolOverrides: Readonly<Record<string, { readonly maxSlippage?: number; readonly maxPriceImpact?: number }>>;
+    readonly pool: { readonly maxSwapPriceImpact: number };
+  },
+): SwapLimits {
+  const override = config.poolOverrides[poolId];
+  return {
+    maxSlippage: override?.maxSlippage ?? config.swap.maxSlippage,
+    maxPriceImpact: override?.maxPriceImpact ?? config.swap.maxPriceImpact,
+    quoteTtlSeconds: config.swap.quoteTtlSeconds,
+    // The second tier stays anchored to the ADMISSION threshold rather than to the (possibly widened)
+    // execution tolerance: "this pool is a liquidity risk" is a judgement about the pool, and widening a
+    // per-pool tolerance must not also raise the bar for flagging it.
+    liquidityRiskPriceImpact: Math.max(config.pool.maxSwapPriceImpact * 2, config.swap.maxPriceImpact * 2),
+  };
+}
+
 /** §40 defaults; always overridden by `StrategyConfig.swap`. */
 export interface SwapLimits {
   /** §40 `max_slippage` (0.003). */

@@ -37,7 +37,13 @@ import { LayeredPoolDataProvider } from '../src/data/poolDataProvider.ts';
 import { createPoolScanner, foundPools } from '../src/data/poolScanner.ts';
 import { filterPools } from '../src/data/poolFilter.ts';
 import { planPosition } from '../src/strategy/positionPlanner.ts';
-import { computePriceImpact, evaluateSwapQuote, planSwapIntent } from '../src/strategy/swapPlanner.ts';
+import {
+  computePriceImpact,
+  evaluateSwapQuote,
+  planSwapIntent,
+  swapLimitsForPool,
+} from '../src/strategy/swapPlanner.ts';
+import { checkBuildAllocation } from '../src/strategy/allocation.ts';
 import type { DexAdapter } from '../src/types/adapters.ts';
 import type { PoolSnapshot } from '../src/types/market.ts';
 import { DEX_IDS } from '../src/types/primitives.ts';
@@ -180,6 +186,19 @@ for (const entry of candidates) {
     upperRatio: config.range.upperRatio,
     referencePriceUsd: pool.stockReferencePrice.value,
   });
+  // §3: the LP budget is `NAV × max_lp_ratio`, and the build must land inside the bands. Checked here so
+  // the dry run exercises the same arithmetic a live build would.
+  const lpCapital = capitalUsd * config.capital.maxLpRatio;
+  const allocation = checkBuildAllocation({
+    navUsd: capitalUsd,
+    currentLpValueUsd: 0,
+    requestedUsd: lpCapital,
+    limits: { maxLpRatio: config.capital.maxLpRatio, reserveRatio: config.capital.reserveRatio },
+  });
+  out('§3 allocation', allocation.ok
+    ? `OK — LP ${lpCapital.toFixed(2)} of NAV ${capitalUsd.toFixed(2)} (cap ${(config.capital.maxLpRatio * 100).toFixed(0)}%), reserve ${(capitalUsd - lpCapital).toFixed(2)}`
+    : `REFUSED — ${allocation.reason ?? ''}`);
+
   out('lowerPrice / upperPrice', `${plan.lowerPrice.toFixed(4)} / ${plan.upperPrice.toFixed(4)}`);
   out('lowerTick / upperTick', `${plan.lowerTick} / ${plan.upperTick}`);
   out('ticks aligned (§34)', plan.lowerTick % expectedSpacing === 0 && plan.upperTick % expectedSpacing === 0);
@@ -233,16 +252,11 @@ for (const entry of candidates) {
   out('priceImpact (independent)', `${(independent * 100).toFixed(6)}%`);
   out('impact agreement', Math.abs(independent - quote.priceImpact) < 1e-9 ? 'exact' : `DIFFERS by ${Math.abs(independent - quote.priceImpact)}`);
 
-  const gate = evaluateSwapQuote(
-    quote,
-    {
-      maxSlippage: config.swap.maxSlippage,
-      maxPriceImpact: config.swap.maxPriceImpact,
-      quoteTtlSeconds: config.swap.quoteTtlSeconds,
-      liquidityRiskPriceImpact: 0.01,
-    },
-    new Date().toISOString(),
-  );
+  // §40: per-pool limits, so a pool with an override (0.8% / 1%) is judged against ITS tolerance rather
+  // than the global default. Also shows whether the override is actually reaching the gate.
+  const limits = swapLimitsForPool(pool.poolId, config);
+  out('§40 limits in force', `slippage ${(limits.maxSlippage * 100).toFixed(2)}% / impact ${(limits.maxPriceImpact * 100).toFixed(2)}%`);
+  const gate = evaluateSwapQuote(quote, limits, new Date().toISOString());
   out('§40 gate ok', gate.ok);
   for (const reason of gate.reasons) out('  gate reason', reason);
 

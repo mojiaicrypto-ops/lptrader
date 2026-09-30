@@ -132,6 +132,12 @@ portfolio:
   reserve_ratio: 0.30
 ```
 
+**资金投入方式（修正说明）**：用户**手动逐步增加资金**，系统不做自动补仓（§68）。因此系统在这方面的职责是**严格执行配置比例并持续监控**：
+
+- 每次建仓的 LP 投入**不得超过** `NAV × max_lp_ratio`；Reserve 不得低于 `NAV × reserve_ratio`。
+- 比例以**成交时的 NAV** 为准计算，并记录在仓位与决策日志中（可审计）。
+- 资金增加后比例会漂移，系统**只监控并告警**（§60），**不自动**动用 Reserve 追加 LP —— 追加由用户手动进行。
+
 ---
 
 ## 4. Reserve 资金定义
@@ -155,8 +161,17 @@ portfolio:
 系统不能只监控钱包余额。必须计算：
 
 ```text
-TotalNAV = Wallet Assets + LP Position Value + Unclaimed Fees + Realized Fees
+TotalNAV = Wallet Assets + LP Position Value + Unclaimed Fees
 ```
+
+**`Realized Fees` 不是 NAV 的加项**（修正说明）：§64 的 `Profit Vault` **就是**已实现手续费，而手续费一旦收取就已在 `Wallet Assets` 里 —— 再加一次会重复计入，抬高 NAV，把 NAV 推到 §66 风控线**以上**，从而**静默关闭亏损保护**。因此：
+
+```text
+Realized Fees  → 计入 Reserve，并作为 §64 Profit Vault 单独记账与展示
+                （Wallet Assets 里已经包含它，不再作为 NAV 的独立项）
+```
+
+`PortfolioSnapshot` 仍必须**单独记录并展示** `realizedFees`（§5 字段、§7 Fee/IL、§90 周报都需要），只是它不参与 `TotalNAV` 求和。低估方向只会让 §66 更早触发，是安全方向。
 
 ```typescript
 PortfolioSnapshot {
@@ -328,7 +343,13 @@ pool_filter:
   min_avg_daily_volume_7d: 250000
   min_pool_age_days: 7
   max_nav_deviation: 0.01
+  # 池子深度的准入判断，与单笔交易的滑点容忍是**两件事**。
+  # 0.5% = 在预算单量下"这个池够不够深"，是池的属性；见 §40 的 single_trade_max_price_impact。
   max_swap_price_impact: 0.005
+  # 单笔 swap 的滑点容忍，是**操作变量、可按池调整**（用户裁定：可按池设为 0.8% / 1%）。
+  # 必须 >= 池准入阈值：准入更严、执行更松是合理的（好池子里也不会每次都用满容忍度）。
+  single_trade_max_price_impact: 0.005     # 默认等于准入阈值，按池可上调
+  single_trade_max_slippage: 0.003         # §40 max_slippage 的默认值，按池可上调
 ```
 
 ```text
@@ -336,7 +357,7 @@ TVL >= $500,000
 7D Avg Daily Volume >= $250,000
 Pool Age >= 7 Days
 Token/NAV Deviation < 1%
-$3500 Swap Price Impact < 0.5%
+$3500 Swap Price Impact < 0.5%   ← **池准入阈值**（池深度），独立于单笔交易的滑点容忍
 ```
 
 ---
@@ -612,9 +633,13 @@ swap:
 ```
 
 ```text
-Max Slippage = 0.3%
-Max Price Impact = 0.5%
+Max Slippage = 0.3%          ← 默认值；**按池可覆盖**（如 0.8% / 1%）
+Max Price Impact = 0.5%      ← 默认值；按池可覆盖，且必须 >= §16 的池准入阈值
 ```
+
+**本节阈值是"单笔交易"的容忍度，与 §16 的"池准入"阈值是两件事**：§16 判断池子够不够深（池的属性），本节判断这一次 swap 允许滑多少（操作的属性）。一个深池在特定时刻仍可能因为其他 LP 的瞬时空洞给出较差报价，所以两者不该用同一个数字；反之，任何池若连 §16 的准入都过不了，就不该被选中，此时本节容忍度再宽也没有意义。
+
+**按池覆盖**（用户裁定）：`strategy.yaml` 可给出全局默认值，`pool_overrides` 可按池（`chainId:dex:poolAddress`）覆盖 `max_slippage` / `max_price_impact`，便于对某个特定池放宽到 0.8% / 1% 而不影响其它池。
 
 `Price Impact > 0.5%` → 取消本轮建仓。
 `Price Impact > 1%` → Pool 标记为 `Liquidity Risk`。
@@ -850,6 +875,12 @@ Initial Reserve = $3000
 Realized Fees   = $300
 → Reserve Principal = 3000, Profit Vault = 300
 ```
+
+**与 §5 的关系（重要）**：`Profit Vault` 是**已实现手续费的累计口径**，而手续费收取后即刻进入钱包余额。因此：
+
+- `Wallet Assets` 已经包含这 $300，**不得**再把 `Realized Fees` 加到 `TotalNAV`（否则重复计入）。
+- `Profit Vault` / `Reserve Principal` 是**分类视图**，用于区分"本金储备"与"已赚取"的部分，并驱动 §60 的 Reserve Ratio 判定。
+- 划分口径：`Reserve Principal = min(钱包稳定币余额, InitialStrategyCapital × reserve_ratio)`，`Profit Vault = 钱包稳定币余额 − Reserve Principal`（超出本金储备的部分即为已赚）。
 
 ---
 
@@ -1172,9 +1203,16 @@ strategy:
     min_age_days: 7
 
   swap:
-    max_slippage: 0.003
-    max_price_impact: 0.005
+    max_slippage: 0.003          # 默认；按池可覆盖
+    max_price_impact: 0.005      # 默认；按池可覆盖，且 >= pool 的池准入阈值
     quote_ttl_seconds: 30
+
+  # 按池覆盖（用户裁定）：key 为 §13 的池唯一标识 chainId:dex:poolAddress。
+  # 只允许**放宽**执行容忍度（更严没有意义，因为否则池就该被淘汰），且不得低于 §16 准入阈值。
+  pool_overrides:
+    "56:pancakeswap-v3:0xe531fcb1f5a195de7608b9f4f9518544c2cdb693":
+      max_slippage: 0.008        # 0.8%
+      max_price_impact: 0.008
 
   switch:
     min_apr_improvement: 0.08

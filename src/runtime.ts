@@ -198,6 +198,9 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
     // nothing for USDC, which previously zeroed the whole reserve and tripped §66 on a healthy wallet.
     stablecoinPrice: createStablecoinPricer(env),
     maxDrawdown: config.risk.maxDrawdown,
+    // §3: the monitor reports the allocation every round, because the user funds manually and the ratios
+    // drift with each deposit (§68 — noticing is the bot's job, not topping up).
+    allocationLimits: { maxLpRatio: config.capital.maxLpRatio, reserveRatio: config.capital.reserveRatio },
     windowSeconds: config.monitor.portfolioIntervalMinutes * 60,
     ...(env['STRATEGY_WALLET_ADDRESS'] === undefined || env['STRATEGY_WALLET_ADDRESS'] === ''
       ? {}

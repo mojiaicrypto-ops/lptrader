@@ -274,6 +274,10 @@ function buildInput(over: Record<string, unknown> = {}) {
   return {
     pool: poolSnapshot(),
     capitalUsd: 7000,
+    // §3: NAV 10,000 with nothing deployed yet and a 70% cap ⇒ 7,000 is exactly the budget.
+    navUsd: 10_000,
+    currentLpValueUsd: 0,
+    allocationLimits: { maxLpRatio: 0.7, reserveRatio: 0.3 },
     walletAddress: '0x1111111111111111111111111111111111111111' as Address,
     plan: plan(),
     quote: quote(),

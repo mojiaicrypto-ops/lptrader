@@ -3,7 +3,7 @@ import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import type { ChainId, DexId } from '../types/primitives.ts';
 import type { TokenMeta } from '../types/token.ts';
-import type { StrategyConfig } from '../types/config.ts';
+import type { PoolOverrideConfig, StrategyConfig } from '../types/config.ts';
 import { WhitelistError, type Whitelist, type WhitelistDexEntry } from '../types/registry.ts';
 import {
   strategyFileSchema,
@@ -85,6 +85,54 @@ export function parseStrategyYaml(text: string, file = STRATEGY_FILE_NAME): Stra
     throw new ConfigError(`invalid strategy config (${formatIssues(result.error.issues)})`, file);
   }
   return result.data;
+}
+
+/**
+ * §40 resolve per-pool execution tolerances, validating each against the §16 admission threshold.
+ *
+ * Validation happens here (at startup) rather than at the trade gate for two reasons:
+ *  - a configuration whose tolerance is BELOW the admission threshold is contradictory — the pool could
+ *    not have been admitted under a looser rule while the execution is stricter — and silently accepting
+ *    it would make the effective limit depend on which check ran first;
+ *  - a malformed key (not a §13 pool identity) would otherwise never match a pool and be silently dead.
+ *
+ * Widening ABOVE the admission threshold is the supported direction and is what the user asked for
+ * (e.g. a 1% tolerance on a pool admitted at 0.5%).
+ */
+export function buildPoolOverrides(
+  pool: { readonly max_swap_price_impact: number },
+  swap: { readonly max_slippage: number; readonly max_price_impact: number },
+  overrides: Readonly<Record<string, { readonly max_slippage?: number; readonly max_price_impact?: number }>>,
+): Readonly<Record<string, PoolOverrideConfig>> {
+  const resolved: Record<string, PoolOverrideConfig> = {};
+  for (const [poolId, override] of Object.entries(overrides)) {
+    // §13 identity is `chainId:dex:poolAddress`; anything else can never match a pool at runtime.
+    const parts = poolId.split(':');
+    if (parts.length !== 3 || !/^\d+$/.test(parts[0] ?? '') || !/^0x[0-9a-fA-F]{40}$/.test(parts[2] ?? '')) {
+      throw new ConfigError(
+        `pool_overrides key "${poolId}" is not a §13 pool identity (expected chainId:dex:poolAddress)`,
+        STRATEGY_FILE_NAME,
+      );
+    }
+    const slippage = override.max_slippage ?? swap.max_slippage;
+    const impact = override.max_price_impact ?? swap.max_price_impact;
+    if (slippage < pool.max_swap_price_impact) {
+      throw new ConfigError(
+        `pool_overrides["${poolId}"].max_slippage ${slippage} is below the §16 admission threshold ` +
+          `${pool.max_swap_price_impact}; an execution tolerance stricter than admission is contradictory`,
+        STRATEGY_FILE_NAME,
+      );
+    }
+    if (impact < pool.max_swap_price_impact) {
+      throw new ConfigError(
+        `pool_overrides["${poolId}"].max_price_impact ${impact} is below the §16 admission threshold ` +
+          `${pool.max_swap_price_impact}; widen it, or the pool should simply not be admitted`,
+        STRATEGY_FILE_NAME,
+      );
+    }
+    resolved[poolId] = { maxSlippage: slippage, maxPriceImpact: impact };
+  }
+  return resolved;
 }
 
 /** Parse + validate `tokens.yaml` and `stablecoins.yaml` into address-keyed overrides. */
@@ -366,6 +414,9 @@ function assembleStrategyConfig(
       maxPriceImpact: swap.max_price_impact,
       quoteTtlSeconds: swap.quote_ttl_seconds,
     },
+    // §40 per-pool overrides. Each is validated against the admission threshold here, at startup, so a
+    // configuration that could never be honoured is rejected before a trade rather than at the gate.
+    poolOverrides: buildPoolOverrides(pool, swap, yaml.pool_overrides),
     switch: {
       minAprImprovement: switchCfg.min_apr_improvement,
       maxBreakEvenDays: switchCfg.max_break_even_days,

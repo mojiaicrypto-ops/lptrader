@@ -94,14 +94,34 @@ const poolSchema = z.strictObject({
   min_avg_daily_volume_7d: nonNegativeUsdSchema.default(250_000),
   min_age_days: nonNegativeIntSchema.default(7),
   max_nav_deviation: ratioSchema.default(0.01),
+  /**
+   * ADMISSION threshold: is this pool deep enough for the budgeted ticket (§16). A property of the pool,
+   * independent of any single trade's tolerance.
+   */
   max_swap_price_impact: ratioSchema.default(0.005),
 });
 
+/**
+ * §40 EXECUTION tolerances — how much slippage one swap may accept.
+ *
+ * Distinct from §16's admission threshold on purpose: admission asks "is this pool deep enough", this
+ * asks "how much may THIS swap slip". A deep pool can still quote badly for a moment, and a wide
+ * tolerance cannot rescue a pool that fails admission. Per-pool overrides may widen these (the user
+ * asked for per-pool 0.8% / 1%) but never below the admission threshold.
+ */
 const swapSchema = z.strictObject({
   max_slippage: ratioSchema.default(0.003),
   max_price_impact: ratioSchema.default(0.005),
   quote_ttl_seconds: positiveIntSchema.default(30),
 });
+
+/** Per-pool §40 override, keyed by the §13 pool identity `chainId:dex:poolAddress`. */
+const poolOverrideSchema = z.strictObject({
+  max_slippage: ratioSchema.optional(),
+  max_price_impact: ratioSchema.optional(),
+});
+
+const poolOverridesSchema = z.record(z.string(), poolOverrideSchema);
 
 const switchSchema = z.strictObject({
   min_apr_improvement: ratioSchema.default(0.08),
@@ -161,6 +181,9 @@ export const strategyFileSchema = z.strictObject({
       yield: yieldSchema.prefault({}),
       pool: poolSchema.prefault({}),
       swap: swapSchema.prefault({}),
+      // §40 per-pool tolerances; a key is the §13 identity, so the override cannot be applied to a pool
+      // identified only by its token pair.
+      pool_overrides: poolOverridesSchema.prefault({}),
       switch: switchSchema.prefault({}),
       risk: riskSchema.prefault({}),
       fees: feesSchema.prefault({}),

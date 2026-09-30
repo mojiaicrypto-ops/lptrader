@@ -30,20 +30,32 @@ strategy:
     warning_duration_hours: 72
 
   pool:
-    # §16 hard filters. A pool failing any of these is discarded before ranking.
+    # §16 ADMISSION filters. A pool failing any of these is discarded before ranking.
     min_tvl_usd: 500000
     min_avg_daily_volume_7d: 250000
     min_age_days: 7
     max_nav_deviation: 0.01
+    # "Is this pool deep enough for the budgeted ticket?" — a property of the POOL, separate from how
+    # much one swap may tolerate (§40 swap block below).
     max_swap_price_impact: 0.005
 
   swap:
-    # §40 caps. Slippage is enforceable inside the atomic call; price impact MUST be self-computed
-    # before encoding (the Pancake SDK cannot enforce it).
+    # §40 EXECUTION tolerances (defaults; per-pool overrides below).
+    # Slippage is enforceable inside the atomic call; price impact MUST be self-computed before encoding
+    # (the Pancake SDK cannot enforce it).
     max_slippage: 0.003
     max_price_impact: 0.005
     # §41 quote freshness.
     quote_ttl_seconds: 30
+
+  # §40 per-pool overrides, keyed by the §13 pool identity `chainId:dex:poolAddress`.
+  # Only WIDENING is allowed, and never below the §16 admission threshold — a tolerance stricter than
+  # admission would mean the pool should simply not have been admitted. Startup rejects both mistakes.
+  pool_overrides:
+    # QQQB/USDT on PancakeSwap V3 (0.01%): the deep, executable pool for QQQB.
+    "56:pancakeswap-v3:0xe531fcb1f5a195de7608b9f4f9518544c2cdb693":
+      max_slippage: 0.008        # 0.8%
+      max_price_impact: 0.008
 
   switch:
     # §70-§72 (Phase 5 consumers; present from day one so the thresholds are reviewed up front).

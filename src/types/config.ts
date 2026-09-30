@@ -50,16 +50,36 @@ export interface PoolThresholdConfig {
   readonly minAvgDailyVolume7dUsd: UsdAmount;
   readonly minPoolAgeDays: number;
   readonly maxNavDeviation: Ratio;
+  /**
+   * ADMISSION threshold: is this pool deep enough for the budgeted ticket (§16)? A property of the pool.
+   *
+   * Separate from `SwapConfig.maxPriceImpact` (§40), which is how much one swap may tolerate. Admission
+   * is the stricter, pool-level question; execution tolerance is the per-trade, overridable one.
+   */
   readonly maxSwapPriceImpact: Ratio;
 }
 
 export interface SwapConfig {
-  /** §40 slippage cap enforced inside the atomic call. */
+  /** §40 default slippage cap, enforced inside the atomic call. Overridable per pool. */
   readonly maxSlippage: Ratio;
-  /** §40 price-impact cap — MUST be self-computed before encoding (the SDK cannot enforce it). */
+  /**
+   * §40 default price-impact cap — MUST be self-computed before encoding (the SDK cannot enforce it).
+   * Overridable per pool, but never below §16's admission threshold.
+   */
   readonly maxPriceImpact: Ratio;
   /** §41 quote freshness. */
   readonly quoteTtlSeconds: DurationSeconds;
+}
+
+/**
+ * §40 per-pool execution tolerances, keyed by the §13 pool identity `chainId:dex:poolAddress`.
+ *
+ * Keyed by identity, not by token pair, because two venues (or two fee tiers) for the same pair can have
+ * very different depth — the whole reason a per-pool override exists.
+ */
+export interface PoolOverrideConfig {
+  readonly maxSlippage?: Ratio;
+  readonly maxPriceImpact?: Ratio;
 }
 
 /** §30-§32, §70-§72 (Phase 5 consumers, config present from day one). */
@@ -118,6 +138,8 @@ export interface StrategyConfig {
   readonly yield: YieldConfig;
   readonly pool: PoolThresholdConfig;
   readonly swap: SwapConfig;
+  /** §40 per-pool overrides; an absent entry means the global default applies. */
+  readonly poolOverrides: Readonly<Record<string, PoolOverrideConfig>>;
   readonly switch: SwitchConfig;
   readonly risk: RiskConfig;
   readonly fees: FeesConfig;
