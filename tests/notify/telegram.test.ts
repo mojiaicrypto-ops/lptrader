@@ -12,7 +12,8 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   DECISION_CALLBACK_ACTIONS,
   TELEGRAM_AUDIT_EVENTS,
-  TELEGRAM_COMMANDS,
+  TELEGRAM_ACTION_COMMANDS,
+  TELEGRAM_QUERY_COMMANDS,
   TELEGRAM_REFUSAL_REASONS,
   TelegramApiError,
   TelegramNotifier,
@@ -24,6 +25,7 @@ import {
   parseTelegramCommand,
   renderAlert,
   type FetchLike,
+  type ActionHandlers,
   type QueryHandlers,
   type TelegramUpdate,
 } from '../../src/notify/telegram.ts';
@@ -182,6 +184,7 @@ function buildNotifier(
     readonly audit?: DecisionLogSink;
     readonly logger?: LoggerLike;
     readonly queryHandlers?: QueryHandlers;
+    readonly actionHandlers?: ActionHandlers;
     readonly now?: () => number;
   } = {},
 ): TelegramNotifier {
@@ -195,6 +198,7 @@ function buildNotifier(
     ...(extras.audit === undefined ? {} : { audit: extras.audit }),
     ...(extras.logger === undefined ? {} : { logger: extras.logger }),
     ...(extras.queryHandlers === undefined ? {} : { queryHandlers: extras.queryHandlers }),
+    ...(extras.actionHandlers === undefined ? {} : { actionHandlers: extras.actionHandlers }),
     ...(extras.now === undefined ? {} : { now: extras.now }),
   });
 }
@@ -571,11 +575,159 @@ describe('telegram — alerts and queries', () => {
       },
     });
 
-    for (const command of TELEGRAM_COMMANDS) {
-      expect(await notifier.query(command)).toBe(`${command.slice(1)}:`);
+    // Only the QUERY commands run through this path. Actions are asserted separately below: they must
+    // NOT be reachable here, because the query path has no approval gate and actions move funds.
+    for (const command of TELEGRAM_QUERY_COMMANDS) {
+      const expected = command === '/help' ? expect.stringContaining('lptrader commands') : `${command.slice(1)}:`;
+      expect(await notifier.query(command)).toEqual(expected);
     }
     expect(await notifier.query('/status portfolio')).toBe('status:portfolio');
-    expect(seen).toEqual([...TELEGRAM_COMMANDS, '/status']);
+    expect(seen).toEqual(
+      TELEGRAM_QUERY_COMMANDS.filter((command) => command !== '/help').concat('/status'),
+    );
+  });
+
+  it('refuses to run an ACTION through the read-only query path', async () => {
+    // Routing an action here would skip its authorisation entirely, so the refusal is the safety property,
+    // not an inconvenience.
+    const notifier = buildNotifier(new FakeTelegramApi(), {
+      actionHandlers: {
+        exit: async () => 'exited',
+        start: async () => 'started',
+        resume: async () => 'resumed',
+      },
+    });
+    for (const command of TELEGRAM_ACTION_COMMANDS) {
+      await expect(notifier.query(command)).rejects.toThrow(/operator action/);
+    }
+  });
+
+  describe('operator actions (§6.2 authorisation policy)', () => {
+    function collectingActions(): {
+      readonly handlers: ActionHandlers;
+      readonly seen: string[];
+    } {
+      const seen: string[] = [];
+      return {
+        seen,
+        handlers: {
+          exit: async () => {
+            seen.push('/exit');
+            return 'position closed';
+          },
+          start: async () => {
+            seen.push('/start');
+            return 'building';
+          },
+          resume: async () => {
+            seen.push('/resume');
+            return 'resumed';
+          },
+        },
+      };
+    }
+
+    it('/start runs WITHOUT an approval, because the command is the authorisation', async () => {
+      // Asking twice would make "exit then rebuild" a two-round-trip ritual with no added safety. The
+      // decision is recorded in the architecture doc; this test is what enforces it.
+      const api = new FakeTelegramApi();
+      const { handlers, seen } = collectingActions();
+      const notifier = buildNotifier(api, { actionHandlers: handlers });
+
+      const result = await notifier.performAction('/start', '', {
+        approvalSummary: 'unused',
+        requestId: 'act_start',
+      });
+
+      expect(result).toBe('building');
+      expect(seen).toEqual(['/start']);
+      expect(api.methodCalls('sendMessage')).toHaveLength(0);
+    });
+
+    it('/exit does NOT run until the operator approves', async () => {
+      // An exit pays swap costs and realises impermanent loss, so it is irreversible in practice.
+      const api = new FakeTelegramApi();
+      const { handlers, seen } = collectingActions();
+      const notifier = buildNotifier(api, { actionHandlers: handlers });
+
+      const pending = notifier.performAction('/exit', '', {
+        approvalSummary: 'EXIT position (value $4,900, range 627–857)',
+        requestId: 'act_exit',
+      });
+      await waitForSend(api);
+
+      // Nothing happened yet, and the operator was shown the numbers.
+      expect(seen).toEqual([]);
+      const sent = api.methodCalls('sendMessage')[0]?.body['text'];
+      expect(String(sent)).toContain('EXIT position');
+      expect(String(sent)).toContain('$4,900');
+
+      await notifier.handleUpdate(callbackUpdate('act_exit', ALLOWED_USER_ID, 'approve'));
+      expect(await pending).toContain('position closed');
+      expect(seen).toEqual(['/exit']);
+    });
+
+    it('/exit runs NOTHING when the operator rejects', async () => {
+      const api = new FakeTelegramApi();
+      const { handlers, seen } = collectingActions();
+      const notifier = buildNotifier(api, { actionHandlers: handlers });
+
+      const pending = notifier.performAction('/exit', '', {
+        approvalSummary: 'EXIT',
+        requestId: 'act_exit_reject',
+      });
+      await waitForSend(api);
+      await notifier.handleUpdate(callbackUpdate('act_exit_reject', ALLOWED_USER_ID, 'reject'));
+
+      const result = await pending;
+      expect(result).toContain('not confirmed');
+      expect(seen).toEqual([]);
+    });
+
+    it('/resume needs an approval too (it re-enables trading after a risk halt)', async () => {
+      const api = new FakeTelegramApi();
+      const { handlers, seen } = collectingActions();
+      const notifier = buildNotifier(api, { actionHandlers: handlers });
+
+      const pending = notifier.performAction('/resume', '', {
+        approvalSummary: 'RESUME trading after risk halt',
+        requestId: 'act_resume',
+      });
+      await waitForSend(api);
+      expect(seen).toEqual([]);
+
+      await notifier.handleUpdate(callbackUpdate('act_resume', ALLOWED_USER_ID, 'approve'));
+      expect(await pending).toContain('resumed');
+      expect(seen).toEqual(['/resume']);
+    });
+
+    it('an UNAUTHORISED user cannot approve an exit (the gate is not just a prompt)', async () => {
+      const api = new FakeTelegramApi();
+      const { handlers, seen } = collectingActions();
+      const notifier = buildNotifier(api, { actionHandlers: handlers });
+
+      const pending = notifier.performAction('/exit', '', {
+        approvalSummary: 'EXIT',
+        requestId: 'act_exit_intruder',
+      });
+      await waitForSend(api);
+      await notifier.handleUpdate(callbackUpdate('act_exit_intruder', INTRUDER_USER_ID, 'approve'));
+
+      // Still pending: the intruder's click changed nothing.
+      expect(seen).toEqual([]);
+      expect(notifier.pendingCount).toBe(1);
+
+      await notifier.handleUpdate(callbackUpdate('act_exit_intruder', ALLOWED_USER_ID, 'reject'));
+      expect(await pending).toContain('not confirmed');
+      expect(seen).toEqual([]);
+    });
+
+    it('refuses an action when no action handlers are wired', async () => {
+      const notifier = buildNotifier(new FakeTelegramApi());
+      await expect(
+        notifier.performAction('/start', '', { approvalSummary: 'x', requestId: 'r' }),
+      ).rejects.toThrow('action handlers are not wired');
+    });
   });
 
   it('refuses to answer a query when no handlers are wired', async () => {

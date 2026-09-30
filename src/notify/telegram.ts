@@ -20,6 +20,7 @@
  */
 import {
   ALERT_SEVERITIES,
+  APPROVAL_KINDS,
   APPROVAL_STATUSES,
   noopNotifier,
   type AlertSeverity,
@@ -42,9 +43,42 @@ import { withDeadline } from '../execution/approvalGate.ts';
 /** Default Bot API host. Overridable for self-hosted Bot API servers and offline fixtures. */
 export const TELEGRAM_API_BASE_URL_DEFAULT = 'https://api.telegram.org';
 
-/** `/status` `/position` `/pools` `/nav` `/risk` (§78 / T13). */
-export const TELEGRAM_COMMANDS = ['/status', '/position', '/pools', '/nav', '/risk'] as const;
+/** How long an operator action stays answerable. Matches the §6.2 approval window (30 minutes). */
+export const DEFAULT_ACTION_APPROVAL_TTL_MS = 30 * 60 * 1000;
+
+/**
+ * Read-only queries plus the operator actions (§78 / T13 / architecture §6.2).
+ *
+ * The two groups are separated because they have different authority:
+ * - **queries** (`/status` …) answer a question and change nothing.
+ * - **actions** (`/exit` `/start` `/resume`) move money and are gated differently — see
+ *   `TELEGRAM_ACTION_COMMANDS`.
+ */
+export const TELEGRAM_QUERY_COMMANDS = [
+  '/status',
+  '/position',
+  '/pools',
+  '/nav',
+  '/risk',
+  '/help',
+] as const;
+
+/**
+ * Operator actions. `/exit` and `/resume` require an explicit Approve; `/start` does not, because the
+ * command itself is the authorisation (architecture §6.2) — asking twice would make "exit then rebuild"
+ * a two-round-trip ritual for no added safety.
+ */
+export const TELEGRAM_ACTION_COMMANDS = ['/exit', '/start', '/resume'] as const;
+
+export const TELEGRAM_COMMANDS = [...TELEGRAM_QUERY_COMMANDS, ...TELEGRAM_ACTION_COMMANDS] as const;
 export type TelegramCommand = (typeof TELEGRAM_COMMANDS)[number];
+export type TelegramQueryCommand = (typeof TELEGRAM_QUERY_COMMANDS)[number];
+export type TelegramActionCommand = (typeof TELEGRAM_ACTION_COMMANDS)[number];
+
+/** True for a command that moves funds and therefore carries its own authorisation rules. */
+export function isActionCommand(command: TelegramCommand): command is TelegramActionCommand {
+  return (TELEGRAM_ACTION_COMMANDS as readonly string[]).includes(command);
+}
 
 /** Callback-data actions of the inline keyboard. Telegram limits `callback_data` to 64 bytes. */
 export const DECISION_CALLBACK_ACTIONS = {
@@ -141,6 +175,27 @@ export interface QueryHandlers {
   readonly pools: (args: string) => string | Promise<string>;
   readonly nav: (args: string) => string | Promise<string>;
   readonly risk: (args: string) => string | Promise<string>;
+  /** `/help`: usage text. Optional — a sensible default is rendered when absent. */
+  readonly help?: (args: string) => string | Promise<string>;
+}
+
+/**
+ * Operator actions, injected like `QueryHandlers` so this module still never touches the chain, the DB
+ * or the executor.
+ *
+ * Each returns a human-readable outcome. **They must not throw for a business refusal** (e.g. `/start`
+ * while a position is open): the caller renders the reason. Throwing is reserved for wiring failures.
+ *
+ * `exit` and `resume` are gated by the approval channel before they run — see
+ * `createNotifierFromConfig` and the `/exit` handling below. `start` runs directly.
+ */
+export interface ActionHandlers {
+  /** Request to close the current position; the caller has ALREADY obtained approval. */
+  readonly exit: (args: string) => string | Promise<string>;
+  /** Begin a build from IDLE. No approval: the command is the authorisation. */
+  readonly start: (args: string) => string | Promise<string>;
+  /** Leave PAUSED after a risk halt; the caller has ALREADY obtained approval. */
+  readonly resume: (args: string) => string | Promise<string>;
 }
 
 /** Thrown for Bot API failures. Deliberately carries no URL/token (a token must never be logged). */
@@ -176,6 +231,10 @@ export interface TelegramNotifierOptions {
   readonly requestTimeoutMs?: number;
   /** Data source for `/status` `/position` `/pools` `/nav` `/risk`. */
   readonly queryHandlers?: QueryHandlers;
+  /** Operator actions (§6.2). Absent ⇒ action commands are refused rather than silently ignored. */
+  readonly actionHandlers?: ActionHandlers;
+  /** TTL for an action's approval prompt; falls back to the query/approval default. */
+  readonly actionApprovalTtlMs?: number;
   /** §77 audit sink (StateStore). Wired by the composition root. */
   readonly audit?: DecisionLogSink;
   readonly logger?: LoggerLike;
@@ -303,6 +362,8 @@ export class TelegramNotifier implements Notifier {
   private readonly pollTimeoutSeconds: number;
   private readonly requestTimeoutMs: number;
   private readonly queryHandlers: QueryHandlers | undefined;
+  private readonly actionHandlers: ActionHandlers | undefined;
+  private readonly approvalTtlMs: number;
   private readonly audit: DecisionLogSink | undefined;
   private readonly logger: LoggerLike;
   private readonly nowMs: () => number;
@@ -338,6 +399,8 @@ export class TelegramNotifier implements Notifier {
     this.pollTimeoutSeconds = Math.min(Math.max(options.pollTimeoutSeconds ?? DEFAULT_POLL_TIMEOUT_SECONDS, 0), 50);
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.queryHandlers = options.queryHandlers;
+    this.actionHandlers = options.actionHandlers;
+    this.approvalTtlMs = options.actionApprovalTtlMs ?? DEFAULT_ACTION_APPROVAL_TTL_MS;
     this.audit = options.audit;
     this.logger = options.logger ?? defaultLogger;
     this.nowMs = options.now ?? (() => Date.now());
@@ -498,6 +561,16 @@ export class TelegramNotifier implements Notifier {
     if (parsed === null) {
       throw new Error(`unknown query command: "${question}"`);
     }
+    // An action must be refused BEFORE the handler-wiring check. Otherwise a workspace with no query
+    // handlers wired would report "query handlers are not wired" for `/exit` — naming a wiring problem
+    // for what is actually an authorisation refusal, and hiding the real reason from the operator.
+    if (isActionCommand(parsed.command)) {
+      throw new Error(
+        `${parsed.command} is an operator action and cannot run through the query path; ` +
+          'use performAction (fail closed)',
+      );
+    }
+
     const handlers = this.queryHandlers;
     if (handlers === undefined) {
       throw new Error('telegram query handlers are not wired (fail closed)');
@@ -514,7 +587,62 @@ export class TelegramNotifier implements Notifier {
     if (parsed.command === '/nav') {
       return await handlers.nav(parsed.args);
     }
-    return await handlers.risk(parsed.args);
+    if (parsed.command === '/risk') {
+      return await handlers.risk(parsed.args);
+    }
+    if (parsed.command === '/help') {
+      return handlers.help === undefined ? renderHelp() : await handlers.help(parsed.args);
+    }
+    throw new Error(`unknown query command: "${question}"`);
+  }
+
+  /**
+   * Run an operator action (§6.2).
+   *
+   * ## Authorisation policy, per command
+   * - **`/exit`** and **`/resume`** are approved first. Both are irreversible or consequential: an exit
+   *   pays swap costs and realises impermanent loss, and a resume re-enables trading after a risk halt.
+   *   The approval is requested through this same channel, so the operator sees the numbers (position
+   *   value, range, fees) before agreeing.
+   * - **`/start`** runs directly. It is a deliberate command from an authorised user, so asking again
+   *   would make "exit then rebuild" a two-round-trip ritual without adding safety — and §6.2 records
+   *   that decision.
+   *
+   * A refusal from the gate does NOT run the handler; the caller sees why.
+   */
+  async performAction(
+    command: TelegramActionCommand,
+    args: string,
+    options: {
+      /** Human-readable payload shown in the approval prompt. Never include secrets. */
+      readonly approvalSummary: string;
+      readonly approvalPayload?: Readonly<Record<string, unknown>>;
+      readonly requestId: string;
+    },
+  ): Promise<string> {
+    const handlers = this.actionHandlers;
+    if (handlers === undefined) {
+      throw new Error('telegram action handlers are not wired (fail closed)');
+    }
+
+    if (command !== '/start') {
+      const decision = await this.requestApproval({
+        id: options.requestId,
+        kind: APPROVAL_KINDS.BUILD_POSITION,
+        createdAt: iso(this.nowMs()),
+        expiresAt: iso(this.nowMs() + this.approvalTtlMs),
+        payloadSummary: options.approvalSummary,
+        payloadJson: options.approvalPayload ?? {},
+        status: APPROVAL_STATUSES.PENDING,
+      });
+      if (!decision.approved) {
+        return `${command} not confirmed — nothing was done (${decision.reason ?? 'no approval'})`;
+      }
+    }
+
+    if (command === '/exit') return await handlers.exit(args);
+    if (command === '/start') return await handlers.start(args);
+    return await handlers.resume(args);
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -878,6 +1006,10 @@ export function createNotifierFromConfig(
   env: NodeJS.ProcessEnv = process.env,
   deps: {
     readonly queryHandlers?: QueryHandlers;
+  /** Operator actions (§6.2). Absent ⇒ action commands are refused rather than silently ignored. */
+  readonly actionHandlers?: ActionHandlers;
+  /** TTL for an action's approval prompt; falls back to the query/approval default. */
+  readonly actionApprovalTtlMs?: number;
     readonly audit?: DecisionLogSink;
     readonly logger?: LoggerLike;
     readonly fetchImpl?: FetchLike;
@@ -924,4 +1056,34 @@ export function createNotifierFromConfig(
     ...(transport.apiBaseUrl === undefined ? {} : { apiBaseUrl: transport.apiBaseUrl }),
     logger,
   });
+}
+
+/**
+ * Usage text for `/help`.
+ *
+ * States the authorisation policy explicitly, because "which commands need a confirmation" is exactly
+ * the thing an operator must not have to guess before pressing something that moves funds.
+ */
+function renderHelp(): string {
+  return [
+    'lptrader commands',
+    '',
+    'Queries (read-only):',
+    '  /status             state, mode, risk line',
+    '  /position           current pool, range, fees',
+    '  /pools              pools passing the hard filters now',
+    '  /nav                total NAV, reserve, LP value, fees',
+    '  /risk               depeg, reserve ratio, TVL, drawdown',
+    '',
+    'Actions:',
+    '  /exit               close the position (asks for confirmation)',
+    '  /start              build from an empty portfolio (no confirmation — the',
+    '                      command is the authorisation)',
+    '  /resume             leave a risk halt (asks for confirmation)',
+    '',
+    'After /exit the bot re-runs pool selection: it builds if a pool qualifies,',
+    'otherwise it stays flat and waits for /start.',
+    '',
+    'After a RISK halt the bot stops and does NOT rebuild. Use /resume to allow it.',
+  ].join('\n');
 }
