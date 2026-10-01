@@ -37,6 +37,7 @@ import type { TxStore } from '../store/txStore.ts';
 import type { StateMachine } from '../strategy/stateMachine.ts';
 import { APPROVAL_KINDS } from '../types/notifier.ts';
 import { SWAP_PURPOSES } from '../types/adapters.ts';
+import { silentLogger, type Logger } from '../util/logger.ts';
 import { renderRows, usd } from '../notify/messageFormat.ts';
 import { checkBuildAllocation, type AllocationLimits } from '../strategy/allocation.ts';
 import { checkWriteAllowed, WRITE_ACTIONS } from '../strategy/stateMachine.ts';
@@ -112,6 +113,8 @@ export interface PositionExecutorDeps {
   readonly approvalGate: ApprovalGate;
   /** Current bot state; injected so the executor never caches a stale gate verdict. */
   readonly currentState: () => BotState;
+  /** Where the build narrates its steps. Silent unless the composition root supplies one. */
+  readonly logger?: Logger;
 }
 
 /**
@@ -125,9 +128,11 @@ export interface PositionExecutorDeps {
  */
 export class PositionExecutor {
   private readonly deps: PositionExecutorDeps;
+  private readonly log: Logger;
 
   constructor(deps: PositionExecutorDeps) {
     this.deps = deps;
+    this.log = deps.logger ?? silentLogger;
   }
 
   /**
@@ -136,6 +141,14 @@ export class PositionExecutor {
    * would have rejected anyway.
    */
   async buildPosition(input: BuildPositionInput): Promise<ExecutionOutcome> {
+    this.log.info('execute', 'build requested', {
+      poolId: input.pool.poolId,
+      capitalUsd: input.capitalUsd,
+      navUsd: input.navUsd,
+      atomic: this.deps.dex.supportsAtomicBuild,
+      idempotencyKey: input.idempotencyKey,
+    });
+
     const guard = this.checkGuard(input.guard);
     if (guard !== null) return guard;
 
@@ -614,6 +627,12 @@ export class PositionExecutor {
 
   private adapterFailure(idempotencyKey: string, error: unknown): ExecutionOutcome {
     const message = error instanceof Error ? error.message : String(error);
+    this.log.error('execute', 'the venue refused the build', {
+      reason: message,
+      // The decoded revert reason, when viem managed to extract one: `STF`, `Transaction too old`, etc.
+      shortMessage: (error as { shortMessage?: string }).shortMessage ?? '',
+      revert: (error as { data?: unknown }).data ?? 'none',
+    });
 
     /*
      * The WHOLE error is persisted, not just its message.

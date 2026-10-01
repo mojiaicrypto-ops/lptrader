@@ -98,6 +98,7 @@ import { createNotifierFromConfig } from './notify/telegram.ts';
 import { type SchedulerCadence } from './execution/scheduler.ts';
 import { readKeystoreFile } from './security/keystore.ts';
 import { BOT_STATES } from './types/state.ts';
+import { createLogger } from './util/logger.ts';
 import type { PortfolioSnapshot } from './types/portfolio.ts';
 
 /** Everything the cadences share; built once so no cadence rebuilds a client or a store. */
@@ -224,6 +225,14 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
   }
 
 
+  /**
+   * The process's logger, created once and handed to every layer that narrates a decision.
+   *
+   * Level comes from `LP_LOG_LEVEL` (default `info`), so an operator raises verbosity without editing code —
+   * a debug level that required a rebuild would not be used at the moment it is needed.
+   */
+  const logger = createLogger();
+
   const db = openDatabase(env['LP_DB_PATH'] ?? 'data/lptrader.db');
   const stateStore = new StateStore(db);
   const txStore = new TxStore(db);
@@ -263,7 +272,7 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
   const adapters = options.dex !== undefined
     ? [options.dex]
     : DEX_PREFERENCE.filter((dex) => config.whitelist.isWhitelistedDex(chainId, dex)).map((dex) =>
-        createDexAdapter(dex, { chainId, whitelist: config.whitelist, chain }, constructors),
+        createDexAdapter(dex, { chainId, whitelist: config.whitelist, chain, logger }, constructors),
       );
   const dex = options.dex ?? adapters[0];
   if (dex === undefined) {
@@ -358,6 +367,7 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
         stateMachine: stateMachineRef,
         approvalGate: approvals,
         currentState: () => stateMachineRef.current,
+        logger,
       });
 
   // §6.2: built after the executor so the late-bound reference above can be resolved. In read-only mode

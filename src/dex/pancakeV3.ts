@@ -60,6 +60,7 @@ import type { RpcReadResult } from '../chain/rpc.ts';
 import { PositionReader, type RawPositionTuple } from '../chain/positionReader.ts';
 import { BSC_ADDRESSES, BSC_DEX_CONTRACTS, type DexContracts } from '../config/builtins.ts';
 import { isNoPool, tickSpacingFor, type DexAdapterFactoryOptions } from './index.ts';
+import { silentLogger, type Logger } from '../util/logger.ts';
 import { computePriceImpact } from '../strategy/swapPlanner.ts';
 import { applyFloorRatio, toFloat } from '../util/decimal.ts';
 import type {
@@ -157,6 +158,8 @@ export class PancakeV3Adapter implements DexAdapter {
    */
   readonly supportsAtomicBuild = true;
 
+  /** Where this adapter narrates execution. Silent unless the composition root supplies one. */
+  readonly #log: Logger;
   readonly #whitelist: Whitelist;
   readonly #chain: BscChainAdapter;
   readonly #pools: PoolReader;
@@ -165,6 +168,7 @@ export class PancakeV3Adapter implements DexAdapter {
   readonly #now: () => Date;
 
   constructor(options: DexAdapterFactoryOptions) {
+    this.#log = options.logger ?? silentLogger;
     // The options carry both the declared chain id and the chain layer; a mismatch would point reads
     // and the write path at different chains, which is unrecoverable downstream.
     if (options.chain.chainId !== options.chainId) {
@@ -715,12 +719,47 @@ export class PancakeV3Adapter implements DexAdapter {
       this.#sdkApprovalType(quote.tokenOut),
     );
 
-    const txHash = await this.#send(
-      this.#smartRouterAddress(),
-      params.calldata,
-      BigInt(params.value),
-      request.guard,
-    );
+    /*
+     * Everything needed to diagnose a revert, BEFORE the send attempt.
+     *
+     * A failed `eth_estimateGas` never reaches the chain, so no hash exists and nothing is recorded
+     * anywhere: the calldata that caused it is the only artefact, and it existed solely in memory. Logging
+     * it here means the next failure is readable directly rather than reconstructed from a pasted error.
+     */
+    this.#log.info('execute', 'atomic build (swap + mint in one transaction)', {
+      router: this.#smartRouterAddress(),
+      value: params.value,
+      approvalTokenIn: quote.tokenIn,
+      approvalTokenOut: quote.tokenOut,
+      approvalTypeIn: this.#sdkApprovalType(quote.tokenIn),
+      approvalTypeOut: this.#sdkApprovalType(quote.tokenOut),
+      amount0Desired: request.amount0DesiredRaw,
+      amount1Desired: request.amount1DesiredRaw,
+      liquidity: position.liquidity,
+      calldataBytes: (params.calldata.length - 2) / 2,
+    });
+    // The calldata itself at debug: it is long, and only needed once something has failed.
+    this.#log.debug('execute', 'calldata', { data: params.calldata });
+
+    let txHash: Hash;
+    try {
+      txHash = await this.#send(
+        this.#smartRouterAddress(),
+        params.calldata,
+        BigInt(params.value),
+        request.guard,
+      );
+    } catch (error) {
+      // The failure branch: report the encoded call alongside the reason, so the two can be read together.
+      this.#log.error('execute', 'atomic build FAILED', {
+        reason: errorMessage(error),
+        revertData: revertDataOf(error),
+        to: this.#smartRouterAddress(),
+        calldata: params.calldata,
+      });
+      throw error;
+    }
+    this.#log.info('execute', 'atomic build submitted', { txHash });
     return {
       txHash,
       state: TX_STATES.SUBMITTED,
@@ -1255,6 +1294,17 @@ export class PancakeV3Adapter implements DexAdapter {
   async #send(to: Address, data: Hex, value: bigint, guard: TxGuardChecks): Promise<Hash> {
     return this.#chain.sendTransaction({ to, data, value, guard });
   }
+}
+
+/** The revert payload a viem error carries, when there is one. Separated so it logs as a short field. */
+function revertDataOf(error: unknown): string {
+  const carrier = error as { readonly data?: unknown; readonly cause?: { readonly data?: unknown } };
+  const data = carrier.data ?? carrier.cause?.data;
+  return typeof data === 'string' ? data : 'none';
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /** §82 factory: build the Pancake adapter from runtime options. */

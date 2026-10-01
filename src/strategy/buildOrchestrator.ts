@@ -37,6 +37,7 @@ import type { PoolSnapshot } from '../types/market.ts';
 import type { PoolPriceView, SwapQuote, TxGuardChecks } from '../types/adapters.ts';
 import type { Address, IsoTimestamp, PoolId, Ratio, Tick, UsdAmount } from '../types/primitives.ts';
 import type { StrategyConfig } from '../types/config.ts';
+import { silentLogger, type Logger } from '../util/logger.ts';
 import type { TokenMeta } from '../types/token.ts';
 import type { PositionPlan } from './positionPlanner.ts';
 import type { BuildPositionInput } from '../execution/positionExecutor.ts';
@@ -113,6 +114,14 @@ export interface BuildOrchestratorDeps {
   readonly walletAddress: Address;
   /** Injected so a decision is reproducible in tests and replay (§77). */
   readonly now: () => IsoTimestamp;
+  /**
+   * Where the build narrates itself.
+   *
+   * Optional with a silent default so existing callers and tests keep working; the composition root passes
+   * the real one. Every branch below reports, including the ones that return early — a refusal that says
+   * nothing is the failure this exists to prevent.
+   */
+  readonly logger?: Logger;
 }
 
 /**
@@ -126,7 +135,10 @@ export class BuildOrchestrator {
 
   constructor(deps: BuildOrchestratorDeps) {
     this.deps = deps;
+    this.log = deps.logger ?? silentLogger;
   }
+
+  private readonly log: Logger;
 
   /**
    * `navUsd` is the NAV the build is sized against — NOT a budget. The LP amount is derived from it via
@@ -135,13 +147,33 @@ export class BuildOrchestrator {
    */
   async prepare(candidates: readonly PoolSnapshot[], navUsd: UsdAmount): Promise<BuildDecision> {
     const { config } = this.deps;
+    this.log.info('build', `planning a build from ${candidates.length} candidate pool(s)`, {
+      navUsd,
+    });
 
     // ---- 1. Screen -------------------------------------------------------------------------------
     // The screener is the ONLY place allowed to read the chain, so it also answers §16's on-chain gates
     // (impact at the probe notional, tick alignment). It stops at the first pool that passes.
+    this.log.debug('build', 'screening candidates on chain (this reads every pool until one passes)');
     const outcome = await this.deps.screener.screen(candidates);
+    this.log.info('build', 'screening finished', {
+      accepted: outcome.accepted?.poolId ?? 'none',
+      examined: outcome.attempts.length,
+      aborted: outcome.aborted,
+    });
+    for (const attempt of outcome.attempts) {
+      // One line per candidate at debug: an operator asking "why not that pool" needs the answer without
+      // re-running anything.
+      this.log.debug('build', `candidate ${attempt.poolId}`, {
+        accepted: attempt.accepted,
+        refusal: attempt.refusal ?? attempt.reasons[0] ?? '',
+      });
+    }
 
     if (outcome.aborted) {
+      this.log.warn('build', 'screening aborted before reaching a verdict', {
+        reason: outcome.abortReason ?? 'unknown',
+      });
       // Distinguishing this from "nothing passed" is the whole point of the flag: the pools were never
       // judged, so their quality is unknown and the operator has a DATA problem, not a pool problem.
       return {
@@ -157,6 +189,7 @@ export class BuildOrchestrator {
     const pool = outcome.accepted;
     const price = outcome.price;
     if (pool === null || price === null) {
+      this.log.warn('build', 'no pool passed the hard filters', { examined: outcome.attempts.length });
       return {
         ok: false,
         reason: BUILD_REFUSALS.NO_QUALIFIED_POOL,
@@ -166,6 +199,13 @@ export class BuildOrchestrator {
     }
 
     // ---- 2. Plan ---------------------------------------------------------------------------------
+    this.log.info('build', `using pool ${pool.poolId}`, {
+      dex: pool.dex,
+      tvlUsd: pool.tvlUSD.value,
+      tick: price.tick,
+      feeTier: price.feeTier,
+      tickSpacing: price.tickSpacing,
+    });
     const token0 = this.deps.tokenMeta(pool.token0);
     const token1 = this.deps.tokenMeta(pool.token1);
     if (token0 === null || token1 === null) {
@@ -182,6 +222,11 @@ export class BuildOrchestrator {
     // §3: the LP amount is the budget derived from NAV, and the check is on the RESULTING allocation so
     // two individually-compliant builds cannot combine into an over-allocation.
     const lpCapital = navUsd * config.capital.maxLpRatio;
+    this.log.info('build', 'allocation accepted', {
+      navUsd,
+      lpCapital,
+      maxLpRatio: config.capital.maxLpRatio,
+    });
     const allocation = checkBuildAllocation({
       navUsd,
       currentLpValueUsd: 0,
@@ -200,6 +245,7 @@ export class BuildOrchestrator {
       };
     }
 
+    this.log.debug('plan', 'computing range, ticks and the optimal ratio');
     let plan: PositionPlan;
     try {
       plan = planPosition({
@@ -212,6 +258,9 @@ export class BuildOrchestrator {
         referencePriceUsd: pool.stockReferencePrice.value,
       });
     } catch (error) {
+      this.log.error('plan', 'the position plan could not be computed', {
+        reason: error instanceof Error ? error.message : String(error),
+      });
       return {
         ok: false,
         reason: BUILD_REFUSALS.PLAN_FAILED,
@@ -219,6 +268,15 @@ export class BuildOrchestrator {
         outcome,
       };
     }
+
+    this.log.info('plan', 'plan ready', {
+      lowerTick: plan.lowerTick,
+      upperTick: plan.upperTick,
+      liquidity: plan.liquidity,
+      amount0: plan.amount0,
+      amount1: plan.amount1,
+      swapNeeded: plan.swapNeeded === null ? 'none' : plan.swapNeeded.amountIn,
+    });
 
     // ---- 3. Quote --------------------------------------------------------------------------------
     // The screener already quoted at the §16 probe notional to judge the pool. THIS quote is for the
@@ -230,6 +288,11 @@ export class BuildOrchestrator {
     if (plan.swapNeeded === null) {
       buildQuote = this.noSwapQuote(pool);
     } else {
+      this.log.info('quote', 'requesting an on-chain quote for the deficit', {
+        tokenIn: plan.swapNeeded.tokenIn,
+        tokenOut: plan.swapNeeded.tokenOut,
+        amountIn: plan.swapNeeded.amountIn,
+      });
       try {
         buildQuote = await this.deps.quoteSwap({
           poolId: pool.poolId,
@@ -238,7 +301,27 @@ export class BuildOrchestrator {
           amountIn: plan.swapNeeded.amountIn,
           ttlSeconds: config.swap.quoteTtlSeconds,
         });
+        this.log.info('quote', 'quote received', {
+          amountOut: buildQuote.amountOutRaw,
+          amountOutMinimum: buildQuote.amountOutMinimumRaw,
+          amountInUsd: buildQuote.amountInUsd,
+          priceImpact: buildQuote.priceImpact,
+          slippage: buildQuote.slippageTolerance,
+        });
+        // The comparison that decides whether the mint can be fed: stated explicitly, because a shortfall
+        // here is invisible in the raw numbers.
+        const shortfall = plan.amount0 - buildQuote.amountOutRaw;
+        if (shortfall > 0n) {
+          this.log.warn('quote', 'the quote delivers LESS than the position needs', {
+            needed: plan.amount0,
+            gets: buildQuote.amountOutRaw,
+            shortfall,
+          });
+        }
       } catch (error) {
+        this.log.error('quote', 'the venue could not quote the required swap', {
+          reason: error instanceof Error ? error.message : String(error),
+        });
         return {
           ok: false,
           reason: BUILD_REFUSALS.QUOTE_FAILED,
@@ -255,6 +338,13 @@ export class BuildOrchestrator {
     // swap — which is the common case when the wallet already holds the optimal ratio.
     const noSwap = plan.swapNeeded === null;
     const gate = noSwap ? { ok: true, reasons: [] as readonly string[] } : evaluateSwapQuote(buildQuote, limits, now);
+    this.log.info('gate', gate.ok ? 'swap gate passed' : 'swap gate REFUSED', {
+      impact: buildQuote.priceImpact,
+      maxImpact: limits.maxPriceImpact,
+      slippage: buildQuote.slippageTolerance,
+      maxSlippage: limits.maxSlippage,
+      reasons: gate.reasons.join('; '),
+    });
     if (!gate.ok) {
       return {
         ok: false,
@@ -279,6 +369,11 @@ export class BuildOrchestrator {
     });
 
     const intent = planSwapIntent(plan, buildQuote, buildQuote.slippageTolerance);
+    this.log.info('build', 'handing the request to the executor', {
+      amountInRaw: intent.amountInRaw,
+      amountOutMinimumRaw: intent.amountOutMinimumRaw,
+      noSwapNeeded: intent.noSwapNeeded === true,
+    });
 
     // ---- 5. Hand off -----------------------------------------------------------------------------
     return {

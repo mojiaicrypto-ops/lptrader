@@ -15,6 +15,7 @@
  * all, rather than being caught later by whichever call happened to remember (§12).
  */
 import type { BscChainAdapter } from '../chain/adapter.ts';
+import type { Logger } from '../util/logger.ts';
 import type { DexAdapter } from '../types/adapters.ts';
 import type { ChainId, DexId } from '../types/primitives.ts';
 import type { Whitelist } from '../types/registry.ts';
@@ -65,6 +66,14 @@ export interface DexAdapterFactoryOptions {
   readonly slippageTolerance?: number;
   /** Injectable clock so `expiresAt` and quote freshness are deterministic under test. */
   readonly now?: () => Date;
+  /**
+   * Where the adapter narrates an execution.
+   *
+   * The DEX layer is where a build actually fails — gas estimation, approvals, the atomic call — and it
+   * had no logging whatsoever, so a revert arrived as one opaque string. Optional with a silent default so
+   * existing callers and tests keep working.
+   */
+  readonly logger?: Logger;
 }
 
 /**
