@@ -308,26 +308,36 @@ pending aprv : 0
 
 **`last beat` 是判断"活着吗"最快的方式** —— 它直接告诉你调度器还在不在跳。
 
-#### 后台启动需要口令文件
+#### 后台启动与口令
 
-后台进程没有终端，**交互式口令提示无法回答** —— 不配置的话进程会永远卡在提示上。
+**三种给口令的方式，任选一种：**
 
 ```bash
-# 1) 一次性：把口令写入只有 root 可读的文件
-printf '%s' '你的钱包口令' > /root/.lptrader-pass
-chmod 600 /root/.lptrader-pass
+# 1) 环境变量（适合脚本化/无人值守）
+KEYSTORE_PASSPHRASE='你的口令' ./scripts/lptrader.sh start
 
-# 2) .env
-KEYSTORE_PASSPHRASE_FILE=/root/.lptrader-pass
+# 2) 管道
+printf '%s' '你的口令' | ./scripts/lptrader.sh start
+
+# 3) 直接输（脚本会提示，输入时不显示）
+./scripts/lptrader.sh start
 ```
 
-**权限必须是 `0600`。** 放宽了会**拒绝启动**，而不是警告 —— 一个在密钥暴露时照常交易的系统，只会在资金丢失之后才发现暴露。
+**三种都验证过能到 `mode: LIVE`。**
 
-**验证**：
+> **注意**：环境变量对本进程的环境可见 —— 共享主机上优先用方式 3。
+> 用「方式 1/2」时口令会出现在 shell 历史或进程列表里，必要时先 `unset HISTFILE`。
+
+**后台进程能读到你的键盘吗？**
+
+`setsid`/`nohup` 会脱离控制终端，所以**方式 3 在后台启动时可能读不到你的输入**。
+脚本会在启动前告诉你这一点，并给出方式 1/2。
+
+**`doctor` 会说明当前用哪种来源**：
 
 ```bash
 ./scripts/lptrader.sh doctor
-#   PASSPHRASE_FILE          /root/.lptrader-pass (mode 600)      ← 绿
+#   PASSPHRASE    not set — you will be prompted (works at a terminal and from a pipe)
 ```
 
 #### 日志
