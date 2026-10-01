@@ -686,27 +686,20 @@ export class TelegramNotifier implements Notifier {
             return;
           }
           /*
-           * Offset is advanced AFTER handling, not before.
+           * Dispatched WITHOUT awaiting, and the offset advanced immediately.
            *
-           * Telegram deletes an update once `getUpdates` returns past its id, so advancing first means a
-           * throw inside `handleUpdate` loses the update permanently — no redelivery, and the operator sees
-           * a button that does nothing. Handling first means a failure leaves the update queued, and the
-           * next poll retries it.
+           * Awaited dispatch deadlocks the channel. `/start` does not return until the build it triggers
+           * has passed the approval gate — up to 30 minutes — so awaiting it here stopped the poll loop
+           * from ever reading the next update. The operator's own Approve click sat unread in Telegram's
+           * queue while the process waited for it: every command after `/start` appeared to do nothing,
+           * because the loop that would have read it was blocked on `/start` itself.
            *
-           * A failure is contained per update rather than escaping the loop: one bad update must not stop
-           * the channel for everything else.
+           * Offset is committed here because the update is now owned by this process: it has been read and
+           * its handling has started. A failure is reported by the handler below rather than by redelivery,
+           * which is the trade that keeps the channel live.
            */
-          try {
-            await this.handleUpdate(update);
-          } catch (error) {
-            this.logger.error('telegram: handling an update failed; it will be retried', {
-              updateId: String(update.update_id),
-              reason: error instanceof Error ? error.message : 'unknown error',
-            });
-            // Stop here so the offset stays where it is: the next poll re-fetches this update.
-            break;
-          }
           this.offset = Math.max(this.offset ?? 0, update.update_id + 1);
+          void this.dispatch(update);
         }
         if (updates.length === 0 && this.pollTimeoutSeconds === 0) {
           await this.waitUnlessStopped(250);
@@ -723,6 +716,23 @@ export class TelegramNotifier implements Notifier {
         });
         await this.waitUnlessStopped(Math.min(30_000, 1_000 * 2 ** Math.min(failures, 5)));
       }
+    }
+  }
+
+  /**
+   * Handle one update on its own, reporting any failure instead of losing the update silently.
+   *
+   * Fire-and-forget from the poll loop's perspective. A handler that never returns (a command waiting for
+   * approval) is expected and harmless here — it holds only its own promise.
+   */
+  private async dispatch(update: TelegramUpdate): Promise<void> {
+    try {
+      await this.handleUpdate(update);
+    } catch (error) {
+      this.logger.error('telegram: handling an update failed', {
+        updateId: String(update.update_id),
+        reason: error instanceof Error ? error.message : 'unknown error',
+      });
     }
   }
 
