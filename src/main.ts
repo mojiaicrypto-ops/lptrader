@@ -222,12 +222,25 @@ async function main(): Promise<void> {
       '\nStarting. Ctrl-C to stop.\n',
   );
 
+  /**
+   * Report EVERY beat, not only the failures.
+   *
+   * The previous version printed nothing on success, which made "working normally" and "dead" look
+   * identical from the outside — and the first scan takes ~4 minutes, so an operator watching a healthy
+   * start sees several minutes of silence and has no way to tell the difference. An operator who cannot
+   * see progress will restart the process, and restarting is the one action that costs something.
+   */
   const scheduler = new Scheduler({
     cadences,
     onReport: (report) => {
-      if (!report.ok) {
-        process.stderr.write(`[scheduler] ${report.name} failed: ${report.error ?? 'unknown'}\n`);
+      const elapsed = Math.round((Date.parse(report.finishedAt) - Date.parse(report.startedAt)) / 1000);
+      const stamp = report.finishedAt.slice(11, 19);
+      if (report.ok) {
+        process.stdout.write(`[${stamp}] ${report.name} ok (${elapsed}s)\n`);
+        return;
       }
+      // Failures stay on stderr so a log split by stream keeps them separable.
+      process.stderr.write(`[${stamp}] ${report.name} FAILED (${elapsed}s): ${report.error ?? 'unknown'}\n`);
     },
   });
 
