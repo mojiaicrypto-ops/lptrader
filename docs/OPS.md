@@ -310,23 +310,32 @@ pending aprv : 0
 
 #### 后台启动与口令
 
-**后台进程无法提示你输入口令** —— 它脱离了控制终端，读不到键盘（实测：`stdin closed before a value was provided`）。
-
-所以有两种方式：
+**直接启动即可 —— 脚本会提示你输口令：**
 
 ```bash
-# 1) 后台启动：口令随环境变量给出
-KEYSTORE_PASSPHRASE='你的口令' ./scripts/lptrader.sh start
-./scripts/lptrader.sh status     # 应显示 running + [时间] pool-scan ok
+./scripts/lptrader.sh start
+# 钱包口令（输入时不显示，直接回车则取消）: ****
+# started (pid 28450)
+```
 
-# 2) 前台启动：会提示你输入（Ctrl-C 停止）
+**口令不回显，也不写入任何文件** —— 脚本把它放进**本次启动的环境变量**，脱离终端的进程从自己的环境取用。
+
+**无人值守时**（`crontab` / CI）改用环境变量：
+
+```bash
+KEYSTORE_PASSPHRASE='你的口令' ./scripts/lptrader.sh start
+```
+
+**想实时看输出**：
+
+```bash
 ./scripts/lptrader.sh start --foreground
 ```
 
-**缺口令时脚本会直接拒绝并告诉你怎么做**，不会启动到一半才失败。
-
-> **环境变量对本进程的环境可见。** 共享主机上优先用方式 2；用方式 1 时注意 shell
-> 历史可能记录该命令。
+> **为什么必须在这里问**：后台进程脱离控制终端后**自己无法提示输入** —— 实测直接死掉
+> （`stdin closed before a value was provided`）。所以口令必须在启动**之前**拿到。
+>
+> **共享主机注意**：`KEYSTORE_PASSPHRASE='...'` 会进 shell 历史。用默认的交互提示可避免。
 
 #### 日志
 

@@ -124,20 +124,32 @@ cmd_start() {
   #
   # Detected rather than assumed: a keystore plus no passphrase source is exactly the combination that
   # cannot work in the background, and it is knowable without starting anything.
-  # A background start has no way to ask for the passphrase: `setsid` creates a new session with no
-  # controlling terminal, and the process dies with "stdin closed before a value was provided" — measured
-  # twice, with and without a pipe. So the passphrase must already be in the environment, and saying that
-  # HERE is the difference between an instruction and a stack trace.
+  # Ask for the passphrase here, before anything starts.
   #
-  # A pipe is deliberately not offered as a third option: it would need the process to stay attached to the
-  # terminal, which conflicts with the detachment that lets it survive the shell. Two ways in, both tested.
+  # A background process cannot prompt for it — `setsid` gives no controlling terminal, so the process
+  # would die with "stdin closed before a value was provided". Asking at the console and exporting the
+  # answer sidesteps that entirely: the secret is typed interactively, never written to a file, and the
+  # detached process receives it through its own environment.
   if grep -qE '^KEYSTORE_PATH=.+' "$ENV_FILE" && [ -z "${KEYSTORE_PASSPHRASE:-}" ]; then
-    warn "这个配置需要钱包口令，而后台进程无法提示你输入。"
-    warn ""
-    warn "用下面任一种方式："
-    warn "  KEYSTORE_PASSPHRASE='你的口令' $0 start     # 后台，无需终端"
-    warn "  $0 start --foreground                      # 前台，会提示你输入"
-    exit 1
+    if [ -t 0 ]; then
+      printf '钱包口令（输入时不显示，直接回车则取消）: ' >&2
+      # `read -s`: no echo, so the passphrase does not land in the terminal scrollback.
+      local typed
+      if ! IFS= read -r -s typed; then
+        typed=''
+      fi
+      printf '\n' >&2
+      if [ -z "$typed" ]; then
+        warn "未输入口令，已取消启动。"
+        exit 1
+      fi
+      export KEYSTORE_PASSPHRASE="$typed"
+      unset typed
+    else
+      warn "需要钱包口令，但当前不是交互式终端，无法提示你输入。"
+      warn "改为：KEYSTORE_PASSPHRASE='你的口令' $0 start"
+      exit 1
+    fi
   fi
 
   rotate_log
