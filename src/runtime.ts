@@ -420,7 +420,19 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
         config,
         screener,
         tokenMeta: (address) => config.whitelist.registry.getTokenByAddress(chainId, address),
-        quoteSwap: (request) => dex.quoteSwap(request),
+        /*
+         * Quote through the adapter that OWNS the pool.
+         *
+         * The screener reads every whitelisted venue, so it can accept a pool on any of them — but this
+         * previously called `dex.quoteSwap`, bound to the PREFERRED adapter. A Uniswap pool could therefore
+         * be selected and then fail at the quote with a poolId that adapter does not know, which is a
+         * confusing way to say "wrong venue". Observed live.
+         */
+        quoteSwap: (request) => {
+          const venue = request.poolId.split(':')[1];
+          const owner = adapters.find((adapter) => adapter.dex === venue) ?? dex;
+          return owner.quoteSwap(request);
+        },
         guard: () => buildTxGuard(buildGuardChecks(config, dex, walletAddressOf(env))),
         walletAddress: walletAddressOf(env),
         now: () => new Date().toISOString(),

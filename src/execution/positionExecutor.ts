@@ -37,6 +37,7 @@ import type { TxStore } from '../store/txStore.ts';
 import type { StateMachine } from '../strategy/stateMachine.ts';
 import { APPROVAL_KINDS } from '../types/notifier.ts';
 import { SWAP_PURPOSES } from '../types/adapters.ts';
+import { renderRows, usd } from '../notify/messageFormat.ts';
 import { checkBuildAllocation, type AllocationLimits } from '../strategy/allocation.ts';
 import { checkWriteAllowed, WRITE_ACTIONS } from '../strategy/stateMachine.ts';
 import { evaluateSwapQuote, planSwapIntent, type SwapLimits } from '../strategy/swapPlanner.ts';
@@ -634,19 +635,42 @@ export class PositionExecutor {
   }
 
   /** Human-readable digest for the approval message. Must contain no secret material. */
+  /**
+   * The approval prompt's digest.
+   *
+   * This is the last thing a human sees before real money moves, so it is written to be CHECKED, not
+   * merely displayed: the figures an operator must verify are the ones with a plain-language label, and the
+   * raw units appear only where a raw unit is what the transaction actually contains.
+   *
+   * Ordering follows the decision: what is being committed, at what price, over what range, and what the
+   * swap will cost. A number that cannot be judged on its own is paired with the bound it must satisfy
+   * (`impact 0.02% (上限 0.80%)`), because a bare percentage forces the operator to remember the limit.
+   */
   private describeBuild(input: BuildPositionInput, swapAmountInRaw: bigint): string {
     const price = input.pool.currentPrice.value;
+    const swing = (input.plan.lowerPrice / price - 1) * 100;
+    const rise = (input.plan.upperPrice / price - 1) * 100;
     return [
-      `BUILD ${input.pool.dex} ${input.pool.poolId}`,
-      `capital $${input.capitalUsd.toFixed(2)}`,
-      `price $${price.toFixed(4)}`,
-      `range $${input.plan.lowerPrice.toFixed(2)} – $${input.plan.upperPrice.toFixed(2)}`,
-      `ticks ${input.plan.lowerTick} → ${input.plan.upperTick}`,
-      `swap ${swapAmountInRaw.toString()} raw`,
-      `impact ${(input.quote.priceImpact * 100).toFixed(4)}% (max ${(input.limits.maxPriceImpact * 100).toFixed(2)}%)`,
-      `slippage ${(input.quote.slippageTolerance * 100).toFixed(2)}%`,
+      `建仓 ${input.pool.dex}`,
+      shortPool(input.pool.poolId),
+      '',
+      renderRows([
+        { label: '投入金额', value: usd(input.capitalUsd) },
+        { label: '当前价格', value: usd(price) },
+        { label: '价格区间', value: `${usd(input.plan.lowerPrice)} ~ ${usd(input.plan.upperPrice)}` },
+        { label: '区间幅度', value: `${swing.toFixed(1)}% ~ +${rise.toFixed(1)}%` },
+        { label: '需兑换', value: `${swapAmountInRaw.toString()}（最小单位）` },
+        { label: '价格影响', value: `${(input.quote.priceImpact * 100).toFixed(4)}%（上限 ${(input.limits.maxPriceImpact * 100).toFixed(2)}%）` },
+        { label: '允许滑点', value: `${(input.quote.slippageTolerance * 100).toFixed(2)}%` },
+      ]),
     ].join('\n');
   }
+}
+
+/** `56:pancakeswap-v3:0xe531…` → `…e531fcb1f5` — the tail identifies the pool; the full id is unreadable. */
+function shortPool(poolId: string): string {
+  const address = poolId.split(':')[2] ?? poolId;
+  return `池子 …${address.slice(-10)}`;
 }
 
 /**

@@ -585,10 +585,13 @@ describe('approval gate is not bypassable', () => {
 
     expect(seen).toHaveLength(1);
     expect(seen[0]?.kind).toBe(APPROVAL_KINDS.BUILD_POSITION);
-    expect(seen[0]?.payloadSummary).toContain('BUILD');
-    // The digest must show the numbers the human is approving.
-    expect(seen[0]?.payloadSummary).toContain('impact');
-    expect(seen[0]?.payloadSummary).toContain('slippage');
+    // The digest must name the action and show every number the human is approving. Asserted on the
+    // figures rather than the exact labels: the labels are presentation, the values are the contract.
+    expect(seen[0]?.payloadSummary).toContain('建仓');
+    expect(seen[0]?.payloadSummary).toMatch(/价格影响/);
+    expect(seen[0]?.payloadSummary).toMatch(/允许滑点/);
+    expect(seen[0]?.payloadSummary).toMatch(/投入金额/);
+    expect(seen[0]?.payloadSummary).toMatch(/价格区间/);
   });
 });
 
