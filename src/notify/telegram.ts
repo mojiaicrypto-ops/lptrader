@@ -840,12 +840,29 @@ export class TelegramNotifier implements Notifier {
       });
       return;
     }
+    /*
+     * Dispatch by kind.
+     *
+     * Every command used to go through `query()`, which refuses action commands by design — so `/start`,
+     * `/exit` and `/resume` could NEVER run. `performAction` existed, was documented and tested, and had
+     * no caller: the operator's typing reached a guard that told them to use a method nothing invoked.
+     *
+     * The refusal text made that worse by reading like an authorisation problem ("cannot run through the
+     * query path") rather than a wiring one.
+     */
     let answer: string;
     try {
-      answer = await this.query(text);
+      answer = isActionCommand(parsed.command)
+        ? await this.performAction(parsed.command, parsed.args, {
+            // The digest is built by the action itself in the gated case; `/start` needs no summary
+            // because it does not ask for approval (§6.2: the command IS the authorisation).
+            approvalSummary: `${parsed.command} ${parsed.args}`.trim(),
+            requestId: `tg-${message.message_id}-${parsed.command.replace('/', '')}`,
+          })
+        : await this.query(text);
     } catch (error) {
       const reason = error instanceof Error ? error.message : 'unknown error';
-      this.logger.error(`telegram: query "${parsed.command}" failed`, { reason });
+      this.logger.error(`telegram: command "${parsed.command}" failed`, { reason });
       answer = `${parsed.command}: data unavailable (${reason})`;
     }
     try {

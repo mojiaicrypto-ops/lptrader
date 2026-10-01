@@ -243,7 +243,9 @@ function describePool(pool: PoolView): string {
   return (
     `  ${shortId(pool.poolId)}\n` +
     `      规模 ${usd(pool.tvlUsd)} · 日均成交 ${usd(pool.avgDailyVolume7dUsd)} · ` +
-    `上线 ${pool.poolAgeDays} 天 · ${apr}`
+    // Rounded: the age is a float derived from a timestamp, and `63.993998043981485 天` reads as noise on a
+    // phone. Whole days is the resolution an operator judges a pool by.
+    `上线 ${Math.round(pool.poolAgeDays)} 天 · ${apr}`
   );
 }
 

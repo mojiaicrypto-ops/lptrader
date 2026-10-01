@@ -750,6 +750,90 @@ describe('telegram — alerts and queries', () => {
   });
 });
 
+
+describe('a Telegram message reaches the right handler (dispatch by command kind)', () => {
+  /**
+   * The regression this pins, reported from a live run:
+   *
+   * ```text
+   * /start: data unavailable (/start is an operator action and cannot run through the query path)
+   * ```
+   *
+   * Every command went through `query()`, which refuses action commands by design — so `/start`, `/exit`
+   * and `/resume` could NEVER run. `performAction` existed, was documented and thoroughly unit-tested, and
+   * had no caller. The unit tests passed because they called it directly.
+   *
+   * So this asserts the WIRING: a message arriving from Telegram must reach `performAction` for an action
+   * command and `query()` for a query command. Nothing below `handleUpdate` is mocked.
+   */
+  function actionHandlers(seen: string[]): ActionHandlers {
+    return {
+      exit: async () => {
+        seen.push('/exit');
+        return 'exited';
+      },
+      start: async () => {
+        seen.push('/start');
+        return 'building';
+      },
+      resume: async () => {
+        seen.push('/resume');
+        return 'resumed';
+      },
+    };
+  }
+
+  it('/start from a message RUNS the action', async () => {
+    const api = new FakeTelegramApi();
+    const seen: string[] = [];
+    const notifier = buildNotifier(api, { actionHandlers: actionHandlers(seen) });
+
+    await notifier.handleUpdate(textUpdate('/start', ALLOWED_USER_ID));
+
+    expect(seen).toEqual(['/start']);
+    const reply = api.methodCalls('sendMessage').at(-1);
+    expect(String(reply?.body['text'])).toBe('building');
+  });
+
+  it('/exit from a message asks for approval rather than answering with data', async () => {
+    const api = new FakeTelegramApi();
+    const seen: string[] = [];
+    const notifier = buildNotifier(api, { actionHandlers: actionHandlers(seen) });
+
+    // Not awaited to completion: `/exit` blocks on the operator's decision.
+    void notifier.handleUpdate(textUpdate('/exit', ALLOWED_USER_ID));
+    await waitForSend(api);
+
+    // It asked for confirmation, and the exit handler has NOT run.
+    expect(seen).toEqual([]);
+    const prompt = api.methodCalls('sendMessage')[0];
+    expect(String(prompt?.body['text'])).toMatch(/APPROVAL REQUIRED/);
+    expect(prompt?.body['reply_markup']).toBeDefined();
+  });
+
+  it('a query command still goes to the query path', async () => {
+    // The fix must not have routed everything to performAction: a query has no approval and no side effect.
+    const api = new FakeTelegramApi();
+    const seen: string[] = [];
+    const notifier = buildNotifier(api, {
+      actionHandlers: actionHandlers(seen),
+      queryHandlers: {
+        status: async () => 'state: MONITOR',
+        position: async () => '',
+        pools: async () => '',
+        nav: async () => '',
+        risk: async () => '',
+      },
+    });
+
+    await notifier.handleUpdate(textUpdate('/status', ALLOWED_USER_ID));
+
+    expect(seen).toEqual([]);
+    const reply = api.methodCalls('sendMessage').at(-1);
+    expect(String(reply?.body['text'])).toBe('state: MONITOR');
+  });
+});
+
 describe('telegram — configuration and helpers', () => {
   it('parses decisions and commands, and rejects malformed payloads', () => {
     expect(parseDecisionCallback('approve:apr_1')).toEqual({
