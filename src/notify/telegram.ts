@@ -685,8 +685,28 @@ export class TelegramNotifier implements Notifier {
           if (!this.running) {
             return;
           }
+          /*
+           * Offset is advanced AFTER handling, not before.
+           *
+           * Telegram deletes an update once `getUpdates` returns past its id, so advancing first means a
+           * throw inside `handleUpdate` loses the update permanently — no redelivery, and the operator sees
+           * a button that does nothing. Handling first means a failure leaves the update queued, and the
+           * next poll retries it.
+           *
+           * A failure is contained per update rather than escaping the loop: one bad update must not stop
+           * the channel for everything else.
+           */
+          try {
+            await this.handleUpdate(update);
+          } catch (error) {
+            this.logger.error('telegram: handling an update failed; it will be retried', {
+              updateId: String(update.update_id),
+              reason: error instanceof Error ? error.message : 'unknown error',
+            });
+            // Stop here so the offset stays where it is: the next poll re-fetches this update.
+            break;
+          }
           this.offset = Math.max(this.offset ?? 0, update.update_id + 1);
-          await this.handleUpdate(update);
         }
         if (updates.length === 0 && this.pollTimeoutSeconds === 0) {
           await this.waitUnlessStopped(250);

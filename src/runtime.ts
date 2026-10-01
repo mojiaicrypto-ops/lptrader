@@ -301,6 +301,17 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
   let actionHandlersRef: ActionHandlers | null = null;
 
   const notifier = createNotifierFromConfig(config, env, {
+    // The notifier's own diagnostics were being discarded.
+    //
+    // `createNotifierFromConfig` defaults to a logger whose methods are empty, and nothing here overrode it,
+    // so every Telegram warning — a failed `getUpdates`, an ignored callback, a refused decision — went
+    // nowhere. An operator clicking Approve and seeing nothing had no way to tell whether the click was
+    // rejected, unparseable, or never arrived at all.
+    logger: {
+      info: (message, context) => process.stdout.write(`[telegram] ${message}${formatContext(context)}\n`),
+      warn: (message, context) => process.stderr.write(`[telegram] ${message}${formatContext(context)}\n`),
+      error: (message, context) => process.stderr.write(`[telegram] ${message}${formatContext(context)}\n`),
+    },
     // The query commands read the last observation only. Wired through a late-bound reference because the
     // cache is filled by the cadences, which are built from the runtime this notifier is part of.
     queryHandlers: createQueryHandlers({ cache: queryCache }),
@@ -1441,6 +1452,13 @@ function requireActionHandlers(handlers: ActionHandlers | null): ActionHandlers 
 }
 
 /** §92: the wallet address an action should treat as the owner. Required for a funded run. */
+/** Renders a log context as ` key=value` pairs, so a Telegram line is readable in the log. */
+function formatContext(context: Readonly<Record<string, unknown>> | undefined): string {
+  if (context === undefined) return '';
+  const entries = Object.entries(context);
+  return entries.length === 0 ? '' : ` ${entries.map(([k, v]) => `${k}=${String(v)}`).join(' ')}`;
+}
+
 /**
  * The wallet an operator action acts on.
  *
