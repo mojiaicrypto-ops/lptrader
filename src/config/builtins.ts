@@ -36,8 +36,11 @@ export const BSC_ADDRESSES = {
 
 /**
  * bStocks share tokens (Binance/BTECH Holdings), all 18 decimals, all BEP-677 scaled UI amount.
- * Risk tier per §9: CORE = QQQB/MSFTB/AAPLB/AMZNB/METAB, HIGH_VOL = NVDAB/TSLAB/PLTRB.
- * `auto_trade` defaults false for HIGH_VOL (§9: monitor only in V1).
+ * Risk tier per §9, as the FALLBACK when `config/tokens.yaml` says nothing about an address.
+ *
+ * `config/tokens.yaml` overrides these per address (the documented rule), so the live tiers can differ —
+ * NVDAB was moved to CORE there on 2026-10-01 while this table still records HIGH_VOL. Reading this file as
+ * the current whitelist would be wrong; `loadConfig()` is the source of truth.
  */
 export const BSC_BSTOCKS: readonly TokenMeta[] = [
   {

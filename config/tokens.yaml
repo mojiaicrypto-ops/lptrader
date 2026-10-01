@@ -5,8 +5,11 @@
 # can never widen the whitelist; entries here only OVERRIDE attributes of the same address.
 # Decimals are an on-chain fact (all bStocks are 18) and can only be restated, not changed.
 #
-# Risk tiers (§9): CORE = QQQB/MSFTB/AAPLB/AMZNB/METAB (auto-tradeable in V1);
-#                  HIGH_VOL = NVDAB/TSLAB/PLTRB (monitor only, auto_trade: false).
+# Risk tiers (§9) and tradability are SEPARATE settings, and `auto_trade` decides candidacy:
+#   CORE (auto-tradeable)   = QQQB/MSFTB/AAPLB/AMZNB/METAB/NVDAB
+#   HIGH_VOL (monitor only) = TSLAB/PLTRB
+# NVDAB moved from HIGH_VOL to CORE on 2026-10-01. `builtins.ts` still records it as HIGH_VOL, where it
+# is the fallback for a missing config; THIS file overrides it per address, which is the documented rule.
 # Reminder: same-symbol impostors exist on BSC (QQQx, QQQon, an unlisted QQQB-like address, and
 # several 8-decimal "<X> Tokenized bStocks" contracts) — never resolve a token by symbol.
 
