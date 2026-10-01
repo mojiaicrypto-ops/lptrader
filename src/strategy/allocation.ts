@@ -200,7 +200,7 @@ export function verifyPostAllocation(params: {
       ok: false,
       lp: unusable(limits.maxLpRatio),
       reserve: unusable(limits.reserveRatio),
-      problems: [`NAV is ${String(navUsd)}; allocation cannot be verified`],
+      problems: [`总权益是 ${String(navUsd)}，无法据此校验资金配置（通常是还没有注资）`],
     };
   }
 

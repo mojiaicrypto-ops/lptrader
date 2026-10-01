@@ -561,7 +561,7 @@ export function evaluateTvlCollapse(
       baselineAsOf: null,
       windowHours,
       failClosed: true,
-      reason: `§59 no usable TVL observation — collapse status unknowable (fail closed, not "safe")`,
+      reason: `没有可用的池子规模数据，无法判断是否骤降（按不安全处理）`,
     };
   }
 
@@ -722,9 +722,9 @@ export function evaluateReserve(
       action: RISK_ACTIONS.NO_NEW_CAPITAL,
       alertSeverity: critical ? ALERT_SEVERITIES.CRITICAL : ALERT_SEVERITIES.WARNING,
       reason:
-        `§60 reserve ${pct(reserveRatio)} < ${pct(thresholds.minReserveBeforeNewLp)} — ` +
-        `new LP prohibited (no forced rebalance)` +
-        (critical ? `; §105 below the ${pct(thresholds.warningReserve)} warning floor` : ''),
+        `储备金 ${pct(reserveRatio)}，低于下限 ${pct(thresholds.minReserveBeforeNewLp)}，` +
+        '因此不开新仓（不会强制调仓）' +
+        (critical ? `。已低于告警线 ${pct(thresholds.warningReserve)}` : ''),
     };
   }
 
@@ -749,7 +749,7 @@ export function evaluateReserve(
     forceRebalance: false,
     action: RISK_ACTIONS.HOLD,
     alertSeverity: ALERT_SEVERITIES.INFO,
-    reason: `§60 reserve ${pct(reserveRatio)} >= ${pct(thresholds.targetReserve)} — normal`,
+    reason: `储备金 ${pct(reserveRatio)}，不低于 ${pct(thresholds.targetReserve)}，正常`,
   };
 }
 
@@ -1018,7 +1018,7 @@ export function evaluateEmergency(events: readonly EmergencyEvent[]): EmergencyV
       readOnly: true,
       noNewCapital: true,
       requiresManualClear: true,
-      reason: '§58 no emergency condition asserted',
+      reason: '没有紧急情况',
     };
   }
 
@@ -1194,7 +1194,7 @@ export function evaluateMarketDecline(
       marketDecline: false,
       hold: true,
       alertSeverity: ALERT_SEVERITIES.WARNING,
-      reason: `§53 stock price change unavailable (${String(stockPriceChange)}) — decline status unknowable, HOLD`,
+      reason: `读不到股价变动，无法判断是否在下跌，保持观望`,
     };
   }
 

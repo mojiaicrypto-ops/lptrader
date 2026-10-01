@@ -26,6 +26,7 @@ import type { StateMachine } from '../strategy/stateMachine.ts';
 import type { PositionReader } from '../chain/positionReader.ts';
 import type { DexAdapter, TxGuardChecks } from '../types/adapters.ts';
 import { BOT_STATES, type BotState } from '../types/state.ts';
+import { renderMessage, titleWithIcon } from '../notify/messageFormat.ts';
 
 /** What a handler needs from the rest of the system. All injected: this module owns no clients. */
 export interface ActionHandlerDeps {
@@ -90,7 +91,7 @@ export class ActionHandlers {
   async exit(): Promise<ActionOutcome> {
     const position = await this.currentPosition();
     if (position === null) {
-      return { ok: false, message: 'no open position — nothing to exit', nextState: this.state() };
+      return { ok: false, message: '当前没有仓位，无需撤池。', nextState: this.state() };
     }
 
     if (position.liquidity === 0n) {
@@ -99,8 +100,8 @@ export class ActionHandlers {
       return {
         ok: false,
         message:
-          `position ${position.positionTokenId} has zero liquidity; nothing to remove. ` +
-          'Collect fees with the normal auto-collection path.',
+          `仓位 ${position.positionTokenId} 的流动性为 0，没有可撤出的部分。\n` +
+          '未领取的手续费会由自动收取流程处理。',
         nextState: this.state(),
       };
     }
@@ -126,7 +127,7 @@ export class ActionHandlers {
     if (!outcome.ok) {
       return {
         ok: false,
-        message: `exit failed: ${outcome.reason}`,
+        message: `撤池失败：${outcome.reason}`,
         nextState: this.state(),
       };
     }
@@ -138,12 +139,17 @@ export class ActionHandlers {
     if (rebuild !== undefined && !rebuild.allowed) {
       await this.notify(
         'warning',
-        'position closed — rebuild skipped',
-        `${rebuild.reason}\n\nThe bot is flat and will not build until you send /start.`,
+        titleWithIcon('warning', '已撤池，但暂不重建'),
+        renderMessage({
+          severity: 'warning',
+          title: '已撤池，但暂不重建',
+          action: '现在空仓。想重新建仓时发 /start。',
+          note: rebuild.reason,
+        }),
       );
       return {
         ok: true,
-        message: `position closed; rebuild skipped (${rebuild.reason}). Send /start to build when ready.`,
+        message: `已撤池。暂不自动重建，原因：${rebuild.reason}\n想重新建仓时发 /start。`,
         nextState: BOT_STATES.IDLE,
       };
     }
@@ -153,18 +159,22 @@ export class ActionHandlers {
     if (this.deps.buildPosition === undefined) {
       return {
         ok: true,
-        message: 'position closed. No build path is wired, so send /start when you want to re-enter.',
+        message: '已撤池。当前进程没有建仓能力（未配置签名钱包），想重新建仓时请发 /start。',
         nextState: BOT_STATES.IDLE,
       };
     }
 
-    await this.notify('info', 'rebuilding after exit', 'Position closed. Selecting a replacement pool…');
+    await this.notify(
+      'info',
+      titleWithIcon('info', '正在重新选池'),
+      renderMessage({ severity: 'info', title: '正在重新选池', action: '仓位已撤出，正在挑选替代池子…' }),
+    );
     const built = await this.deps.buildPosition({ trigger: 'post-exit rebuild' });
     return {
       ok: true,
       message: built.ok
-        ? `position closed; replacement build started — ${built.message}`
-        : `position closed; rebuild did not proceed — ${built.message}`,
+        ? `已撤池，正在重新建仓。\n${built.message}`
+        : `已撤池，但未能重新建仓。\n${built.message}`,
       // Same reasoning as `/start`: the position IS closed, so the bot is flat. A submitted build is still
       // behind its approval gate and owns its own transition.
       nextState: BOT_STATES.IDLE,
@@ -184,8 +194,8 @@ export class ActionHandlers {
       return {
         ok: false,
         message:
-          `a position is already open (${position.poolId}, tokenId ${position.positionTokenId}); ` +
-          'send /exit first if you want to close it',
+          `已有持仓（${position.poolId}，tokenId ${position.positionTokenId}）。\n` +
+          '如需平仓请先发 /exit。',
         nextState: this.state(),
       };
     }
@@ -196,18 +206,22 @@ export class ActionHandlers {
     if (this.deps.buildPosition === undefined) {
       return {
         ok: false,
-        message: 'no build path is wired: this process cannot open a position',
+        message: '当前进程不能建仓：没有配置签名钱包，只能只读监控。',
         nextState: this.state(),
       };
     }
 
-    await this.notify('info', 'build requested', '/start received. Screening pools…');
+    await this.notify(
+      'info',
+      titleWithIcon('info', '正在挑选池子'),
+      renderMessage({ severity: 'info', title: '正在挑选池子', action: '扫描与链上核验大约需要几分钟，结果会推送给你。' }),
+    );
     const built = await this.deps.buildPosition({ trigger: '/start' });
     return {
       ok: built.ok,
       message: built.ok
-        ? `build started — ${built.message}`
-        : `no position was opened — ${built.message}`,
+        ? `已发起建仓。\n${built.message}`
+        : `没有建仓。\n${built.message}`,
       /**
        * The state the bot is actually in, not the state a build might eventually reach.
        *
@@ -230,7 +244,7 @@ export class ActionHandlers {
   async resume(): Promise<ActionOutcome> {
     const state = this.state();
     if (state === BOT_STATES.IDLE || state === BOT_STATES.MONITOR) {
-      return { ok: false, message: `nothing to resume from ${state}`, nextState: state };
+      return { ok: false, message: `当前状态是 ${state}，无需恢复。`, nextState: state };
     }
     if (state !== BOT_STATES.PAUSED) {
       // GLOBAL_RISK_OFF / EMERGENCY mean the risk condition is still true. Clearing them needs the
@@ -238,14 +252,14 @@ export class ActionHandlers {
       return {
         ok: false,
         message:
-          `not resuming from ${state}: that state is driven by a live risk condition, not by an ` +
-          'operator halt. Resolve the condition (or re-check with /risk) before restarting.',
+          `不能从 ${state} 恢复：这个状态由实时风险条件驱动，不是人工暂停。\n` +
+          '请先确认风险已解除（发 /risk 查看）再恢复。',
         nextState: state,
       };
     }
     return {
       ok: true,
-      message: 'resumed to IDLE. Send /start when you want to build again.',
+      message: '已恢复为空仓状态。想建仓时发 /start。',
       nextState: BOT_STATES.IDLE,
     };
   }

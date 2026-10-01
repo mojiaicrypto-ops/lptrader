@@ -59,7 +59,7 @@ describe('/exit (manual close, architecture §6.2)', () => {
     // sat flat while the text promised otherwise. The build path is now actually invoked.
     expect(buildPosition).toHaveBeenCalledTimes(1);
     expect(outcome.nextState).toBe(BOT_STATES.IDLE);
-    expect(outcome.message).toMatch(/replacement build started/);
+    expect(outcome.message).toMatch(/正在重新建仓/);
   });
 
   it('stays flat and says so when no build path is wired', async () => {
@@ -68,14 +68,14 @@ describe('/exit (manual close, architecture §6.2)', () => {
     const outcome = await handlers.exit();
     expect(buildPosition).not.toHaveBeenCalled();
     expect(outcome.nextState).toBe(BOT_STATES.IDLE);
-    expect(outcome.message).toMatch(/No build path is wired/);
+    expect(outcome.message).toMatch(/没有建仓能力/);
   });
 
   it('reports a failed rebuild instead of claiming success', async () => {
     const { handlers } = harness({ build: { ok: false, message: 'NO_QUALIFIED_POOL: nothing passed' } });
     const outcome = await handlers.exit();
     expect(outcome.nextState).toBe(BOT_STATES.IDLE);
-    expect(outcome.message).toMatch(/rebuild did not proceed/);
+    expect(outcome.message).toMatch(/未能重新建仓/);
   });
 
   it('refuses when there is nothing open', async () => {
@@ -83,7 +83,7 @@ describe('/exit (manual close, architecture §6.2)', () => {
     const outcome = await handlers.exit();
 
     expect(outcome.ok).toBe(false);
-    expect(outcome.message).toMatch(/no open position/);
+    expect(outcome.message).toMatch(/没有仓位/);
     expect(exitPosition).not.toHaveBeenCalled();
   });
 
@@ -94,7 +94,7 @@ describe('/exit (manual close, architecture §6.2)', () => {
     const outcome = await handlers.exit();
 
     expect(outcome.ok).toBe(false);
-    expect(outcome.message).toMatch(/zero liquidity/);
+    expect(outcome.message).toMatch(/流动性为 0/);
     expect(exitPosition).not.toHaveBeenCalled();
   });
 
@@ -120,10 +120,10 @@ describe('/exit (manual close, architecture §6.2)', () => {
 
     expect(outcome.ok).toBe(true);
     expect(outcome.nextState).toBe(BOT_STATES.IDLE);
-    expect(outcome.message).toMatch(/rebuild skipped/);
+    expect(outcome.message).toMatch(/暂不自动重建/);
     expect(deps.notify).toHaveBeenCalledWith(
       'warning',
-      expect.stringContaining('rebuild skipped'),
+      expect.stringContaining('暂不重建'),
       expect.stringContaining('0.75%'),
     );
   });
@@ -159,7 +159,7 @@ describe('/start (manual build, architecture §6.2)', () => {
     });
     const outcome = await handlers.start();
     expect(outcome.ok).toBe(false);
-    expect(outcome.message).toMatch(/no position was opened/);
+    expect(outcome.message).toMatch(/没有建仓/);
     // The bot stays where it was. Reporting SELECT_POOL claimed a selection that never happened — the bug
     // this whole change removes.
     expect(outcome.nextState).toBe(BOT_STATES.MONITOR);
@@ -172,7 +172,7 @@ describe('/start (manual build, architecture §6.2)', () => {
     const outcome = await handlers.start();
 
     expect(outcome.ok).toBe(false);
-    expect(outcome.message).toMatch(/already open/);
+    expect(outcome.message).toMatch(/已有持仓/);
     expect(outcome.message).toMatch(/\/exit/);
   });
 });
@@ -195,7 +195,7 @@ describe('/resume (leave a risk halt, architecture §6.3)', () => {
       const { handlers } = harness({ state, position: null });
       const outcome = await handlers.resume();
       expect(outcome.ok).toBe(false);
-      expect(outcome.message).toMatch(/live risk condition/);
+      expect(outcome.message).toMatch(/实时风险条件/);
       expect(outcome.nextState).toBe(state);
     }
   });
@@ -205,7 +205,7 @@ describe('/resume (leave a risk halt, architecture §6.3)', () => {
       const { handlers } = harness({ state, position: null });
       const outcome = await handlers.resume();
       expect(outcome.ok).toBe(false);
-      expect(outcome.message).toMatch(/nothing to resume/);
+      expect(outcome.message).toMatch(/无需恢复/);
     }
   });
 });
@@ -224,7 +224,7 @@ describe('single-pool fault surfacing (architecture §8.5)', () => {
 
     // And the handler propagates whatever it is given (no filtering of its own).
     const outcome = await handlers.start();
-    expect(outcome.message).toMatch(/already open/);
+    expect(outcome.message).toMatch(/已有持仓/);
     void second;
   });
 });

@@ -96,6 +96,8 @@ grep -rn "\.<method>(" src/          # 排除被调用者自身的定义文件
 | 4.6 | **建仓决策链接线**（精筛→计划→报价→门禁→构造） | ✅ **可用** | `src/strategy/buildOrchestrator.ts`，经 `runtime` | |
 | 4.7 | 建仓确认门（Telegram Approve/Reject） | ✅ **可用** | 执行器构造交易前经 `ApprovalGate`；无通道时 fail closed | |
 | 4.8 | `/start` 真正建仓 | ✅ **可用** | 调用同一 `openPositionFromLatestScan` | 已删除虚假文案 |
+| 4.8b | **资金币种归一化**（钱包 USDT，池报价 USDC） | ✅ **可用** | `src/strategy/funding.ts`，11 条测试 | 只换缺口；独立交易；同样走 §40 闸门 |
+| 4.8c | **钱包余额校验**（建仓前） | ✅ **可用** | 不足时明确拒绝并说明需存入多少 | 2026-10-01 新增 —— 此前**完全不检查余额** |
 | 4.9 | 建仓交易构造（不广播） | ✅ **可用** | 实测：经真实候选池产出完整 `BuildPositionInput`（tick、L、swap 额、§40 下限、guard、幂等键） | |
 
 > **4.5 与 4.6 的区别是本次事故的核心**：方法写完了（4.5），但从没有人调用它（4.6）。

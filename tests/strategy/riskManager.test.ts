@@ -550,7 +550,7 @@ describe('§60 reserve monitoring', () => {
     expect(below.action).toBe(RISK_ACTIONS.NO_NEW_CAPITAL);
     expect(below.alertSeverity).toBe(ALERT_SEVERITIES.WARNING);
     expect(below.forceRebalance).toBe(false);
-    expect(below.reason).toContain('new LP prohibited');
+    expect(below.reason).toContain('不开新仓');
 
     // boundary: the rule is `< 25%`, so 25% itself still permits new LP.
     const atThreshold = evaluateReserve(0.25, RESERVE);
@@ -561,7 +561,7 @@ describe('§60 reserve monitoring', () => {
 
   it('treats 30% as normal and 29.99% as a below-target warning', () => {
     expect(evaluateReserve(0.3, RESERVE).action).toBe(RISK_ACTIONS.HOLD);
-    expect(evaluateReserve(0.3, RESERVE).reason).toContain('normal');
+    expect(evaluateReserve(0.3, RESERVE).reason).toContain('正常');
     expect(evaluateReserve(0.2999, RESERVE).action).toBe(RISK_ACTIONS.ALERT);
     expect(evaluateReserve(0.9, RESERVE).action).toBe(RISK_ACTIONS.HOLD);
   });
@@ -573,7 +573,7 @@ describe('§60 reserve monitoring', () => {
 
     const belowFloor = evaluateReserve(0.1999, RESERVE);
     expect(belowFloor.alertSeverity).toBe(ALERT_SEVERITIES.CRITICAL);
-    expect(belowFloor.reason).toContain('warning floor');
+    expect(belowFloor.reason).toContain('告警线');
   });
 
   it('reads the 25% floor from config', () => {
@@ -738,7 +738,7 @@ describe('§58 emergency triggers', () => {
     expect(verdict.active).toBe(false);
     expect(verdict.action).toBe(RISK_ACTIONS.HOLD);
     expect(verdict.conditions).toEqual([]);
-    expect(verdict.reason).toContain('no emergency condition');
+    expect(verdict.reason).toContain('没有紧急情况');
   });
 
   it('collapses duplicates but preserves every event for the audit log', () => {

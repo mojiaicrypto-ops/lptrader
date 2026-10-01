@@ -29,6 +29,13 @@
  */
 import type { IsoTimestamp, PoolId, Ratio, UsdAmount } from '../types/primitives.ts';
 import type { AlertSeverity } from '../types/notifier.ts';
+import {
+  pct,
+  renderMessage,
+  riskHeadline,
+  usd,
+  type MessageRow,
+} from '../notify/messageFormat.ts';
 import type { BotState } from '../types/state.ts';
 import type { StrategyConfig } from '../types/config.ts';
 import type { PoolSnapshot } from '../types/market.ts';
@@ -340,61 +347,80 @@ export function describeRiskAction(
     readonly nav?: UsdAmount;
   } = {},
 ): string {
-  const lines: string[] = [`${plan.action} (severity ${plan.severity})`];
-  for (const reason of plan.reasons.slice(0, 5)) lines.push(`  · ${reason}`);
+  const rows: MessageRow[] = [];
 
-  if (context.currentPrice !== undefined && context.lowerPrice !== undefined && context.upperPrice !== undefined) {
-    const position =
-      context.currentPrice <= context.lowerPrice
-        ? 'BELOW the lower bound'
-        : context.currentPrice >= context.upperPrice
-          ? 'ABOVE the upper bound'
-          : 'inside the range';
-    lines.push(
-      '',
-      'Range:',
-      `  current ${context.currentPrice.toFixed(6)} / lower ${context.lowerPrice.toFixed(6)} / upper ${context.upperPrice.toFixed(6)}`,
-      `  price is ${position}`,
-    );
+  if (context.nav !== undefined) rows.push({ label: '总权益', value: usd(context.nav) });
+
+  if (context.reserveRatio !== undefined) {
+    rows.push({ label: '储备金', value: `${pct(context.reserveRatio)}（下限 25%）` });
   }
 
+  if (
+    context.currentPrice !== undefined &&
+    context.lowerPrice !== undefined &&
+    context.upperPrice !== undefined
+  ) {
+    const where =
+      context.currentPrice <= context.lowerPrice
+        ? '已跌破下限'
+        : context.currentPrice >= context.upperPrice
+          ? '已涨破上限'
+          : '在区间内';
+    rows.push({ label: '当前价', value: `${context.currentPrice.toFixed(4)}（${where}）` });
+    rows.push({ label: '区间', value: `${context.lowerPrice.toFixed(4)} ~ ${context.upperPrice.toFixed(4)}` });
+  }
+
+  // The two numbers that separate "the market moved" from "this token broke". Kept as a pair: either alone
+  // cannot answer the question, and they are the whole reason the operator is being asked to decide.
   if (context.stockPriceChange !== undefined || context.referenceNavChange !== undefined) {
-    // The two numbers that separate "the market fell" from "this token broke".
-    lines.push(
-      '',
-      'Is this a market move or a token problem?',
-      `  underlying stock move : ${formatPct(context.stockPriceChange)}`,
-      `  reference NAV move    : ${formatPct(context.referenceNavChange)}`,
-      context.deviation === null || context.deviation === undefined
-        ? '  token/NAV deviation   : unknown (no trustworthy reference)'
-        : `  token/NAV deviation   : ${(context.deviation * 100).toFixed(4)}%`,
-      '  If both moved together the position is riding a market move (hold); if only the token moved, ' +
-        'the token is the problem.',
-    );
+    rows.push({ label: '标的股票', value: signedPct(context.stockPriceChange) });
+    rows.push({
+      label: '参考净值',
+      value:
+        context.deviation === null || context.deviation === undefined
+          ? signedPct(context.referenceNavChange)
+          : `${signedPct(context.referenceNavChange)}（偏离 ${pct(context.deviation, 4)}）`,
+    });
   }
 
   if (context.tvlDropRatio !== null && context.tvlDropRatio !== undefined) {
-    lines.push('', `Pool TVL changed ${(context.tvlDropRatio * 100).toFixed(2)}% over the window.`);
-  }
-  if (context.reserveRatio !== undefined) {
-    lines.push(`Reserve ratio: ${(context.reserveRatio * 100).toFixed(2)}%`);
-  }
-  if (context.nav !== undefined) {
-    lines.push(`NAV: $${context.nav.toLocaleString('en-US', { maximumFractionDigits: 2 })}`);
+    rows.push({ label: '池子规模', value: `变化 ${signedPct(context.tvlDropRatio)}` });
   }
 
-  if (!plan.autoExit && plan.action === RISK_ACTIONS.RISK_REVIEW) {
-    lines.push(
-      '',
-      'No automatic action will be taken. Review and use /exit if you decide to close.',
-    );
-  }
-  return lines.join('\n');
+  /*
+   * `plan.reasons` is deliberately NOT forwarded to the operator.
+   *
+   * Those strings are the engine's diagnostics: precise, stable, and full of clause numbers
+   * (`§60 reserve 0.00% < 25.00% — new LP prohibited (no forced rebalance); §105 below the 20.00% warning
+   * floor`). They are exactly right for the decision log (§77) and exactly wrong for a phone: an operator
+   * cannot act on `§105`, and a message that restates its own conclusion trains the reader to stop reading.
+   *
+   * They are recorded to the audit trail by the caller before this function runs, so nothing is lost.
+   */
+  const action = plan.autoExit
+    ? '机器人正在自动撤池，无需你操作。'
+    : plan.action === RISK_ACTIONS.RISK_REVIEW
+      ? '机器人不会自动处理。看完上面的数据后，决定是否发 /exit。'
+      : plan.action === RISK_ACTIONS.NO_NEW_CAPITAL
+        ? '这是提示，不影响已有仓位。补足储备金后即可开新仓。'
+        : plan.action === RISK_ACTIONS.HOLD || plan.action === RISK_ACTIONS.ALERT
+          ? undefined
+          : '机器人不会自动处理，需要你判断。';
+
+  return renderMessage({
+    severity: plan.severity,
+    title: riskHeadline(plan.action),
+    rows,
+    ...(action === undefined ? {} : { action }),
+  });
 }
 
-function formatPct(value: number | undefined): string {
-  if (value === undefined || !Number.isFinite(value)) return 'unknown';
-  return `${value >= 0 ? '+' : ''}${(value * 100).toFixed(2)}%`;
+
+/** A percentage that keeps its sign, so a fall reads as a fall. */
+function signedPct(value: number | undefined): string {
+  if (value === undefined) return '—';
+  const formatted = `${(value * 100).toFixed(2)}%`;
+  return value > 0 ? `+${formatted}` : formatted;
 }
 
 /** Re-exported so the composition root does not have to reach into the strategy layer for the adapter. */

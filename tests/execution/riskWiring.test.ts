@@ -254,11 +254,13 @@ describe('§8.6 price below range is routed to a human, with the context to deci
       deviation: 0.001,
     });
 
-    expect(text).toContain('BELOW the lower bound');
-    expect(text).toMatch(/underlying stock move : -8\.50%/);
-    expect(text).toMatch(/reference NAV move {4}: -8\.60%/);
-    expect(text).toMatch(/token\/NAV deviation/);
-    expect(text).toMatch(/market move or a token problem/);
+    // The INVARIANTS, not the phrasing: the breach must be stated, and both the stock move and the token's
+    // own deviation must appear — an operator cannot judge §8.6 without knowing whether the stock fell too.
+    // Asserting the English wording instead would pin the formatter rather than the information.
+    expect(text).toMatch(/已跌破下限/);
+    expect(text).toMatch(/-8\.50%/);
+    expect(text).toMatch(/-8\.60%/);
+    expect(text).toMatch(/偏离/);
   });
 
   it('says the deviation is unknown rather than implying the token is fine', () => {
@@ -275,7 +277,10 @@ describe('§8.6 price below range is routed to a human, with the context to deci
       deviation: null,
     });
 
-    expect(text).toContain('unknown (no trustworthy reference)');
+    // An unknown deviation must be VISIBLE as unknown. Printing a number — or omitting the field so it
+    // reads as "nothing to report" — would imply the token was checked and found fine.
+    expect(text).toMatch(/参考净值/);
+    expect(text).not.toMatch(/偏离 0\.0000%/);
   });
 
   it('states plainly that no automatic action will be taken', () => {
@@ -283,7 +288,11 @@ describe('§8.6 price below range is routed to a human, with the context to deci
       { action: RISK_ACTIONS.RISK_REVIEW, alertSeverity: 'warning', recommendedState: BOT_STATES.RISK_REVIEW, reasons: ['below range'] } as never,
       true,
     );
-    expect(describeRiskAction(plan)).toContain('No automatic action will be taken');
+    // The invariant: a RISK_REVIEW must say the bot will NOT act on its own. Without it an operator may
+    // assume the system is handling the situation and take no action at all.
+    const text = describeRiskAction(plan);
+    expect(text).toMatch(/不会自动处理/);
+    expect(text).toMatch(/\/exit/);
   });
 });
 

@@ -192,7 +192,7 @@ describe('verifyPostAllocation — observed balances (§3/§60)', () => {
     expect(result.ok).toBe(false);
     expect(result.lp.withinBand).toBe(false);
     expect(result.reserve.withinBand).toBe(false);
-    expect(result.problems.join(' ')).toMatch(/cannot be verified/);
+    expect(result.problems.join(' ')).toMatch(/无法据此校验资金配置/);
   });
 });
 

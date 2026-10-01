@@ -71,7 +71,6 @@ import {
   FundingPlanner,
   conversionGuard,
   conversionKey,
-  describeConversion,
   type FundingPlan,
 } from './strategy/funding.ts';
 import { evaluateSwapQuote, swapLimitsForPool } from './strategy/swapPlanner.ts';
@@ -83,6 +82,12 @@ import {
 } from './strategy/returns.ts';
 import { QueryCache, poolViewFrom, type PositionView, type ReturnView, type StatusView } from './runtime/queryCache.ts';
 import { createQueryHandlers } from './runtime/queryHandlers.ts';
+import {
+  conditionLabel,
+  renderMessage,
+  riskHeadline,
+  titleWithIcon,
+} from './notify/messageFormat.ts';
 import { buildTxGuard } from './chain/txState.ts';
 import { filterPools } from './data/poolFilter.ts';
 import { createReferencePriceProvider } from './data/referencePrice.ts';
@@ -779,6 +784,18 @@ function computePositionReturn(
 /** §LP-contribution: consecutive rounds in which the pool's contribution was negative. */
 let negativeContributionRounds = 0;
 
+/**
+ * The identifying tail of a pool id.
+ *
+ * `56:pancakeswap-v3:0xe9b9998b2ec5430d2246c7f1f8d9f298c97d7365` does not fit a phone notification, and
+ * the address tail is the part that distinguishes one pool from another. `conditionLabel`-style shortening
+ * here is not an abbreviation for convenience: an unreadable id is an unactionable alert.
+ */
+function shortPoolId(poolId: string): string {
+  const address = poolId.split(':')[2] ?? poolId;
+  return `…${address.slice(-10)}`;
+}
+
 /** The `/status` view: what the process is doing, from the runtime's own configuration. */
 function statusView(runtime: StrategyRuntime, at: IsoTimestamp): StatusView {
   const { config } = runtime;
@@ -870,8 +887,22 @@ async function executeFundingConversion(
 
   await deps.notifier.send(
     ALERT_SEVERITIES.INFO,
-    'funding the position',
-    describeConversion(conversion, quoteSymbol, quote),
+    titleWithIcon('info', '正在兑换建仓所需币种'),
+    renderMessage({
+      severity: 'info',
+      title: '正在兑换建仓所需币种',
+      rows: [
+        { label: '卖出', value: `${Number(conversion.amountInRaw) / 10 ** conversion.meta.decimals} ${conversion.meta.symbol}` },
+        {
+          label: '买入',
+          value:
+            quote === null
+              ? quoteSymbol
+              : `${(Number(quote.amountOutRaw) / 10 ** 18).toFixed(4)} ${quoteSymbol}`,
+        },
+      ],
+      action: '这是建仓之外单独的一笔。若随后建仓未成，钱包里只是换成另一种稳定币，价值不变。',
+    }),
   );
 
   try {
@@ -997,8 +1028,13 @@ export function buildCadences(runtime: StrategyRuntime): readonly SchedulerCaden
           // A partial scan must not look like a clean market: say which source failed.
           await runtime.notifier.send(
             ALERT_SEVERITIES.WARNING,
-            'pool scan incomplete',
-            summary.blockers.join('\n'),
+            titleWithIcon('warning', '本次扫描数据不全'),
+            renderMessage({
+              severity: 'warning',
+              title: '本次扫描数据不全',
+              action: '部分池子的数据源没有响应，本轮结果不完整。',
+              note: summary.blockers.slice(0, 4).map((b) => `· ${b}`).join('\n'),
+            }),
           );
         }
 
@@ -1032,8 +1068,13 @@ export function buildCadences(runtime: StrategyRuntime): readonly SchedulerCaden
         } catch (error) {
           await runtime.notifier.send(
             ALERT_SEVERITIES.WARNING,
-            'pool snapshot history could not be recorded',
-            `${error instanceof Error ? error.message : String(error)}\n\nTVL-collapse detection depends on this history; until it is fixed, §59 can only report insufficient-data.`,
+            titleWithIcon('warning', '池子历史未能记录'),
+            renderMessage({
+              severity: 'warning',
+              title: '池子历史未能记录',
+              action: '池子规模骤降的检测依赖这段历史。历史缺失期间，该检测无法生效。',
+              note: error instanceof Error ? error.message : String(error),
+            }),
           );
         }
 
@@ -1107,11 +1148,16 @@ export function buildCadences(runtime: StrategyRuntime): readonly SchedulerCaden
         if (undecided.length > 0) {
           await runtime.notifier.send(
             ALERT_SEVERITIES.WARNING,
-            `${undecided.length} pool(s) could not be judged because a figure was unreadable`,
-            undecided
-              .map((entry) => `${entry.snapshot.poolId}: ${entry.evaluation.reasons.join('; ')}`)
-              .join('\n') +
-              '\n\nThese were rejected for missing DATA, not for being unsuitable. Check the data sources.',
+            titleWithIcon('warning', `${undecided.length} 个池子因数据缺失未能判定`),
+            renderMessage({
+              severity: 'warning',
+              title: `${undecided.length} 个池子因数据缺失未能判定`,
+              action: '这些池子不是不合格，是数据读不到。请检查数据源。',
+              note: undecided
+                .slice(0, 3)
+                .map((entry) => `· ${shortPoolId(entry.snapshot.poolId)}  ${entry.evaluation.failedCodes.map(conditionLabel).join('、')}`)
+                .join('\n'),
+            }),
           );
         }
       },
@@ -1133,8 +1179,13 @@ export function buildCadences(runtime: StrategyRuntime): readonly SchedulerCaden
         if (round.valuationProblems !== undefined) {
           await runtime.notifier.send(
             ALERT_SEVERITIES.WARNING,
-            'portfolio valuation incomplete — no drawdown verdict this round',
-            round.valuationProblems.join('\n'),
+            titleWithIcon('warning', '本轮无法估值，风控线未判定'),
+            renderMessage({
+              severity: 'warning',
+              title: '本轮无法估值，风控线未判定',
+              action: '有资产的价格读不到，所以本轮没有做止损判断 —— 这不代表安全。',
+              note: round.valuationProblems.slice(0, 3).map((p) => `· ${p}`).join('\n'),
+            }),
           );
         }
 
@@ -1144,8 +1195,13 @@ export function buildCadences(runtime: StrategyRuntime): readonly SchedulerCaden
         if (!allocation.ok) {
           await runtime.notifier.send(
             ALERT_SEVERITIES.WARNING,
-            'allocation outside the configured bands',
-            allocation.problems.join('\n'),
+            titleWithIcon('warning', '资金配置超出设定比例'),
+            renderMessage({
+              severity: 'warning',
+              title: '资金配置超出设定比例',
+              action: '这是提示，不会自动调整。需要的话请手动转入或撤出。',
+              note: allocation.problems.slice(0, 3).map((p) => `· ${p}`).join('\n'),
+            }),
           );
         }
 
@@ -1225,10 +1281,38 @@ async function reportRiskRound(
     ...(round.nav === undefined ? {} : { nav: round.nav }),
   };
 
+  /*
+   * §77: the engine's precise reasons are recorded HERE, before the operator-facing message is built.
+   *
+   * The message deliberately omits them — clause numbers cannot be acted on from a phone — and until this
+   * line existed they were dropped entirely: the alert was the only place they ever appeared. A decision
+   * audit that cannot answer "why did it do that on this day" is the thing §77 exists to prevent.
+   */
+  runtime.stateStore.appendDecisionLog({
+    timestamp: at,
+    state: runtime.stateMachine.current,
+    action: `RISK_${plan.action}`,
+    reason: plan.reasons.join(' | '),
+    result: plan.autoExit ? 'auto_exit' : 'reported',
+    ...(context.nav === undefined ? {} : { totalNAV: context.nav }),
+    detail: { severity: plan.severity, autoExit: plan.autoExit, nextState: plan.nextState },
+  });
+
   await runtime.notifier.send(
     plan.severity,
-    `risk: ${plan.action}`,
+    titleWithIcon(plan.severity, riskHeadline(plan.action)),
     describeRiskAction(plan, context),
+    /*
+     * Collapse repeats from the two risk beats.
+     *
+     * `portfolio-monitor` (5m) and `pool-health` (15m) deliberately share this function so their alerts read
+     * identically — but they also RUN together, so a condition that persists produced two identical messages
+     * seconds apart. The dedupe machinery existed and no caller had ever passed a key, so it never fired.
+     *
+     * Keyed on the verdict, not the message text: the same condition with a slightly different NAV is still
+     * the same thing to report once.
+     */
+    { dedupeKey: `risk:${plan.action}` },
   );
 
   // §8.6: an automatic exit happens ONLY for the catastrophic verdicts. Price leaving the range goes to a
@@ -1236,8 +1320,13 @@ async function reportRiskRound(
   if (plan.autoExit && runtime.executor !== null) {
     await runtime.notifier.send(
       ALERT_SEVERITIES.CRITICAL,
-      'automatic exit triggered',
-      `${plan.action} — closing the position without waiting for confirmation (§67).\n\n${plan.reasons.slice(0, 3).join('\n')}`,
+      titleWithIcon('critical', '正在自动撤池'),
+      renderMessage({
+        severity: 'critical',
+        title: '正在自动撤池',
+        action: '情况严重到不能等你确认，机器人已在撤池。',
+        note: plan.reasons.slice(0, 2).map((r) => `· ${r}`).join('\n'),
+      }),
     );
     // The exit itself runs through the same executor the manual path uses, so there is one code path for
     // closing a position rather than two that can diverge.
@@ -1245,8 +1334,13 @@ async function reportRiskRound(
     if (outcome !== undefined && !outcome.ok) {
       await runtime.notifier.send(
         ALERT_SEVERITIES.CRITICAL,
-        'automatic exit FAILED — position still open',
-        outcome.message,
+        titleWithIcon('critical', '自动撤池失败，仓位仍在'),
+        renderMessage({
+          severity: 'critical',
+          title: '自动撤池失败，仓位仍在',
+          action: '需要你手动处理：检查钱包与网络后重试。',
+          note: outcome.message,
+        }),
       );
       // Fall through to no rebuild: the position is still open, and attempting a build on top of it would
       // create a second position (§8.5 makes that a hard fault).
@@ -1263,15 +1357,22 @@ async function reportRiskRound(
     if (runtime.buildOrchestrator !== null) {
       await runtime.notifier.send(
         ALERT_SEVERITIES.WARNING,
-        're-selecting a pool after the risk exit',
-        'The position was closed by a risk condition. Pool selection is running now; a replacement will be ' +
-          'proposed for approval if one qualifies, otherwise the bot stays flat and reports why.',
+        titleWithIcon('warning', '正在重新选池'),
+        renderMessage({
+          severity: 'warning',
+          title: '正在重新选池',
+          action: '撤回的资金正在重新挑选池子。有合格的会推给你确认。',
+        }),
       );
       const rebuilt = await runtime.openPositionFromLatestScan({ trigger: `risk switch (${plan.action})` });
       await runtime.notifier.send(
         rebuilt.ok ? ALERT_SEVERITIES.INFO : ALERT_SEVERITIES.WARNING,
-        rebuilt.ok ? 'replacement position proposed' : 'no replacement pool',
-        rebuilt.message,
+        titleWithIcon(rebuilt.ok ? 'info' : 'warning', rebuilt.ok ? '已找到替代池子' : '没有找到替代池子'),
+        renderMessage({
+          severity: rebuilt.ok ? 'info' : 'warning',
+          title: rebuilt.ok ? '已找到替代池子' : '没有找到替代池子',
+          note: rebuilt.message,
+        }),
       );
     }
   }

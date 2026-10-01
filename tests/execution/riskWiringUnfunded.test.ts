@@ -165,6 +165,6 @@ describe('allocation with an empty wallet is "nothing to check", not a violation
       limits: { maxLpRatio: config.capital.maxLpRatio, reserveRatio: config.capital.reserveRatio },
     });
     expect(verdict.ok).toBe(false);
-    expect(verdict.problems.join(' ')).toMatch(/cannot be verified/);
+    expect(verdict.problems.join(' ')).toMatch(/无法据此校验资金配置/);
   });
 });
