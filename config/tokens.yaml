@@ -51,8 +51,8 @@ tokens:
     chain_id: 56
     contract: "0x02fca66c1d1afb4e2a7884261eb00f63598a7436"
     risk_tier: HIGH_VOL
-    auto_trade: false
-    notes: "HIGH_VOL: monitor only in V1."
+    auto_trade: true
+    notes: "Binance bStocks"
 
   - symbol: TSLAB
     chain_id: 56
