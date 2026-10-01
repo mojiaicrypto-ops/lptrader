@@ -34,7 +34,6 @@ import {
   decryptPrivateKey,
   readKeystoreFile,
 } from './security/keystore.ts';
-import { readPassphraseFile } from './security/passphraseFile.ts';
 import { WhitelistError } from './types/registry.ts';
 import { buildCadences, buildRuntime, type StrategyRuntime } from './runtime.ts';
 import { Scheduler } from './execution/scheduler.ts';
@@ -148,23 +147,25 @@ async function resolveSigner(
   const envelope = await readKeystoreFile(keystorePath);
 
   /*
-   * Unattended start: read the passphrase from a file when one is configured.
+   * Two ways to supply the passphrase:
    *
-   * A process manager has no terminal, so the interactive prompt below can never be answered — the process
-   * would block forever on a prompt nobody can see. The file's permissions are enforced by the reader, and
-   * a file that is group- or world-readable REFUSES to start rather than warning: a system that trades
-   * happily while its key is exposed discovers the exposure only after the funds are gone.
+   *   1. KEYSTORE_PASSPHRASE  — for an unattended start
+   *   2. the prompt           — reading stdin, which works at a terminal AND from a pipe
+   *
+   * The prompt is not only for a human typing: `nohup`/`setsid` keep whatever stdin they inherit, so a
+   * background start can be given the passphrase on stdin and works the same way.
    */
-  const fromFile = await readPassphraseFile(env['KEYSTORE_PASSPHRASE_FILE']);
-  if (fromFile !== null) {
-    process.stdout.write(`Passphrase read from ${String(env['KEYSTORE_PASSPHRASE_FILE'])}.\n`);
+  const fromEnv = env['KEYSTORE_PASSPHRASE'];
+  const promptable = fromEnv === undefined || fromEnv.length === 0;
+  if (!promptable) {
+    process.stdout.write('Passphrase taken from KEYSTORE_PASSPHRASE.\n');
   } else {
     process.stdout.write(
       '\nA keystore is configured, so the signing key is needed.\n' +
         'Enter the passphrase (hidden). Press Ctrl-C to run read-only instead.\n',
     );
   }
-  const passphrase = fromFile ?? (await promptSecret('Passphrase (hidden): '));
+  const passphrase = promptable ? await promptSecret('Passphrase (hidden): ') : fromEnv;
   if (passphrase.length === 0) {
     process.stdout.write('No passphrase supplied — running read-only.\n');
     return null;

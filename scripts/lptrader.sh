@@ -118,23 +118,22 @@ cmd_start() {
     exec node --experimental-strip-types --env-file-if-exists="$ENV_FILE" src/main.ts
   fi
 
-  # The passphrase must come from a file: with no TTY the interactive prompt can never be answered and the
-  # process would block forever on a prompt nobody can see. Warn early rather than let that happen.
-  if grep -qE '^KEYSTORE_PATH=.+' "$ENV_FILE" && ! grep -qE '^KEYSTORE_PASSPHRASE_FILE=.+' "$ENV_FILE"; then
-    warn "KEYSTORE_PATH is set but KEYSTORE_PASSPHRASE_FILE is not."
-    warn "A background start has no terminal, so the passphrase prompt cannot be answered."
-    warn "Set KEYSTORE_PASSPHRASE_FILE in $ENV_FILE (see: $0 doctor), or use: $0 start --foreground"
-    exit 1
+  # If a keystore is configured and the passphrase is not already in the environment, it has to be typed.
+  # Said BEFORE starting, because the prompt appears mid-stream and is easy to miss — and a process waiting
+  # on an unnoticed prompt looks exactly like one that has hung.
+  local needs_passphrase=0
+  if grep -qE '^KEYSTORE_PATH=.+' "$ENV_FILE" && [ -z "${KEYSTORE_PASSPHRASE:-}" ]; then
+    needs_passphrase=1
+    say "本进程需要钱包口令，启动后请输入（输入时不显示）。"
+    say "想跳过这一步：KEYSTORE_PASSPHRASE='你的口令' $0 start"
   fi
 
   rotate_log
 
   # Detach from the terminal's session so the process survives the shell that started it.
   #
-  # `setsid` is the clean way but is not present everywhere (macOS has no `setsid` binary, and minimal
-  # containers often lack it). `nohup` is the portable fallback: it ignores SIGHUP, which is what kills a
-  # background process when its shell exits. Detected rather than assumed, because a hard dependency on a
-  # missing binary fails at the worst moment — right after the operator believes it started.
+  # `setsid` is the clean way but is absent on macOS and in minimal containers; `nohup` is the portable
+  # fallback, since SIGHUP is what kills a background process when its shell exits.
   local launcher
   if command -v setsid >/dev/null 2>&1; then
     launcher=(setsid)
@@ -142,6 +141,9 @@ cmd_start() {
     launcher=(nohup)
   fi
 
+  # Note what is redirected and what is NOT: stdout/stderr go to the log, stdin stays attached. That is
+  # what lets the passphrase be typed here — or piped in. Redirecting stdin to /dev/null (the
+  # obvious-looking choice) would silently make the prompt unanswerable, which is the problem this avoids.
   "${launcher[@]}" node --experimental-strip-types --env-file-if-exists="$ENV_FILE" src/main.ts \
     >> "$LOG_FILE" 2>&1 &
   local new_pid=$!
@@ -157,8 +159,17 @@ $(tail -20 "$LOG_FILE" 2>/dev/null || true)"
   fi
 
   ok "started (pid $new_pid)"
+  if [ "$needs_passphrase" = "1" ]; then
+    # The prompt was printed by the process into the log, not to this terminal — `setsid` detaches from the
+    # controlling terminal, so a TTY-less process reads stdin instead of the keyboard. Point at the log and
+    # at the alternative, rather than leaving the operator to wonder why nothing asked them for anything.
+    say ""
+    say "本进程需要口令，但后台进程读不到你的键盘。两种做法："
+    say "  a) 停掉，用环境变量启动：KEYSTORE_PASSPHRASE='你的口令' $0 restart"
+    say "  b) 把口令通过管道送入：printf '%s' '你的口令' | $0 start"
+    say "详情见日志：$0 logs"
+  fi
   say "log : $LOG_FILE"
-  say "follow with: $0 logs -f"
 }
 
 cmd_stop() {
@@ -266,23 +277,12 @@ cmd_doctor() {
   v="$(grep -cE '^KEYSTORE_PATH=.+' "$ENV_FILE" || true)"
   check "KEYSTORE_PATH" "$v" "$([ "$v" = 1 ] && echo 'set' || echo 'not set — read-only monitor')"
 
-  # The passphrase file is what makes a background start possible at all.
-  local pf
-  pf="$(grep -E '^KEYSTORE_PASSPHRASE_FILE=' "$ENV_FILE" | cut -d= -f2- || true)"
-  if [ -n "$pf" ]; then
-    if [ ! -f "$pf" ]; then
-      check "PASSPHRASE_FILE" 0 "$pf does not exist"
-    else
-      local mode
-      mode="$(stat -c '%a' "$pf" 2>/dev/null || echo '?')"
-      if [ "$mode" = "600" ]; then
-        check "PASSPHRASE_FILE" 1 "$pf (mode 600)"
-      else
-        check "PASSPHRASE_FILE" 0 "$pf has mode $mode — must be 600. Run: chmod 600 $pf"
-      fi
-    fi
+  # The passphrase has three sources; report WHICH one is in play, because the failure mode of getting
+  # this wrong is a process sitting silently at a prompt nobody can see.
+  if [ -n "${KEYSTORE_PASSPHRASE:-}" ]; then
+    check "PASSPHRASE" 1 "KEYSTORE_PASSPHRASE is set in the environment"
   else
-    check "PASSPHRASE_FILE" 0 "not set — a background start cannot answer the passphrase prompt"
+    check "PASSPHRASE" 1 "not set — you will be prompted (works at a terminal and from a pipe)"
   fi
 
   v="$(grep -cE '^DRY_RUN=0' "$ENV_FILE" || true)"
