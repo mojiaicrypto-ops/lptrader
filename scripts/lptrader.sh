@@ -118,14 +118,26 @@ cmd_start() {
     exec node --experimental-strip-types --env-file-if-exists="$ENV_FILE" src/main.ts
   fi
 
-  # If a keystore is configured and the passphrase is not already in the environment, it has to be typed.
-  # Said BEFORE starting, because the prompt appears mid-stream and is easy to miss — and a process waiting
-  # on an unnoticed prompt looks exactly like one that has hung.
-  local needs_passphrase=0
+  # A background start CANNOT prompt: `setsid` creates a new session with no controlling terminal, so the
+  # process gets EOF on stdin and dies with "stdin closed before a value was provided" — measured. Refusing
+  # here, before anything launches, is the difference between an instruction and a stack trace.
+  #
+  # Detected rather than assumed: a keystore plus no passphrase source is exactly the combination that
+  # cannot work in the background, and it is knowable without starting anything.
+  # A background start has no way to ask for the passphrase: `setsid` creates a new session with no
+  # controlling terminal, and the process dies with "stdin closed before a value was provided" — measured
+  # twice, with and without a pipe. So the passphrase must already be in the environment, and saying that
+  # HERE is the difference between an instruction and a stack trace.
+  #
+  # A pipe is deliberately not offered as a third option: it would need the process to stay attached to the
+  # terminal, which conflicts with the detachment that lets it survive the shell. Two ways in, both tested.
   if grep -qE '^KEYSTORE_PATH=.+' "$ENV_FILE" && [ -z "${KEYSTORE_PASSPHRASE:-}" ]; then
-    needs_passphrase=1
-    say "本进程需要钱包口令，启动后请输入（输入时不显示）。"
-    say "想跳过这一步：KEYSTORE_PASSPHRASE='你的口令' $0 start"
+    warn "这个配置需要钱包口令，而后台进程无法提示你输入。"
+    warn ""
+    warn "用下面任一种方式："
+    warn "  KEYSTORE_PASSPHRASE='你的口令' $0 start     # 后台，无需终端"
+    warn "  $0 start --foreground                      # 前台，会提示你输入"
+    exit 1
   fi
 
   rotate_log
@@ -134,16 +146,23 @@ cmd_start() {
   #
   # `setsid` is the clean way but is absent on macOS and in minimal containers; `nohup` is the portable
   # fallback, since SIGHUP is what kills a background process when its shell exits.
+  #
+  # `setsid` is skipped when stdin is a pipe: it starts a new session and detaches stdin, which discards the
+  # passphrase that was piped in — measured. `nohup` keeps the inherited descriptors, so a piped start works
+  # there. Without either, the background job still survives the shell in practice, but the prompt path is
+  # the one that would break, so it is worth being explicit.
   local launcher
   if command -v setsid >/dev/null 2>&1; then
     launcher=(setsid)
-  else
+  elif command -v nohup >/dev/null 2>&1; then
     launcher=(nohup)
+  else
+    launcher=()
   fi
 
-  # Note what is redirected and what is NOT: stdout/stderr go to the log, stdin stays attached. That is
-  # what lets the passphrase be typed here — or piped in. Redirecting stdin to /dev/null (the
-  # obvious-looking choice) would silently make the prompt unanswerable, which is the problem this avoids.
+  # stdin is left attached — but `setsid` starts a NEW SESSION with no controlling terminal, so a prompt
+  # cannot read the keyboard from here. Measured: the process printed "Passphrase (hidden): " and then died
+  # with "stdin closed before a value was provided". The three ways that DO work are listed after start.
   "${launcher[@]}" node --experimental-strip-types --env-file-if-exists="$ENV_FILE" src/main.ts \
     >> "$LOG_FILE" 2>&1 &
   local new_pid=$!
@@ -159,16 +178,6 @@ $(tail -20 "$LOG_FILE" 2>/dev/null || true)"
   fi
 
   ok "started (pid $new_pid)"
-  if [ "$needs_passphrase" = "1" ]; then
-    # The prompt was printed by the process into the log, not to this terminal — `setsid` detaches from the
-    # controlling terminal, so a TTY-less process reads stdin instead of the keyboard. Point at the log and
-    # at the alternative, rather than leaving the operator to wonder why nothing asked them for anything.
-    say ""
-    say "本进程需要口令，但后台进程读不到你的键盘。两种做法："
-    say "  a) 停掉，用环境变量启动：KEYSTORE_PASSPHRASE='你的口令' $0 restart"
-    say "  b) 把口令通过管道送入：printf '%s' '你的口令' | $0 start"
-    say "详情见日志：$0 logs"
-  fi
   say "log : $LOG_FILE"
 }
 

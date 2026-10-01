@@ -310,35 +310,23 @@ pending aprv : 0
 
 #### 后台启动与口令
 
-**三种给口令的方式，任选一种：**
+**后台进程无法提示你输入口令** —— 它脱离了控制终端，读不到键盘（实测：`stdin closed before a value was provided`）。
+
+所以有两种方式：
 
 ```bash
-# 1) 环境变量（适合脚本化/无人值守）
+# 1) 后台启动：口令随环境变量给出
 KEYSTORE_PASSPHRASE='你的口令' ./scripts/lptrader.sh start
+./scripts/lptrader.sh status     # 应显示 running + [时间] pool-scan ok
 
-# 2) 管道
-printf '%s' '你的口令' | ./scripts/lptrader.sh start
-
-# 3) 直接输（脚本会提示，输入时不显示）
-./scripts/lptrader.sh start
+# 2) 前台启动：会提示你输入（Ctrl-C 停止）
+./scripts/lptrader.sh start --foreground
 ```
 
-**三种都验证过能到 `mode: LIVE`。**
+**缺口令时脚本会直接拒绝并告诉你怎么做**，不会启动到一半才失败。
 
-> **注意**：环境变量对本进程的环境可见 —— 共享主机上优先用方式 3。
-> 用「方式 1/2」时口令会出现在 shell 历史或进程列表里，必要时先 `unset HISTFILE`。
-
-**后台进程能读到你的键盘吗？**
-
-`setsid`/`nohup` 会脱离控制终端，所以**方式 3 在后台启动时可能读不到你的输入**。
-脚本会在启动前告诉你这一点，并给出方式 1/2。
-
-**`doctor` 会说明当前用哪种来源**：
-
-```bash
-./scripts/lptrader.sh doctor
-#   PASSPHRASE    not set — you will be prompted (works at a terminal and from a pipe)
-```
+> **环境变量对本进程的环境可见。** 共享主机上优先用方式 2；用方式 1 时注意 shell
+> 历史可能记录该命令。
 
 #### 日志
 
