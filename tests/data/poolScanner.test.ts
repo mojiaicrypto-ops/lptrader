@@ -235,9 +235,11 @@ describe('§14 enumerateCandidatePairs: stock × stablecoin × DEX, by address',
   it('expands the builtin whitelist to the full cross set on chain 56', () => {
     const pairs = enumerateCandidatePairs({ whitelist: config.whitelist });
 
-    // 5 auto-trade stock tokens × 2 stablecoins × 2 DEXes.
-    expect(pairs).toHaveLength(20);
-    expect([...new Set(pairs.map((pair) => pair.stockToken))]).toHaveLength(5);
+    // Derived from the whitelist rather than hardcoded: the set grows when a token is added, and a
+    // literal here turns that into a failing test that says nothing about the behaviour under test.
+    const autoTrade = config.whitelist.registry.listStockTokens({ autoTradeOnly: true });
+    expect(pairs).toHaveLength(autoTrade.length * 2 * 2);
+    expect([...new Set(pairs.map((pair) => pair.stockToken))]).toHaveLength(autoTrade.length);
     expect([...new Set(pairs.map((pair) => pair.stablecoin))].sort()).toEqual([USDC, USDT].sort());
     expect([...new Set(pairs.map((pair) => pair.dex))].sort()).toEqual(
       [DEX_IDS.UNISWAP_V3, DEX_IDS.PANCAKESWAP_V3].sort(),
@@ -248,12 +250,18 @@ describe('§14 enumerateCandidatePairs: stock × stablecoin × DEX, by address',
   it('never treats WBNB as a stablecoin, and excludes HIGH_VOL stock tokens', () => {
     const pairs = enumerateCandidatePairs({ whitelist: config.whitelist });
     expect(pairs.some((pair) => pair.stablecoin === WBNB)).toBe(false);
-    // NVDAB/TSLAB/PLTRB are HIGH_VOL: monitor-only in V1 (§9), so they are not trading candidates.
-    const nvdab = config.whitelist.registry
+    // TSLAB/PLTRB are HIGH_VOL and monitor-only in V1 (§9), so they are not trading candidates.
+    //
+    // Asserted on the tokens whose `auto_trade` is false rather than on a fixed list: the invariant is
+    // "a token the registry marks non-tradeable never becomes a candidate", and naming NVDAB here encoded
+    // an assumption about that token's config rather than about this function's behaviour.
+    const monitorOnly = config.whitelist.registry
       .listStockTokens()
-      .find((token) => token.symbol === 'NVDAB');
-    expect(nvdab).toBeDefined();
-    expect(pairs.some((pair) => pair.stockToken === nvdab!.address)).toBe(false);
+      .filter((token) => !token.autoTrade);
+    expect(monitorOnly.length).toBeGreaterThan(0);
+    for (const token of monitorOnly) {
+      expect(pairs.some((pair) => pair.stockToken === token.address)).toBe(false);
+    }
   });
 });
 

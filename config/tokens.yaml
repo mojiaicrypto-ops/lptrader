@@ -50,7 +50,7 @@ tokens:
   - symbol: NVDAB
     chain_id: 56
     contract: "0x02fca66c1d1afb4e2a7884261eb00f63598a7436"
-    risk_tier: HIGH_VOL
+    risk_tier: CORE
     auto_trade: true
     notes: "Binance bStocks"
 

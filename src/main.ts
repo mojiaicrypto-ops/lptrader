@@ -81,6 +81,21 @@ export async function loadStartupSummary(env: NodeJS.ProcessEnv = process.env): 
     await readKeystoreFile(keystorePath);
   }
 
+  /*
+   * The wallet, validated BEFORE the passphrase prompt.
+   *
+   * A keystore supplies it (the key IS the owner), so this only fails when neither is present. Checking
+   * here rather than inside `buildRuntime` matters because the operator is asked for a passphrase in
+   * between: discovering a missing configuration after typing a secret is both alarming and unnecessary.
+   */
+  if ((keystorePath === undefined || keystorePath.length === 0) &&
+      (env['STRATEGY_WALLET_ADDRESS'] === undefined || env['STRATEGY_WALLET_ADDRESS'] === '')) {
+    throw new ConfigError(
+      'no wallet to monitor: set STRATEGY_WALLET_ADDRESS to the address to watch, or configure ' +
+        'KEYSTORE_PATH to run with a signing wallet.',
+    );
+  }
+
   const dryRun = env['DRY_RUN'] !== '0';
   return {
     sourcePath: config.sourcePath ?? '<unknown>',

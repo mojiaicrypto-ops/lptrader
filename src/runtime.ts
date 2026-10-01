@@ -250,6 +250,15 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
     );
   }
 
+  /**
+   * The wallet operator actions act on, resolved once.
+   *
+   * Resolved here rather than at each use: it is a precondition of several subsystems, and discovering it
+   * is missing in the middle of building the runtime is how an operator ends up entering a passphrase and
+   * only then being told the configuration is incomplete.
+   */
+  const walletAddress = walletAddressOf(env, options.signer);
+
   const tokenReader = new TokenReaderImpl(chain, registryFor(config), chainId);
   const positionReader = new PositionReaderImpl(chain, chainId);
   const referencePrice =
@@ -354,7 +363,7 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
           poolId: record.poolId,
           positionTokenId: BigInt(record.id),
           liquidity: record.liquidity,
-          owner: walletAddressOf(env),
+          owner: walletAddress,
           dex: record.dex,
         };
       },
@@ -406,7 +415,7 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
     ? null
     : new FundingPlanner({
         config,
-        balanceOf: (token) => chain.getTokenBalanceOf(token, walletAddressOf(env)),
+        balanceOf: (token) => chain.getTokenBalanceOf(token, walletAddress),
         tokenMeta: (address) => config.whitelist.registry.getTokenByAddress(chainId, address),
       });
 
@@ -433,8 +442,8 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
           const owner = adapters.find((adapter) => adapter.dex === venue) ?? dex;
           return owner.quoteSwap(request);
         },
-        guard: () => buildTxGuard(buildGuardChecks(config, dex, walletAddressOf(env))),
-        walletAddress: walletAddressOf(env),
+        guard: () => buildTxGuard(buildGuardChecks(config, dex, walletAddress)),
+        walletAddress: walletAddress,
         now: () => new Date().toISOString(),
       });
 
@@ -458,7 +467,7 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
         pool,
         positionTokenId: BigInt(record.id),
         liquidity: record.liquidity,
-        owner: walletAddressOf(env),
+        owner: walletAddress,
       };
     },
     tvlSeries: (poolId) => poolSnapshots.tvlSeries(poolId),
@@ -1409,12 +1418,21 @@ function requireActionHandlers(handlers: ActionHandlers | null): ActionHandlers 
 }
 
 /** §92: the wallet address an action should treat as the owner. Required for a funded run. */
-function walletAddressOf(env: NodeJS.ProcessEnv): Address {
+/**
+ * The wallet an operator action acts on.
+ *
+ * The signer's own address is authoritative and needs no configuration: when a keystore is attached, the
+ * key it decrypted IS the owner, and asking the operator to restate it is both redundant and a way to
+ * configure the wrong one. `STRATEGY_WALLET_ADDRESS` remains for the read-only case, where there is no
+ * signer to ask — a monitor watching someone else's wallet.
+ */
+function walletAddressOf(env: NodeJS.ProcessEnv, signer?: RuntimeSigner): Address {
+  if (signer !== undefined) return signer.account.address;
   const configured = env['STRATEGY_WALLET_ADDRESS'];
   if (configured === undefined || configured === '') {
     throw new Error(
-      'STRATEGY_WALLET_ADDRESS is not set: an operator action needs to know the owning wallet, and ' +
-        'guessing it would be worse than refusing',
+      'no wallet to act on: attach a keystore (KEYSTORE_PATH) or set STRATEGY_WALLET_ADDRESS for a ' +
+        'read-only monitor.',
     );
   }
   return configured as Address;
