@@ -215,24 +215,29 @@ eth_gasPrice could not be served by any RPC endpoint (1 tried): ... An internal 
 
 ## 4. 启动前检查（每次动真钱之前都做一遍）
 
-这四步**全部免费、全部只读**，跑完再决定要不要真跑。
+这三步**全部免费、全部只读**，跑完再决定要不要真跑。
 
 ```bash
-npm run dev             # ① 配置与白名单自检（不连链）
-npm run smoke:read      # ② 链上只读：池状态、余额、bStock 换算系数
-npm run smoke:quote     # ③ 真实报价：1000 USDT 能换多少标的
+npm run smoke:read      # ① 链上只读：池状态、余额、bStock 换算系数
+npm run smoke:quote     # ② 真实报价：1000 USDT 能换多少标的
 npm run dry-run:build -- 7000
-                        # ④ 完整建仓决策链：计划 / 报价 / 闸门 / calldata —— 不发送
+                        # ③ 完整建仓决策链：计划 / 报价 / 闸门 / calldata —— 不发送
 ```
 
 **期望与判读：**
 
 | 命令 | 期望输出 | 异常时看什么 |
 |---|---|---|
-| `dev` | 打印链、DEX、可交易股票、稳定币优先级、风控线、审批策略 | 直接报错退出 = 配置非法，按提示改 YAML |
-| `smoke:read` | 末尾 `verdict: all required reads succeeded` | RPC 不通；或某 token 探测失败 |
-| `smoke:quote` | 有 `amountOut`、`priceImpact`、`§40 gate ok` | 报价失败 = 池地址/Quoter 问题 |
+| `smoke:read` | 逐项读到池状态/余额/换算系数，**没有** `SMOKE READ FAILED` | 出现 `SMOKE READ FAILED` = RPC 不通或某 token 探测失败 |
+| `smoke:quote` | 有 `amountOut (QQQB)`、`priceImpact`、`amountOutMinimumRaw` | 报价失败 = 池地址/Quoter 问题 |
 | `dry-run:build` | 每个候选池一段计划 + `RESULT PASS/REJECTED` | 见 §8 判读指南 |
+
+> **⚠️ `npm run dev` 不是自检 —— 它会一直运行。**
+>
+> 它打印配置摘要后**直接进入调度循环**（扫描、估值、风控），直到你按 Ctrl-C 或停止服务。
+> 想只看配置与白名单就退出，用 `./scripts/lptrader.sh doctor`。
+>
+> 这也意味着**启动前的配置检查不能靠 `npm run dev`** —— 用 `doctor` 或上面三步只读命令。
 
 `dry-run:build` 的参数是**你要投入 LP 的金额**（不是总资金）。
 
@@ -401,9 +406,37 @@ sqlite3 data/lptrader.db "select count(*), min(sampled_at), max(sampled_at) from
 
 ### 5.4 日志与告警
 
-- 进程日志：`stdout.log` / `stderr.log`（或 `journalctl`）
-- **重要事件会推到 Telegram**：风控线触发、脱锚、池子流动性崩塌、交易失败、审批请求
-- 启动时若发现上次有未完成的交易，会推一条 `warning` 提醒需要人工核查
+**两个地方，分工不同：**
+
+| 来源 | 内容 | 怎么看 |
+|---|---|---|
+| **进程日志** | 启动信息、**每个节拍的完成情况**、错误 | `./scripts/lptrader.sh logs` / `tail` |
+| **Telegram** | 风控触发、脱锚、池子规模崩塌、交易失败、审批请求 | 手机 |
+
+**每个节拍完成时会打印一行**，这是判断"活着吗"最直接的方式：
+
+```text
+[15:31:34] pool-scan ok (218s)
+[15:36:34] portfolio-monitor ok (3s)
+[15:51:34] pool-health ok (2s)
+```
+
+**只打印失败是不够的** —— 之前成功时完全静默，让"运行正常"和"已经死了"从外面看一模一样，运维者只能靠重启来试探。
+
+**节拍失败会写到 `stderr`**（与正常输出分开，便于分流）：
+
+```text
+[15:41:34] pool-health FAILED (2s): provider unreachable
+```
+
+**日志文件**：
+
+```text
+logs/lptrader.log              当前
+logs/lptrader.log.<时间戳>      超过 10 MiB 自动滚动
+```
+
+启动时若发现上次有未完成的交易，会推一条 `warning` 提醒需要人工核查。
 
 ### 5.5 私钥的备份与恢复
 
@@ -581,17 +614,42 @@ npm run telegram:check
 
 | 操作 | 需要确认？ | 说明 |
 |---|---|---|
-| **建仓**（首次把资金放进池子） | ✅ 需要 | 会推送区间、金额、滑点、价格影响 |
-| **换池** | ✅ 需要 | 同上 |
-| 收取手续费 | ❌ 自动 | §63，收进储备 |
+| **建仓**（`/start` 之后真正提交那笔） | ✅ **需要** | 推送金额、区间、价格影响、滑点；**这是唯一动钱的确认门** |
+| **撤池**（`/exit`） | ✅ **需要** | 撤池不可逆：付 swap 成本 + 实现无常损失 |
+| **恢复交易**（`/resume`） | ✅ **需要** | 重新允许交易，所以先问 |
+| 收取手续费 | ❌ 自动 | 收进储备 |
 | 风控退出 / 停机 | ❌ 自动 | **故意不设人工门** —— 危险时刻不该等人 |
 | 持仓监控、池扫描、告警 | ❌ 自动 | |
 
+**`/start` 本身不需要确认**（§6.2 记录的决定）：它是你主动发出的命令，本身就是授权；再问一次会让"撤池再重建"变成两次往返，而不增加安全性。
+
+**但它触发的建仓**仍然要过确认门 —— 所以你会看到**一条** Approve/Reject 推送，那是提交交易的确认，不是 `/start` 的。
+
 请求 **30 分钟**（`timeout_minutes`）未答即过期，**过期后不执行**。
 
-### 6.2 可用查询命令
+**⚠️ 进程重启会让已发出的按钮失效**：审批请求记录在数据库里，但等待状态在内存中。重启后点旧按钮**不会执行任何东西** —— 重新发一次命令即可。
 
-`/status`、`/position`、`/pools`、`/nav`、`/risk`
+### 6.2 可用命令
+
+**查询**（只读，不需要确认）：
+
+| 命令 | 看什么 |
+|---|---|
+| `/status` | 状态、模式、通知是否启用、三个节拍 |
+| `/nav` | 总权益、收益率与归因 |
+| `/position` | 持仓池、区间位置、未领手续费 |
+| `/pools` | 候选池（`/pools all` 看全部拒绝理由） |
+| `/risk` | 风控结论 |
+
+**操作**（会动钱，见 §6.1）：
+
+| 命令 | 作用 |
+|---|---|
+| `/start` | 空仓时发起建仓；走与自动路径相同的选池逻辑 |
+| `/exit` | 撤出当前仓位；撤完自动重新选池 |
+| `/resume` | 风控停机后人工放行 |
+
+**命令没反应时先查两件事**：`/status` 里的**通知**是否为"已启用"；进程是否还在跑（`./scripts/lptrader.sh status`）。通报未启用时，**所有命令都不会有任何回应**。
 
 ---
 
@@ -826,8 +884,11 @@ npm run telegram:check
 npm run dev
 ```
 
-**流程**：启动 → 扫描 → 找到合格池 → **Telegram 弹出带 Approve/Reject 的确认请求**
-（含金额、区间、ticks、滑点、价格影响）→ **你核对后点 Approve** → 才真正发交易。
+**流程**：发 `/start` → 扫描 → 找到合格池 → **Telegram 弹出带 Approve/Reject 的确认请求**
+（含投入金额、当前价格、价格区间、需兑换数量、价格影响、允许滑点）→ **你核对后点 Approve** → 才真正发交易。
+
+> **⚠️ 进程重启后，已发出的按钮会失效** —— 审批请求在数据库里，但"等待点击"的状态在内存中。
+> 重启后点旧按钮不会有任何反应，重新发一次 `/start` 即可。
 
 判读标准见 §6.1 与 §8。**拿不准就 Reject 或让它超时** —— 超时只是"这轮不建仓"。
 
@@ -939,7 +1000,7 @@ candidate 56:pancakeswap-v3:0xe531fcb1...
 ### 9.1 紧急停止
 
 ```bash
-sudo systemctl stop lptrader        # 停进程
+cd /root/app/lptrader && ./scripts/lptrader.sh stop    # 优雅停进程
 ```
 
 **注意**：停进程**不会**自动撤出资金。链上仓位仍在池子里继续赚取/承担无常损失。
@@ -1035,12 +1096,13 @@ npm run keystore:verify -- --export   # 导出私钥做备份（敏感）
 ./scripts/lptrader.sh stop       # 优雅停止
 
 # 运行（前台，排障用）
-npm run dev                  # 前台
-sudo systemctl start lptrader
+./scripts/lptrader.sh start --foreground
 
 # 排障
-journalctl -u lptrader -f
-sqlite3 data/lptrader.db "select * from decision_logs order by timestamp desc limit 20;"
+./scripts/lptrader.sh status                         # 进程/节拍/数据库 一眼看全
+./scripts/lptrader.sh logs 200                       # 最近 200 行
+./scripts/lptrader.sh tail                           # 实时跟随
+sqlite3 data/lptrader.db "select timestamp, action, result, reason from decision_logs order by timestamp desc limit 20;"
 ```
 
-**遇到无法解释的现象：先停（`systemctl stop`），保留 `data/lptrader.db` 与日志，再排查。** 停机的代价远小于带着错误状态继续交易。
+**遇到无法解释的现象：先停（`./scripts/lptrader.sh stop`），保留 `data/lptrader.db` 与 `logs/`，再排查。** 停机的代价远小于带着错误状态继续交易。

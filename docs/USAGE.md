@@ -43,7 +43,19 @@
 > **「还没有数据」** —— 这是真实状态，不是错误。首轮扫描约 4 分钟（数据源限流）。
 > 显示 `$0.00` 则意味着**真的测到了 0**，与"还没测"是两回事。
 
-**主动推送**（不用你问）：风控触发、脱锚告警、池子流动性崩塌、交易失败、以及**需要你确认的请求**。
+**主动推送**（不用你问）：风控触发、脱锚告警、池子规模崩塌、交易失败、以及**需要你确认的请求**。
+
+> **命令没有任何回应时，先查两件事：**
+>
+> 1. `/status` 里的「通知」是不是**已启用**。未启用时**所有命令都不会有回应**（没有任何通道能回复你）。
+> 2. 进程还在不在：`./scripts/lptrader.sh status`。
+>
+> **如果它连 `/status` 都不回**，那就是通道或进程的问题，不是命令的问题。
+
+> **⚠️ 重启进程会让已发出的 Approve/Reject 按钮失效。**
+>
+> 审批请求记录在数据库里，但"等待你点击"的状态在内存中。重启后点旧按钮**不会有任何反应**。
+> 重新发一次命令即可（比如再发 `/start`）。
 
 ### 2.2 推送的级别与你的动作
 
@@ -121,7 +133,7 @@ expires: 2026-10-01T12:34:56.000Z
 
 1. **把钱转进策略钱包**（USDT 或 USDC；另备少量 BNB 作 gas）
 2. **改 `config/strategy.yaml` 的 `initial_strategy_capital_usd`** = 你打算投进策略的**总额**
-3. **重启进程**：`sudo systemctl restart lptrader`
+3. **重启进程**：`./scripts/lptrader.sh restart`
 4. **看 Telegram `/nav` 与 `/status`**，确认新 NAV 被读到
 
 ### 为什么必须改 `initial_strategy_capital_usd`
@@ -166,7 +178,7 @@ expires: 2026-10-01T12:34:56.000Z
 | 系统行为与这份文档不符 | 先停，保留 `data/lptrader.db` 与日志，再排查 |
 
 ```bash
-sudo systemctl stop lptrader
+cd /root/app/lptrader && ./scripts/lptrader.sh stop
 ```
 
 **停机的代价远小于带着错误状态继续交易。**
@@ -381,9 +393,10 @@ npm run smoke:scan                   # 哪些池合格（约 3 分钟）
 npm run dry-run:build -- <LP金额>     # ★ 建仓预演：真建仓会长什么样
 
 # 运行
-sudo systemctl start lptrader
-sudo systemctl stop lptrader         # ★ 不确定时就停
-journalctl -u lptrader -f
+./scripts/lptrader.sh start          # 后台启动
+./scripts/lptrader.sh status         # 进程/节拍/数据库
+./scripts/lptrader.sh logs           # 看日志
+./scripts/lptrader.sh stop           # ★ 不确定时就停
 
 # 查历史决策
 sqlite3 data/lptrader.db "select timestamp, action, result, reason from decision_logs order by timestamp desc limit 20;"
