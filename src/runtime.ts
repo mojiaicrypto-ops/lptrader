@@ -143,6 +143,14 @@ export interface StrategyRuntime {
   /** `null` in read-only mode — the entire write path is unreachable without it. */
   readonly executor: PositionExecutor | null;
   readonly readOnly: boolean;
+  /**
+   * True when transactions are guard-checked and refused before broadcast.
+   *
+   * On the runtime rather than read from `process.env` at each use: a banner that reports "dry-run: yes"
+   * while the chain layer would happily broadcast is worse than having no flag at all, and the two must
+   * therefore read the SAME resolved value.
+   */
+  readonly dryRun: boolean;
   /** Module 2: screens candidates on chain and returns the first that passes. */
   readonly screener: PoolScreener;
   /**
@@ -225,9 +233,23 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
   // the recovery pass is the caller's job because it needs chain access to resolve a hash.
   const unresolved = txStore.findUnresolved({ chainId });
 
+  /*
+   * DRY_RUN reaches the chain adapter, which is the ONLY layer that can refuse to broadcast.
+   *
+   * It previously did not: the adapter was constructed without `dryRun`, so it defaulted to `false` and
+   * would have sent every transaction for real — while the startup banner printed
+   * `dry-run: yes (no transaction will be sent)`. A safety switch that reports itself as on and is off is
+   * worse than no switch, because it is trusted.
+   *
+   * Read from `env` (the caller's environment) rather than `process.env`: this function takes an explicit
+   * env, and consulting the global one would let the two disagree about whether real money may move.
+   */
+  const dryRun = (env['DRY_RUN'] ?? '1') !== '0';
+
   const chain = new BscAdapter({
     chainId,
     whitelist: config.whitelist,
+    dryRun,
     ...(options.signer === undefined ? {} : { account: options.signer.account }),
   });
 
@@ -663,6 +685,7 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
     stateMachine,
     executor,
     readOnly,
+    dryRun,
     poolSnapshots,
     rememberScannedPools: (pools) => {
       latestPoolByAddress.clear();
@@ -823,7 +846,7 @@ function statusView(runtime: StrategyRuntime, at: IsoTimestamp): StatusView {
   return {
     state: runtime.stateMachine.current,
     readOnly: runtime.readOnly,
-    dryRun: (process.env['DRY_RUN'] ?? '1') !== '0',
+    dryRun: runtime.dryRun,
     telegramEnabled: config.telegram.enabled,
     cadences: [
       { name: 'pool-scan', intervalMinutes: config.monitor.poolScanIntervalMinutes },
