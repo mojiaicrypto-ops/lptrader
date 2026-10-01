@@ -270,40 +270,95 @@ Starting. Ctrl-C to stop.
 
 **口令**：配置了 keystore 时会**交互式要求输入**（不回显）。**口令错误 = 硬失败退出**，不会静默退化成只读 —— 否则你会以为机器人能交易而实际不能。
 
-### 5.2 长驻运行（`systemd` 示例）
+### 5.2 长驻运行（后台服务）
 
-```ini
-# /etc/systemd/system/lptrader.service
-[Unit]
-Description=lptrader - tokenized stock LP strategy
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=lptrader
-WorkingDirectory=/opt/lptrader
-EnvironmentFile=/opt/lptrader/.env
-ExecStart=/usr/bin/node --experimental-strip-types src/main.ts
-Restart=on-failure
-RestartSec=30
-# 硬性要求：重启不能导致重复发交易，程序自身由幂等键保证；
-# 但请勿用 Restart=always 掩盖反复崩溃。
-StandardOutput=append:/var/log/lptrader/stdout.log
-StandardError=append:/var/log/lptrader/stderr.log
-
-[Install]
-WantedBy=multi-user.target
-```
+**用 `scripts/lptrader.sh`。** 它管理进程、日志、状态，不需要 tmux，也不需要 systemd。
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now lptrader
-sudo systemctl status lptrader
-journalctl -u lptrader -f
+./scripts/lptrader.sh start      # 后台启动
+./scripts/lptrader.sh status     # 一眼看全：进程/节拍/数据库
+./scripts/lptrader.sh logs       # 最近 100 行
+./scripts/lptrader.sh tail       # 实时跟随
+./scripts/lptrader.sh stop       # 优雅停止
+./scripts/lptrader.sh restart    # 重启
+./scripts/lptrader.sh doctor     # 启动前体检配置
 ```
 
-**重启是安全的**：程序启动时会检查上次是否留下未完成的交易（状态 `CREATED`/`SUBMITTED`/`UNKNOWN`），只会去链上**查询确认**，**不会重发**。
+**`status` 的输出**（不需要 attach 任何东西）：
+
+```text
+──────────────────────────────────────────────
+process      : running (pid 85848)
+  uptime     : 01:23:45
+  cpu / mem  :  0:12.34 72400
+──────────────────────────────────────────────
+log          : /root/app/lptrader/logs/lptrader.log (4.0K)
+last beat    : [15:31:34] pool-scan ok (218s)
+last error   : none
+db snapshots : 15
+open position: none
+pending aprv : 0
+──────────────────────────────────────────────
+```
+
+**`last beat` 是判断"活着吗"最快的方式** —— 它直接告诉你调度器还在不在跳。
+
+#### 后台启动需要口令文件
+
+后台进程没有终端，**交互式口令提示无法回答** —— 不配置的话进程会永远卡在提示上。
+
+```bash
+# 1) 一次性：把口令写入只有 root 可读的文件
+printf '%s' '你的钱包口令' > /root/.lptrader-pass
+chmod 600 /root/.lptrader-pass
+
+# 2) .env
+KEYSTORE_PASSPHRASE_FILE=/root/.lptrader-pass
+```
+
+**权限必须是 `0600`。** 放宽了会**拒绝启动**，而不是警告 —— 一个在密钥暴露时照常交易的系统，只会在资金丢失之后才发现暴露。
+
+**验证**：
+
+```bash
+./scripts/lptrader.sh doctor
+#   PASSPHRASE_FILE          /root/.lptrader-pass (mode 600)      ← 绿
+```
+
+#### 日志
+
+```text
+logs/lptrader.log              当前日志
+logs/lptrader.log.<时间戳>      滚动后的历史（超过 10 MiB 时滚动）
+```
+
+**`run/lptrader.pid`** 是 PID 文件；**残留的 PID 文件会被识别并忽略**（脚本会核对进程确实是本程序）。
+
+#### 开机自启（可选）
+
+脚本本身不注册开机自启。需要的话，在 `crontab` 加一行：
+
+```bash
+@reboot sleep 30 && cd /root/app/lptrader && ./scripts/lptrader.sh start
+```
+
+**为什么不用 systemd**：systemd 的 `ExecStart` 同样没有终端，口令问题一模一样；而且要额外维护一个单元文件。脚本 + `@reboot` 覆盖了同样的需求，且 `status` / `logs` / `doctor` 是 systemd 给不了的。
+
+#### 停止是优雅的
+
+```text
+SIGTERM → 等当前节拍跑完 → 退出
+```
+
+**为什么可能要等几分钟**：首轮池扫描约 4 分钟（数据源 6 秒/次限流）。**扫描中途被杀**正是最常见的停止场景，所以超时设为 **300 秒**，而不是默认的几十秒。
+
+**超时后**会 `SIGKILL`，并提示：
+
+```text
+note: it was killed, not stopped. Check tx_records before trusting the position state.
+```
+
+**重启是安全的**：启动时会检查上次是否留下未完成的交易，**只查询确认，不重发**（幂等键保证）。
 
 ### 5.3 运行期数据与备份
 
@@ -867,8 +922,10 @@ candidate 56:pancakeswap-v3:0xe531fcb1...
 | `cross-check failed ... slot0` | 两个 RPC 端点不一致 | 多为区块不同步；程序已固定区块高度。持续报错则换 RPC 端点 |
 | `ExperimentalWarning: SQLite` | Node 内嵌 SQLite 的实验性提示 | **可忽略**（功能正常） |
 | 扫描很慢（3 分钟） | 数据源限流（6 秒/次） | **正常**，不要调低限流 |
-| 进程反复重启 | 配置错 / RPC 全挂 | `journalctl -u lptrader -n 200`；**不要**用 `Restart=always` 掩盖 |
-| 启动后 3–4 分钟没有任何新输出 | **正常** —— 第一轮池扫描受 6 秒/次限流，约 3 分钟 | 等待。之后每个节拍按各自间隔继续 |
+| 进程反复重启 | 配置错 / RPC 全挂 | `./scripts/lptrader.sh logs`；先跑 `./scripts/lptrader.sh doctor` |
+| **不知道程序在不在跑** | 成功的节拍现在会打印 | `./scripts/lptrader.sh status` —— 看 `last beat` |
+| 后台启动卡住不动 | 没配口令文件 | `KEYSTORE_PASSPHRASE_FILE`（0600）；见 §5.2 |
+| 启动后看到 `Starting. Ctrl-C to stop.` 后安静几分钟 | **正常** —— 首轮扫描受 6 秒/次限流，约 4 分钟 | 等待。之后每完成一个节拍会打印一行 `[时间] 节拍名 ok (Ns)` |
 | 启动即要求输入口令 | keystore 已配置 | 输入创建时的口令。**错误即退出**（不降级为只读） |
 | `data/` 目录长时间不出现 | 首轮扫描未完成或失败 | 等满 4 分钟；仍无则看是否有扫描失败告警。**无 `data/` = 时序表不存在 = §59 不会生效** |
 | 启动时收到"有未完成交易"告警 | 上次崩溃时有交易在途 | **按提示去链上核查**，程序不会自动重发；确认状态后再决定 |
@@ -970,7 +1027,14 @@ npm run keystore:init        # 导入已有私钥
 npm run keystore:verify      # 验证备份可用（只打印地址）
 npm run keystore:verify -- --export   # 导出私钥做备份（敏感）
 
-# 运行
+# 运行（推荐：脚本管理进程与日志）
+./scripts/lptrader.sh doctor     # 启动前体检
+./scripts/lptrader.sh start      # 后台启动
+./scripts/lptrader.sh status     # 进程/节拍/数据库
+./scripts/lptrader.sh logs       # 最近日志
+./scripts/lptrader.sh stop       # 优雅停止
+
+# 运行（前台，排障用）
 npm run dev                  # 前台
 sudo systemctl start lptrader
 
