@@ -10,6 +10,10 @@ secrets/
 .env.*
 !.env.example
 
+# Runtime state written by scripts/lptrader.sh: the pid file and the rotated logs.
+/run/
+/logs/
+
 # Runtime state / local databases. Anchored to the repo root: an unanchored `data/` also matched
 # `src/data/**` and `tests/data/**`, which silently left the whole data layer untracked.
 /data/

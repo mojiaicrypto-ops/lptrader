@@ -34,6 +34,7 @@ import {
   decryptPrivateKey,
   readKeystoreFile,
 } from './security/keystore.ts';
+import { readPassphraseFile } from './security/passphraseFile.ts';
 import { WhitelistError } from './types/registry.ts';
 import { buildCadences, buildRuntime, type StrategyRuntime } from './runtime.ts';
 import { Scheduler } from './execution/scheduler.ts';
@@ -146,11 +147,24 @@ async function resolveSigner(
   const chainId = Number(env['KEYSTORE_CHAIN_ID'] ?? 56);
   const envelope = await readKeystoreFile(keystorePath);
 
-  process.stdout.write(
-    '\nA keystore is configured, so the signing key is needed.\n' +
-      'Enter the passphrase (hidden). Press Ctrl-C to run read-only instead.\n',
-  );
-  const passphrase = await promptSecret('Passphrase (hidden): ');
+  /*
+   * Unattended start: read the passphrase from a file when one is configured.
+   *
+   * A process manager has no terminal, so the interactive prompt below can never be answered — the process
+   * would block forever on a prompt nobody can see. The file's permissions are enforced by the reader, and
+   * a file that is group- or world-readable REFUSES to start rather than warning: a system that trades
+   * happily while its key is exposed discovers the exposure only after the funds are gone.
+   */
+  const fromFile = await readPassphraseFile(env['KEYSTORE_PASSPHRASE_FILE']);
+  if (fromFile !== null) {
+    process.stdout.write(`Passphrase read from ${String(env['KEYSTORE_PASSPHRASE_FILE'])}.\n`);
+  } else {
+    process.stdout.write(
+      '\nA keystore is configured, so the signing key is needed.\n' +
+        'Enter the passphrase (hidden). Press Ctrl-C to run read-only instead.\n',
+    );
+  }
+  const passphrase = fromFile ?? (await promptSecret('Passphrase (hidden): '));
   if (passphrase.length === 0) {
     process.stdout.write('No passphrase supplied — running read-only.\n');
     return null;

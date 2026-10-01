@@ -122,7 +122,11 @@ export type KeystoreErrorCode =
   | 'WEAK_KDF_PARAMS'
   | 'DECRYPT_FAILED'
   | 'ADDRESS_MISMATCH'
-  | 'WEAK_FILE_PERMISSIONS';
+  | 'WEAK_FILE_PERMISSIONS'
+  /** The passphrase file could not be read (missing, not a file, unreadable). */
+  | 'PASSPHRASE_FILE_UNREADABLE'
+  /** The passphrase file exists but is empty. */
+  | 'PASSPHRASE_FILE_EMPTY';
 
 /** Canonical AAD string for an address/chain pair. Deterministic and safe to store in cleartext. */
 export function buildAad(chainId: number, address: Address): string {
