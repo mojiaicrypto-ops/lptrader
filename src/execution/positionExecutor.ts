@@ -614,9 +614,21 @@ export class PositionExecutor {
 
   private adapterFailure(idempotencyKey: string, error: unknown): ExecutionOutcome {
     const message = error instanceof Error ? error.message : String(error);
-    // The record is deliberately left in its persisted state: a network error is `UNKNOWN` territory
-    // and must be resolved by a chain query, never by re-sending (§96/§98).
-    this.deps.txStore.markUnknown(idempotencyKey, message);
+
+    /*
+     * The WHOLE error is persisted, not just its message.
+     *
+     * viem puts the calldata, the estimated gas arguments and the decoded revert reason on the error
+     * object, and only `message` survives a template literal. A failed build was therefore recorded as
+     * "adapter failed: ..." with the one piece of evidence that identifies the cause — the encoded call —
+     * discarded. Diagnosing it required re-deriving the transaction by hand from a partially pasted
+     * trace, which is not a reasonable thing to ask of an operator at 3am.
+     *
+     * `JSON.stringify` with a plain replacer: the error carries bigints, which throw on serialisation, and
+     * a diagnostic that itself crashes is worse than none.
+     */
+    const detail = safeDetail(error);
+    this.deps.txStore.markUnknown(idempotencyKey, detail);
     return {
       ok: false,
       refusal: BUILD_REFUSALS.ADAPTER_FAILED,
@@ -671,6 +683,40 @@ export class PositionExecutor {
 function shortPool(poolId: string): string {
   const address = poolId.split(':')[2] ?? poolId;
   return `池子 …${address.slice(-10)}`;
+}
+
+/**
+ * Everything useful the error carries, as text that survives both JSON and a SQLite column.
+ *
+ * viem's error object holds `data` (the calldata), `metaMessages` (the estimate-gas arguments) and the
+ * decoded revert reason. Losing them makes a revert undiagnosable from the record alone.
+ */
+function safeDetail(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const carrier = error as Error & {
+    readonly data?: unknown;
+    readonly metaMessages?: readonly string[];
+    readonly cause?: unknown;
+  };
+  const parts: string[] = [error.message];
+  if (carrier.metaMessages !== undefined && carrier.metaMessages.length > 0) {
+    parts.push(carrier.metaMessages.join('\n'));
+  }
+  if (carrier.data !== undefined) parts.push(`data: ${stringifySafe(carrier.data)}`);
+  if (carrier.cause !== undefined) parts.push(`cause: ${stringifySafe(carrier.cause)}`);
+  return parts.join('\n\n');
+}
+
+/** JSON with bigint support and a depth cap, so a cyclic or huge error cannot break the record. */
+function stringifySafe(value: unknown, depth = 0): string {
+  if (depth > 6) return '[deep]';
+  try {
+    return JSON.stringify(value, (_key, val) =>
+      typeof val === 'bigint' ? `${val.toString()}n` : val,
+    ) ?? String(value);
+  } catch {
+    return String(value);
+  }
 }
 
 /**
