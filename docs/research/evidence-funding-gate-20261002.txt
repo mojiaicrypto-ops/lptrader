@@ -1,0 +1,23 @@
+# T8 funding gate — live negative proof (2026-10-02)
+
+## Setup (real money, deliberate)
+tx 0xfeb51196…a1ab2bf7  bought 1_338 wei QQQB (0.001 USDT, fee ~2e-9) — wallet deliberately NOT pure U.
+
+## The gate fires LIVE
+`scripts/live-build.ts --dex pancake` → prepare → funding:
+
+  Error: cannot fund — §5.3.1: the wallet is not pure U — a build must start empty of stock tokens,
+  and the optimal ratio was derived on that premise. Found: QQQB 1338. This is evidence of an
+  INCOMPLETE prior exit (or a burned-but-still-open position): resolve the residue to U first.
+  The build is refused, not self-balanced — selling the residue silently would reward a state the
+  exit rules exist to prevent.
+
+`Found: QQQB 1338` matches the on-chain balance EXACTLY (one multicall3 batch over the registry stock
+tokens + NPM NFT counts; no per-token reads, no "scan everything").
+
+## Recovery (also exercises §5.3.2 discipline)
+tx 0x7cf02c46…1a7cd51b  sold the FULL residue (no dust rule at cleanup; §5.3.2) → wallet pure U again:
+QQQB 0, USDT 19,546,855,194,796,228,631.
+
+## Cost of the proof
+Two swaps of 0.001 USDT notional: fee+slippage < $0.001, gas ~0.0002 BNB.

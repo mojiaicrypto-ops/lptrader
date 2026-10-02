@@ -78,7 +78,9 @@ export type FundingRefusalReason =
   /** The quote leg cannot be covered, and no stablecoin can be converted to cover it. */
   | 'NO_QUOTE_TOKEN_FUNDS'
   /** The pool's quote token is not a whitelisted token, so nothing can be planned against it. */
-  | 'NO_CONVERSION_SOURCE';
+  | 'NO_CONVERSION_SOURCE'
+  /** §5.3.1: the wallet holds stock tokens (or unburned NPM NFTs) that a prior exit left behind. */
+  | 'WALLET_NOT_PURE_U';
 
 export interface FundingRefusal {
   readonly ok: false;
@@ -99,6 +101,19 @@ export interface FundingDeps {
   readonly balanceOf: (token: Address) => Promise<bigint>;
   /** Token metadata for a whitelisted address, or `null` when it is not in the registry. */
   readonly tokenMeta: (address: Address) => TokenMeta | null;
+  /**
+   * §5.3.1 residue reader, injected by the composition root.
+   *
+   * Returns the RAW balances of whitelisted STOCK tokens (one multicall, not per-token reads) and
+   * the count of NPM NFTs still pointed at the wallet — an unburned position is a stronger violation
+   * than dust, because the system claims it is flat.
+   */
+  readonly residualHoldings: () => Promise<{
+    readonly stockBalances: readonly { readonly address: Address; readonly raw: bigint }[];
+    readonly npmNftCount: bigint;
+  }>;
+  /** The U the strategy settles into (§5.3.1/§10: USDT). Other stablecoins readable as residue leg ①. */
+  readonly uToken: Address;
 }
 
 /**
@@ -122,6 +137,40 @@ export class FundingPlanner {
     readonly stockTokenNeededRaw: bigint;
   }): Promise<FundingDecision> {
     const { pool } = input;
+
+    /*
+     * §5.3.1/§5.3.2, checked FIRST because it is the cheapest honest refusal and it protects the
+     * whole downstream plan: the optimal ratio was derived assuming the wallet was pure U. A stock
+     * residue does not get absorbed (there is no self-balancing branch for a state that should not
+     * exist) — the build refuses and names the incomplete exit.
+     *
+     * One injected batched read answers everything: whitelisted stock balances, non-U stablecoins,
+     * and NPM NFTs (an unburned position is a live contradiction of "the system is flat").
+     */
+    const residue = await this.deps.residualHoldings();
+    const residueLegs: string[] = [];
+    for (const stock of residue.stockBalances) {
+      if (stock.raw > 0n) {
+        const meta = this.deps.tokenMeta(stock.address);
+        residueLegs.push(`${meta?.symbol ?? 'unknown'} ${stock.raw.toString()}`);
+      }
+    }
+    if (residue.npmNftCount > 0n) {
+      residueLegs.push(`${residue.npmNftCount.toString()} unburned NPM position NFT(s)`);
+    }
+    if (residueLegs.length > 0) {
+      return {
+        ok: false,
+        reason: 'WALLET_NOT_PURE_U',
+        message:
+          '§5.3.1: the wallet is not pure U — a build must start empty of stock tokens, and the ' +
+          'optimal ratio was derived on that premise. Found: ' + residueLegs.join(', ') + '. ' +
+          'This is evidence of an INCOMPLETE prior exit (or a burned-but-still-open position): ' +
+          'resolve the residue to U first. The build is refused, not self-balanced — selling the ' +
+          'residue silently would reward a state the exit rules exist to prevent.',
+      };
+    }
+
     const quoteMeta = this.deps.tokenMeta(pool.token1);
     if (quoteMeta === null) {
       return {

@@ -137,7 +137,7 @@ function renderSummary(summary: StartupSummary): string {
  * a fallback to read-only: silently downgrading would leave the operator believing the bot can trade when
  * it cannot, and the next thing they would notice is a missed position.
  */
-async function resolveSigner(
+export async function resolveSigner(
   env: NodeJS.ProcessEnv,
 ): Promise<NonNullable<Parameters<typeof buildRuntime>[0]['signer']> | null> {
   const keystorePath = env['KEYSTORE_PATH'];

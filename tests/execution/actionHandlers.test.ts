@@ -26,7 +26,6 @@ function harness(options: {
   readonly position?: OpenPosition | null;
   readonly state?: (typeof BOT_STATES)[keyof typeof BOT_STATES];
   readonly exitResult?: ExecutionOutcome;
-  readonly rebuild?: { readonly allowed: boolean; readonly reason: string };
   readonly build?: { readonly ok: boolean; readonly message: string };
   readonly noBuildPath?: boolean;
 } = {}) {
@@ -38,9 +37,6 @@ function harness(options: {
     positionReader: {} as never,
     dex: {} as never,
     openPosition: vi.fn(async () => (options.position === undefined ? openPosition() : options.position)),
-    ...(options.rebuild === undefined
-      ? {}
-      : { approveRebuild: vi.fn(async () => options.rebuild!) }),
     ...(options.noBuildPath === true ? {} : { buildPosition }),
     notify: vi.fn(async () => {}),
   };
@@ -48,34 +44,18 @@ function harness(options: {
 }
 
 describe('/exit (manual close, architecture §6.2)', () => {
-  it('closes the position and moves to pool re-selection', async () => {
+  it('closes the position, returns pure U, and STOPS at IDLE (2026-10-02 decision: no automatic rebuild)', async () => {
     const { handlers, exitPosition, buildPosition } = harness();
     const outcome = await handlers.exit();
 
     expect(outcome.ok).toBe(true);
     expect(exitPosition).toHaveBeenCalledTimes(1);
-    // §6.2: a manual exit re-runs pool selection — "exit" means stop this position, not stop trading.
-    // This used to be a MESSAGE claiming a rebuild would happen; SELECT_POOL had no consumer, so the bot
-    // sat flat while the text promised otherwise. The build path is now actually invoked.
-    expect(buildPosition).toHaveBeenCalledTimes(1);
-    expect(outcome.nextState).toBe(BOT_STATES.IDLE);
-    expect(outcome.message).toMatch(/正在重新建仓/);
-  });
-
-  it('stays flat and says so when no build path is wired', async () => {
-    // A read-only process has no build path. Reporting SELECT_POOL would claim a selection that cannot run.
-    const { handlers, buildPosition } = harness({ noBuildPath: true });
-    const outcome = await handlers.exit();
+    // 2026-10-02 (推翻 D3.6 旧决策): a manual exit ends the round — the operator opens a new one
+    // with /start when THEY choose. No automatic re-selection.
     expect(buildPosition).not.toHaveBeenCalled();
     expect(outcome.nextState).toBe(BOT_STATES.IDLE);
-    expect(outcome.message).toMatch(/没有建仓能力/);
-  });
-
-  it('reports a failed rebuild instead of claiming success', async () => {
-    const { handlers } = harness({ build: { ok: false, message: 'NO_QUALIFIED_POOL: nothing passed' } });
-    const outcome = await handlers.exit();
-    expect(outcome.nextState).toBe(BOT_STATES.IDLE);
-    expect(outcome.message).toMatch(/未能重新建仓/);
+    expect(outcome.message).toMatch(/回到纯 U/);
+    expect(outcome.message).toMatch('/start');
   });
 
   it('refuses when there is nothing open', async () => {
@@ -108,32 +88,6 @@ describe('/exit (manual close, architecture §6.2)', () => {
     expect(outcome.message).toContain('mint reverted');
     // The state must NOT advance on failure: nothing was closed.
     expect(outcome.nextState).toBe(BOT_STATES.MONITOR);
-  });
-
-  it('stays flat instead of rebuilding when the cost policy refuses (§6.4)', async () => {
-    // An exit can return stock tokens; rebuilding into a DIFFERENT stock would need two swaps. The policy
-    // keeps that cost bounded, and a refusal must leave the bot flat rather than building anyway.
-    const { handlers, deps } = harness({
-      rebuild: { allowed: false, reason: 'switching stock would cost 1.2% > 0.75% cap' },
-    });
-    const outcome = await handlers.exit();
-
-    expect(outcome.ok).toBe(true);
-    expect(outcome.nextState).toBe(BOT_STATES.IDLE);
-    expect(outcome.message).toMatch(/暂不自动重建/);
-    expect(deps.notify).toHaveBeenCalledWith(
-      'warning',
-      expect.stringContaining('暂不重建'),
-      expect.stringContaining('0.75%'),
-    );
-  });
-
-  it('rebuilds when the cost policy allows it', async () => {
-    const { handlers, buildPosition } = harness({ rebuild: { allowed: true, reason: 'same stock leg' } });
-    const outcome = await handlers.exit();
-    expect(buildPosition).toHaveBeenCalledTimes(1);
-    // IDLE is where the bot actually is: the build is behind its approval gate and owns its own transition.
-    expect(outcome.nextState).toBe(BOT_STATES.IDLE);
   });
 });
 

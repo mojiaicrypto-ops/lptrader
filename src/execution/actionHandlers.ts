@@ -39,8 +39,6 @@ export interface ActionHandlerDeps {
    * question this module must not answer itself.
    */
   readonly openPosition: () => Promise<OpenPosition | null>;
-  /** §6.4: may a rebuild proceed after a manual exit? Injected so the cost policy is testable alone. */
-  readonly approveRebuild?: (previous: OpenPosition) => Promise<RebuildDecision>;
   /**
    * The ONE path that opens a position (§45). Injected rather than reimplemented so `/start`, the post-exit
    * rebuild and the risk-driven switch all take the same route — a second build path would be a second set
@@ -132,51 +130,16 @@ export class ActionHandlers {
       };
     }
 
-    // §6.2/§6.4: a manual exit re-runs pool selection. The policy only gates the AUTOMATIC rebuild — the
-    // exit itself already happened, because refusing to close a position the operator wants closed would
-    // be worse than whatever the round trip costs.
-    const rebuild = await this.deps.approveRebuild?.(position);
-    if (rebuild !== undefined && !rebuild.allowed) {
-      await this.notify(
-        'warning',
-        titleWithIcon('warning', '已撤池，但暂不重建'),
-        renderMessage({
-          severity: 'warning',
-          title: '已撤池，但暂不重建',
-          action: '现在空仓。想重新建仓时发 /start。',
-          note: rebuild.reason,
-        }),
-      );
-      return {
-        ok: true,
-        message: `已撤池。暂不自动重建，原因：${rebuild.reason}\n想重新建仓时发 /start。`,
-        nextState: BOT_STATES.IDLE,
-      };
-    }
-
-    // Actually rebuild. This used to return a message SAYING it would — and nothing consumed the
-    // SELECT_POOL state, so the bot sat flat while the text promised otherwise.
-    if (this.deps.buildPosition === undefined) {
-      return {
-        ok: true,
-        message: '已撤池。当前进程没有建仓能力（未配置签名钱包），想重新建仓时请发 /start。',
-        nextState: BOT_STATES.IDLE,
-      };
-    }
-
-    await this.notify(
-      'info',
-      titleWithIcon('info', '正在重新选池'),
-      renderMessage({ severity: 'info', title: '正在重新选池', action: '仓位已撤出，正在挑选替代池子…' }),
-    );
-    const built = await this.deps.buildPosition({ trigger: 'post-exit rebuild' });
+    /*
+     * 撤完停在 IDLE，等 /start（2026-10-02 用户决策，推翻 D3.6 的"自动重新选池"）：
+     * 手动路径保持"撤池撤 U → 我手动开新一轮"的最少步数。§5.3.2 已保证钱包回纯 U，
+     * 下一次 /start 的前提成立。
+     */
     return {
       ok: true,
-      message: built.ok
-        ? `已撤池，正在重新建仓。\n${built.message}`
-        : `已撤池，但未能重新建仓。\n${built.message}`,
-      // Same reasoning as `/start`: the position IS closed, so the bot is flat. A submitted build is still
-      // behind its approval gate and owns its own transition.
+      message:
+        '已撤池，两腿（含 fee）已全部换回 U，钱包回到纯 U（§5.3.2）。\n' +
+        '想开新一轮时发 /start。',
       nextState: BOT_STATES.IDLE,
     };
   }

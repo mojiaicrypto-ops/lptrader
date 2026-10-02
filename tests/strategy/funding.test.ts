@@ -66,12 +66,19 @@ function pool(quoteToken: Address): PoolSnapshot {
 
 const E18 = 10n ** 18n;
 
-function harness(balances: Readonly<Record<string, bigint>>) {
+function harness(
+  balances: Readonly<Record<string, bigint>>,
+  residue: {
+    readonly stockBalances?: readonly { readonly address: Address; readonly raw: bigint }[];
+    readonly npmNftCount?: bigint;
+  } = { stockBalances: [], npmNftCount: 0n },
+) {
   const balanceOf = vi.fn(async (token: Address) => balances[token.toLowerCase()] ?? balances[token] ?? 0n);
   const planner = new FundingPlanner({
     config: {
       whitelist: {
         registry: {
+          listStockTokens: () => [meta(QQQB, 'QQQB')],
           listStablecoins: () => [meta(USDT, 'USDT', 1), meta(USDC, 'USDC', 2)],
           getTokenByAddress: (_chain: number, address: Address) => {
             const lower = address.toLowerCase();
@@ -91,6 +98,11 @@ function harness(balances: Readonly<Record<string, bigint>>) {
       if (lower === QQQB.toLowerCase()) return meta(QQQB, 'QQQB');
       return null;
     },
+    residualHoldings: vi.fn(async () => ({
+      stockBalances: residue.stockBalances ?? [],
+      npmNftCount: residue.npmNftCount ?? 0n,
+    })),
+    uToken: USDT,
   });
   return { planner, balanceOf };
 }
@@ -299,5 +311,52 @@ describe('describeConversion: says what will happen and what happens if the buil
     expect(text).toMatch(/separate transaction/);
     // The reassurance is true and specific: the residue is a stablecoin at par, not a lost position.
     expect(text).toMatch(/simply holds USDC instead — the same money/);
+  });
+});
+
+describe('§5.3.1/: the build gate reads wallet purity BEFORE anything else', () => {
+  const poolSnapshot = pool(USDT);
+
+  it('refuses a build when a stock-token residue exists (an incomplete exit)', async () => {
+    const { planner } = harness(
+      { [USDT]: 10n ** 19n },
+      { stockBalances: [{ address: QQQB, raw: 3n * 10n ** 17n }], npmNftCount: 0n },
+    );
+    const decision = await planner.plan({
+      pool: poolSnapshot,
+      quoteTokenNeededRaw: 5n * 10n ** 18n,
+      stockTokenNeededRaw: 1n * 10n ** 15n,
+    });
+    expect(decision).toMatchObject({ ok: false, reason: 'WALLET_NOT_PURE_U' });
+    if (!decision.ok) {
+      // The message must teach, not just refuse: name the residue and WHY self-balancing is forbidden.
+      expect(decision.message).toContain('QQQB 300000000000000000');
+      expect(decision.message).toMatch(/INCOMPLETE prior exit|incomplete prior exit/);
+    }
+  });
+
+  it('refuses a build when the wallet still holds an unburned NPM position (system says flat, chain says otherwise)', async () => {
+    const { planner } = harness({ [USDT]: 10n ** 19n }, { npmNftCount: 1n });
+    const decision = await planner.plan({
+      pool: poolSnapshot,
+      quoteTokenNeededRaw: 5n * 10n ** 18n,
+      stockTokenNeededRaw: 1n * 10n ** 15n,
+    });
+    expect(decision).toMatchObject({ ok: false, reason: 'WALLET_NOT_PURE_U' });
+    if (!decision.ok) expect(decision.message).toContain('unburned NPM position NFT');
+  });
+
+  it('builds cleanly on a pure-U wallet (residue reader consulted every time)', async () => {
+    const { planner, balanceOf } = harness(
+      { [USDT]: 10n ** 19n },
+      { stockBalances: [{ address: QQQB, raw: 0n }], npmNftCount: 0n },
+    );
+    const decision = await planner.plan({
+      pool: poolSnapshot,
+      quoteTokenNeededRaw: 5n * 10n ** 18n,
+      stockTokenNeededRaw: 1n * 10n ** 15n,
+    });
+    expect(decision.ok).toBe(true);
+    expect(balanceOf).toHaveBeenCalled();
   });
 });
