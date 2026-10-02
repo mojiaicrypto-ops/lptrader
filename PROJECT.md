@@ -8,16 +8,26 @@
 
 ## 产品状态
 
-**当前：闭环未完成。** 系统能发现、筛选、监控、判定风险，但**不能建仓** —— 因此无法开始一笔交易。
+**当前：建仓 + 撤池(换U) + 估值/APR 均已通过真实资金验收（2026-10-02，T5/T6/T7）。** 2026-10-01 首次实盘暴露四类 dry-run 无法发现的缺陷（签名账户形态、缺少 `approve`、授权未等落块、建池用计划值），2026-10-02 修复并双 DEX 跑通完整实盘（PancakeSwap tokenId 7604786；Uniswap tokenId 2808516 —— 后者还暴露并修复了 Uniswap 侧完全没有 approve 逻辑的缺陷）。
+**追加（同日，T6/T7）**：撤池自动换 U（两腿+fee，NFT 烧毁）与 §4.2.1 估值+APR 均已实盘验收；钱包收官纯 U 19.546855。
 
 ```text
-发现池 ✅ ──→ 筛选 ✅ ──→ 建仓 ❌ ──→ 监控 ✅ ──→ 风控判定 ✅
+发现池 ✅ ──→ 筛选 ✅ ──→ 建仓 ✅ ──→ 监控 ⚠️ ──→ 撤池 ✅ ──→ 风控判定 ✅
                              │                        │
                              └── 查询 ❌               ↓
-                                              撤池 ✅（仅灾难级自动）
+                                              撤池 ✅（回纯 U 停 IDLE）
                                                     │
-                                              重新选池 ❌ ──→ 重新建仓 ❌
+                                              ↓ /start（人工，D3.8）
+                                              重新建仓 ✅
 ```
+
+| 环节 | 状态 | 缺口 |
+|---|---|---|
+| 建仓 | ✅ 双 DEX 实盘验收 | — |
+| 监控 | ✅ 估值+APR 口径实盘打通（§4.2.1，T7） | — |
+| 撤池 | ✅ 双 DEX 实盘验收（§5.3.2：两腿+fee 换 U + 烧 NFT） | — |
+
+**验收纪律**：`npm test` 与 dry-run **不代表产品可用**。4.10–4.13 四类缺陷均通过真实资金链路才暴露。**建仓的验收标准是一次完整的实盘链路**：授权 → 等落块 → swap → 等落块 → 建池 → 等落块，中途不得停。
 
 **详细逐条状态**：[`docs/product/feature-list.md`](docs/product/feature-list.md)
 **待开发项与顺序**：[`docs/plan/development-plan.md`](docs/plan/development-plan.md)
@@ -28,7 +38,7 @@
 |---|---|
 | 技术栈 | TypeScript / Node（viem + PancakeSwap V3 SDK） |
 | 链 | BNB Chain（chainId 56） |
-| DEX | PancakeSwap V3（§42 原子建仓）、Uniswap V3 |
+| DEX | PancakeSwap V3、Uniswap V3（建仓统一两笔，D3.7） |
 | 首期标的 | 8 个 bStock ×（USDC/USDT），池由 Scanner 自动发现 |
 | 存储 | SQLite |
 

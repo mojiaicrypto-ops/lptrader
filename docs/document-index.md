@@ -8,13 +8,13 @@
 | `AGENTS.md` | 规则 | L0 | 项目级执行参数、领域硬性约束、门禁分级 |
 | **`docs/product/lptrader-product.md`** | **产品** | L1 | **唯一权威产品定义**：是什么、闭环、结构、对象、规则、操作面、验收、不变量（附录 A） |
 | **`docs/product/feature-list.md`** | **功能** | L1 | **唯一功能状态清单**：逐条功能 + 真实状态 + 验证方式 |
-| **`docs/plan/development-plan.md`** | **计划** | L1 | 待开发项、顺序、dry-run 端到端验收定义 |
+| **`docs/plan/development-plan.md`** | **计划** | L1 | 待开发项、顺序、验收定义；**P0.5 为实盘验收**（T5–T8，dry-run 无法覆盖） |
 | `docs/product/stock-lp-auto-strategy-v1.md` | 参考 | L2 | 规则条款细节（§1–§112）；**参考，非权威** |
 | `docs/decisions/D1-scope-and-stack.md` | 决策 | L2 | 首期范围、技术栈、密钥方案、编号约定 |
 | `docs/decisions/D2-execution-and-approvals.md` | 决策 | L2 | 执行授权、确认闸门、Telegram 双向机器人 |
-| `docs/decisions/D3-architecture.md` | 决策 | L2 | 模块划分、排序策略、时序落库、换池触发分类、确认策略 |
+| `docs/decisions/D3-architecture.md` | 决策 | L2 | 模块划分、排序策略、时序落库、换池触发分类、**确认策略（D3.6：一次确认 = 一次决策）** |
 | `docs/research/onchain-facts-2026-09-29.md` | 调研 | L2 | 链上事实：bStocks、BEP-677、参考价源、池子实况、数据源 |
-| `docs/research/evidence-*.{txt,md}` | 证据 | L4 | 可复现运行证据：链上只读、池扫描、dry-run 建仓 |
+| `docs/research/evidence-*.{txt,md}` | 证据 | L4 | 可复现运行证据：链上只读、池扫描、dry-run 建仓、**实盘建仓（2026-10-02，双 DEX）** |
 | `docs/OPS.md` | 运维 | L1 | 新机器部署与运维 |
 | `docs/USAGE.md` | 手册 | L1 | 日常操作（含**命令可用性状态**） |
 | `docs/code-map.md` | 索引 | L1 | 代码入口、模块、测试位置 |

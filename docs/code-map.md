@@ -30,9 +30,20 @@
 | 文件 | 作用 |
 |---|---|
 | `src/strategy/buildOrchestrator.ts` | §45 建仓编排：精筛 → 计划 → 报价 → §40/§41/§3 门禁 → 交给执行器 |
-| `src/strategy/rebuildPolicy.ts` | §6.4 自动重建的成本上限（只约束自动重建，人工 `/exit` 永不拒绝） |
+| ~~`src/strategy/rebuildPolicy.ts`~~ | **已删除**（D3.8：无自动重建，§6.4 成本上限随之作废） |
 | `src/runtime/queryCache.ts` | 查询命令的数据来源：最近一次观测，不做现场读取 |
 | `src/runtime/queryHandlers.ts` | `/status` `/position` `/pools` `/nav` `/risk` |
+
+**实盘修正（2026-10-01 首次真金建仓暴露，均无法被 dry-run 发现）**：
+
+| 位置 | 修正 | 基线 |
+|---|---|---|
+| `src/dex/pancakeV3.ts` | `#ensureAllowance` —— 此前**完全没有 approve 逻辑**，首次实盘必然 `STF` | §93 |
+| `src/dex/pancakeV3.ts` | `#confirm` —— swap/建池前等待上一笔落块；不等确认时链上 allowance 仍为 0 | §98 |
+| `src/chain/adapter.ts` | 签名账户传 `account` 对象而非地址字符串（后者走 `eth_sendTransaction`，公共 RPC 一律拒绝） | §95 |
+| `src/config/builtins.ts` | 代币合约加入**写目标白名单**，否则 `approve` 被 §95 guard 拒绝 | §95 |
+
+**T5/T6/T8 已落地（2026-10-02，双 DEX 实盘验收 + T8 实盘负例）**：`runAtomicBuild`/`swapForDeficit` 已删除；建仓 = swap→确认→读余额→mint→确认；**撤池 = remove(含烧 NFT)→确认→逐腿换 U→确认→纯 U 校验**（`exitLegs` 在烧毁前缓存腿元数据；尘埃阈值 0.0001 单位）；`UniswapV3Adapter.ensureAllowance`/`getTokenBalance`/burn 支路为日新增；`FundingPlanner` 增加建仓前纯 U 校验（residualHoldings 注入：批量白名单余额 + NPM NFT 计数，拒绝即 `WALLET_NOT_PURE_U`）。证据：`docs/research/evidence-live-{build,exit}-20261002*.txt`。
 
 ## 已实现（实际文件 → 导出 → 基线章节）
 
@@ -135,8 +146,8 @@
 | 文件 | 内容 |
 |---|---|
 | `index.ts` | **共享且冻结**：`DEX_FEE_TIERS`、`tickSpacingFor(dex, fee)`、`feeTiersFor`、`DEX_PREFERENCE`、`createDexAdapter`、`isNoPool`；`DexAdapterFactoryOptions` 含必需 `chain` |
-| `pancakeV3.ts` | `PancakeV3Adapter`，**`supportsAtomicBuild = true`**；QuoterV2 报价；§42 原子 `swapAndAddCallParameters` 经 SmartRouter（outer `0x1f0464d1`） |
-| `uniswapV3.ts` | `UniswapV3Adapter`，**`supportsAtomicBuild = false`**；`swapForDeficit` 传入即抛（不静默降级）；NPM 无 blockhash deadline 重载 → 明确拒绝 |
+| `pancakeV3.ts` | `PancakeV3Adapter`；QuoterV2 报价；§42 原子路径已删除（D3.7）；`#ensureAllowance`/`#confirm`/receipt 解析 tokenId |
+| `uniswapV3.ts` | `UniswapV3Adapter`；`ensureAllowance`（2026-10-02 新增 —— 此前**完全没有 approve 逻辑**，实盘首笔 swap 即 `STF`）；NPM 无 blockhash deadline 重载 → 明确拒绝 |
 
 ### 数据层 `src/data/`（§14–§26/§54–§57/§83/§84）
 
@@ -162,7 +173,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| `positionExecutor.ts` | 建仓/退出/收手续费的编排；四道闸门（§95 guard → §44 写门 → §40/§41 报价门 → 确认门）；§42 原子 vs 两笔；§43 partial；§97 幂等 |
+| `positionExecutor.ts` | 建仓/退出/收手续费的编排；四道闸门（§95 guard → §44 写门 → §40/§41 报价门 → 确认门）；**建仓统一两笔**（§5.4/D3.7，2026-10-02 已落地：swap→确认→读余额→mint→确认）；§43 partial；§97 幂等 |
 | `portfolioMonitor.ts` | §46 组合监控：读钱包、定价、LP 估值、§65 回撤；`complete=false` 表示估值不完整（§96） |
 | `scheduler.ts` | §89 调度：按 cadence 触发、**不重叠**、失败上报且不杀循环 |
 | `approvalGate.ts` | `ApprovalGate`（`gate`/`request`/`awaitDecision`）、SQLite/内存 store、§77 审计 sink；`BUILD_POSITION`/`SWITCH_POOL` 唯一放行路径 |
