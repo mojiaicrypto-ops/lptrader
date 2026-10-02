@@ -625,7 +625,31 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
 
     const outcome = await executor.buildPosition(decision.request.input);
 
-    if (outcome.ok && outcome.positionTokenId !== undefined) {
+    /*
+     * A CONFIRMED mint without a tokenId is a DEFECT, not a footnote: without it no row can be written
+     * and every beat would report 空仓 for a live position while risk verdicts judge the wallet flat.
+     * Fail loudly; the message names the recovery path.
+     */
+    if (outcome.ok && outcome.positionTokenId === undefined) {
+      await notifier.send(
+        ALERT_SEVERITIES.CRITICAL,
+        titleWithIcon('critical', '建仓上链成功，但 tokenId 没有解析出来'),
+        renderMessage({
+          severity: 'critical',
+          title: '建仓上链成功，但 tokenId 没有解析出来',
+          action: '监控无法接管这个仓位。用 NPM receipt 里的 IncreaseLiquidity 事件定位 tokenId。',
+          note: `mint tx: ${outcome.addLiquidityTxHash ?? 'unknown'}`,
+        }),
+      );
+      return {
+        ok: false,
+        message:
+          `建仓交易已上链（mint ${outcome.addLiquidityTxHash ?? '未知'}），但 tokenId 解析失败，` +
+          '系统无法接管监管。请用回执定位 tokenId 后重试或手动处理。',
+      };
+    }
+
+    if (outcome.ok) {
       // Record the position AND its entry baseline.
       //
       // Nothing wrote a position row before this: `insertPosition` had zero production callers, so a
@@ -636,8 +660,9 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
       // reconstructed afterwards: the wallet's composition changes with every trade, so a value derived
       // later would be a different quantity wearing the same name.
       const equityNow = queryCache.nav?.value.totalNavUsd ?? navUsd;
+      const tokenId = outcome.positionTokenId as bigint;
       stateStore.insertPosition({
-        id: outcome.positionTokenId.toString(),
+        id: tokenId.toString(),
         chainId,
         dex: decision.request.pool.dex,
         poolAddress: decision.request.pool.poolAddress,
@@ -680,13 +705,20 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
         benchmarkValue: 0,
         feeILRatio: null,
       });
+
+      /*
+       * Refresh /position NOW, not at the next 5-minute beat: the last estimation beat ran BEFORE the
+       * build and left "空仓" in the cache, which at this moment contradicts the money that just moved.
+       * The fee figure stays 0 until the beat prices it properly (the beat owns fee precision).
+       */
+      const view = positionViewFrom({ stateStore, chain }, 0, null, null);
+      queryCache.setPosition(view, new Date().toISOString());
     }
 
     return {
       ok: outcome.ok,
       message: outcome.ok
-        ? `build submitted: ${outcome.reason}` +
-          (outcome.positionTokenId === undefined ? '' : ` (tokenId ${outcome.positionTokenId})`)
+        ? `build submitted: ${outcome.reason} (tokenId ${outcome.positionTokenId})`
         : `build failed: ${outcome.reason}`,
     };
   };
@@ -768,7 +800,9 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
  * an unobserved bot must not look the same to an operator.
  */
 function positionViewFrom(
-  runtime: StrategyRuntime,
+  runtime:
+    | StrategyRuntime
+    | { stateStore: StateStore; chain: BscChainAdapter },
   unclaimedFeesUsd: UsdAmount,
   lpValueUsd: UsdAmount | null,
   currentEquityUsd: UsdAmount | null,
