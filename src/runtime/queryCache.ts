@@ -22,7 +22,7 @@
  */
 import type { AlertSeverity } from '../types/notifier.ts';
 import type { BotState } from '../types/state.ts';
-import type { IsoTimestamp, PoolId, UsdAmount } from '../types/primitives.ts';
+import type { IsoTimestamp, PoolId, Ratio, UsdAmount } from '../types/primitives.ts';
 import type { PoolSnapshot } from '../types/market.ts';
 import type { ScreenOutcome } from '../data/poolScreener.ts';
 
@@ -101,6 +101,12 @@ export interface PositionView {
   readonly unclaimedFeesUsd: UsdAmount;
   readonly liquidityRaw: string;
   readonly openedAt: IsoTimestamp;
+  /** §4.2.1④: the position's own value, priced this round (`null` = unpriced, not 0). */
+  readonly lpValueUsd?: UsdAmount | null;
+  /** lpValueUsd + unclaimedFeesUsd — the equity the position alone holds. */
+  readonly positionEquityUsd?: UsdAmount | null;
+  /** Simple-annualized total return against the entry U. */
+  readonly apr?: { readonly ratio: Ratio; readonly indicative: boolean } | null;
 }
 
 export interface StatusView {

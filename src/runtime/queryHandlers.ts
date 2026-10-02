@@ -103,10 +103,27 @@ export function createQueryHandlers(deps: QueryHandlerDeps): QueryHandlers {
         { label: '交易所', value: p.dex },
         { label: '仓位编号', value: p.positionTokenId },
         { label: '区间位置', value: `${pct(p.rangeProgress)}（0% 在下限，100% 在上限）` },
+        {
+          label: '仓位价值',
+          value: p.lpValueUsd === undefined ? '未估值' : usd(p.lpValueUsd ?? 0),
+        },
         { label: '未领手续费', value: usd(p.unclaimedFeesUsd) },
+        ...(p.positionEquityUsd === undefined
+          ? []
+          : [{ label: '仓位权益合计', value: usd(p.positionEquityUsd ?? 0) }]),
+        ...(p.apr === undefined || p.apr === null
+          ? []
+          : [
+              {
+                label: 'APR（年化）',
+                value: `${signPct(p.apr.ratio)}${p.apr.indicative ? '＊' : ''}`,
+              },
+            ]),
         { label: '开仓时间', value: p.openedAt.slice(0, 16).replace('T', ' ') },
       ];
-      return `${renderRows(rows)}\n\n${measured(observed.at, nowMs())}`;
+      const aprNote =
+        p.apr === undefined || p.apr === null || !p.apr.indicative ? '' : '\n＊ 持有时间过短（<1 小时），APR 是外推值，仅作方向参考。';
+      return `${renderRows(rows)}${aprNote}\n\n${measured(observed.at, nowMs())}`;
     },
 
     pools: (args) => {
@@ -183,6 +200,20 @@ export function createQueryHandlers(deps: QueryHandlerDeps): QueryHandlers {
 
       const r = n.returns;
       if (r !== undefined) {
+        const pos = cache.position;
+        const apr = pos?.value.apr;
+        if (apr !== undefined && apr !== null) {
+          lines.push(
+            '',
+            renderRows([
+              {
+                label: 'APR（年化）',
+                value: `${signPct(apr.ratio)}${apr.indicative ? '＊' : ''}`,
+              },
+            ]),
+            ...(apr.indicative ? ['  ＊ 持有时间过短（<1 小时），APR 是外推值，仅作方向参考。'] : []),
+          );
+        }
         lines.push('', '收益：');
         if (r.returnRatio === null) {
           lines.push('  这笔仓位没有记录入场权益，无法计算收益率。');

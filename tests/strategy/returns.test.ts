@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { computeReturn, valueEntryComposition, isPoolContributionNegative } from '../../src/strategy/returns.ts';
+import {
+  computeAnnualizedApr,
+  computeReturn,
+  isPoolContributionNegative,
+  valueEntryComposition,
+} from '../../src/strategy/returns.ts';
 
 const AT = '2026-09-30T00:00:00.000Z';
 
@@ -174,5 +179,39 @@ describe('isPoolContributionNegative: only a real shortfall counts', () => {
     });
     // `null` means "we do not know", which must not be read as "negative".
     expect(isPoolContributionNegative(report)).toBe(false);
+  });
+});
+
+describe('§4.2.1 computeAnnualizedApr — the APR the monitoring view shows', () => {
+  const openedAt = '2026-10-02T00:00:00.000Z';
+
+  it('simple-annualizes the total return over the holding period', () => {
+    // 10 days held, +5% total → 0.05 / (10/365) = 1.825.
+    const apr = computeAnnualizedApr(0.05, openedAt, '2026-10-12T00:00:00.000Z');
+    expect(apr).not.toBeNull();
+    expect(apr!.indicative).toBe(false);
+    expect(apr!.aprRatio).toBeCloseTo(1.825, 3);
+  });
+
+  it('is negative when the position lost money', () => {
+    const apr = computeAnnualizedApr(-0.02, openedAt, '2027-10-02T00:00:00.000Z');
+    expect(apr!.aprRatio).toBeCloseTo(-0.02, 6);
+  });
+
+  it('marks sub-hour holdings as indicative and still returns a number', () => {
+    // 1 minute held: years tiny → the figure would be astronomically large but flagged.
+    const apr = computeAnnualizedApr(0.0001, openedAt, '2026-10-02T00:01:00.000Z');
+    expect(apr).not.toBeNull();
+    expect(apr!.indicative).toBe(true);
+    expect(apr!.aprRatio).toBeGreaterThan(50);
+  });
+
+  it('returns null for a zero or backwards holding window', () => {
+    expect(computeAnnualizedApr(0.05, openedAt, openedAt)).toBeNull();
+    expect(computeAnnualizedApr(0.05, '2026-10-02T01:00:00.000Z', openedAt)).toBeNull();
+  });
+
+  it('returns null without a recorded total return', () => {
+    expect(computeAnnualizedApr(null, openedAt, '2026-10-12T00:00:00.000Z')).toBeNull();
   });
 });

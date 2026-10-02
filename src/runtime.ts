@@ -43,6 +43,8 @@ import { TokenReader as TokenReaderImpl } from './chain/tokenReader.ts';
 import type { DexAdapter, PoolDataProvider, ReferencePriceProvider, TxGuardChecks } from './types/adapters.ts';
 import type { StrategyConfig } from './types/config.ts';
 import { DEX_IDS, type Address, type DexId, type IsoTimestamp, type PoolId, type UsdAmount } from './types/primitives.ts';
+import { BSC_ADDRESSES } from './config/builtins.ts';
+import { BSC_DEX_CONTRACTS } from './config/builtins.ts';
 import type { PoolSnapshot } from './types/market.ts';
 import { ALERT_SEVERITIES, type Notifier } from './types/notifier.ts';
 import type { DecryptedPrivateKey } from './security/keystore.ts';
@@ -66,7 +68,6 @@ import { PortfolioMonitor } from './execution/portfolioMonitor.ts';
 import { PoolScanner, foundPools } from './data/poolScanner.ts';
 import { PoolScreener } from './data/poolScreener.ts';
 import { BuildOrchestrator } from './strategy/buildOrchestrator.ts';
-import { decideRebuild } from './strategy/rebuildPolicy.ts';
 import {
   FundingPlanner,
   conversionGuard,
@@ -75,11 +76,13 @@ import {
 } from './strategy/funding.ts';
 import { evaluateSwapQuote, swapLimitsForPool } from './strategy/swapPlanner.ts';
 import {
+  computeAnnualizedApr,
   computeReturn,
   isPoolContributionNegative,
   stockPriceOf,
   valueEntryComposition,
 } from './strategy/returns.ts';
+import type { EntryBaseline } from './strategy/returns.ts';
 import { QueryCache, poolViewFrom, type PositionView, type ReturnView, type StatusView } from './runtime/queryCache.ts';
 import { createQueryHandlers } from './runtime/queryHandlers.ts';
 import {
@@ -164,7 +167,7 @@ export interface StrategyRuntime {
   /**
    * Prepare and (subject to approval) execute a build from the latest scan.
    *
-   * Shared by `/start`, the post-exit rebuild and the risk-driven switch, so there is exactly ONE path
+   * Shared by `/start` (the only build trigger after D3.8 — /exit and risk exits stop at IDLE), so there is exactly ONE path
    * that can open a position. A second path is a second set of bugs.
    */
   readonly openPositionFromLatestScan: (options?: {
@@ -382,23 +385,6 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
       // Late-bound because the handlers are constructed before the runtime object exists, and the build
       // path lives on it. Resolving it here keeps ONE build path rather than a second implementation.
       buildPosition: async (options) => openPositionFromLatestScan(options ?? {}),
-      // §6.4: gates the AUTOMATIC rebuild only. The exit itself is never refused — see the policy module.
-      approveRebuild: async (previous) => {
-        const proceeds = queryCache.nav?.value.lpValueUsd ?? 0;
-        const decision = decideRebuild(
-          {
-            proceedsUsd: proceeds,
-            // §30: the round trip is two swaps plus gas plus the IL the exit just realized. Estimated from
-            // the position value because the exact figures are only knowable after both legs settle.
-            roundTripCostUsd: proceeds * (config.swap.maxSlippage * 2 + config.swap.maxPriceImpact * 2),
-            now: new Date().toISOString(),
-            riskDriven: false,
-          },
-          config.switch,
-        );
-        void previous;
-        return decision;
-      },
       openPosition: async () => {
         const record = stateStore.openPosition(chainId);
         if (record === null) return null;
@@ -460,6 +446,34 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
         config,
         balanceOf: (token) => chain.getTokenBalanceOf(token, walletAddress),
         tokenMeta: (address) => config.whitelist.registry.getTokenByAddress(chainId, address),
+        // §5.3.1: ONE batched read — whitelisted stock balances via multicall3, plus NPM NFT counts
+        // on both whitelisted venues (an unburned NFT is a live contradiction of "the system is flat").
+        residualHoldings: async () => {
+          const stockTokens = config.whitelist.registry
+            .listStockTokens({})
+            .map((meta) => meta.address as Address);
+          const stockBalances = await chain.getTokenBalances(stockTokens, walletAddress);
+          const npmOf = async (dex: DexId): Promise<bigint> => {
+            const npm = BSC_DEX_CONTRACTS[dex]?.positionManager;
+            if (npm === undefined) return 0n;
+            const count = await chain.readContract<bigint>({
+              address: npm,
+              abi: [
+                { type: 'function', name: 'balanceOf', stateMutability: 'view',
+                  inputs: [{ name: 'owner', type: 'address' }],
+                  outputs: [{ type: 'uint256' }] },
+              ],
+              functionName: 'balanceOf',
+              args: [walletAddress],
+            });
+            return count.value;
+          };
+          return {
+            stockBalances: stockBalances.map((b) => ({ address: b.address, raw: b.raw })),
+            npmNftCount: (await npmOf(DEX_IDS.PANCAKESWAP_V3)) + (await npmOf(DEX_IDS.UNISWAP_V3)),
+          };
+        },
+        uToken: BSC_ADDRESSES.USDT as Address,
       });
 
   /**
@@ -536,7 +550,7 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
   /**
    * §45: the ONE path that opens a position.
    *
-   * Every trigger — `/start`, the post-exit rebuild, the risk-driven switch — calls this, so there is a
+   * Every trigger — only `/start` since D3.8 (/exit and risk exits stop at IDLE) — calls this, so there is a
    * single place where a build can begin. The earlier codebase had none, and the components were
    * individually complete: screening, planning, quoting and executing all worked and nothing joined them.
    *
@@ -756,6 +770,8 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
 function positionViewFrom(
   runtime: StrategyRuntime,
   unclaimedFeesUsd: UsdAmount,
+  lpValueUsd: UsdAmount | null,
+  currentEquityUsd: UsdAmount | null,
 ): PositionView | null {
   const record = runtime.stateStore.openPosition(runtime.chain.chainId);
   if (record === null) return null;
@@ -763,6 +779,21 @@ function positionViewFrom(
   const upper = record.upperPrice;
   // §49: (current - lower) / (upper - lower) — an indicator only, never clamped and never a trade input.
   const current = record.entryPrice;
+  const baseline: EntryBaseline = {
+    entryEquityUsd: record.entryEquityUsd,
+    entryStockPriceUsd: record.entryPrice,
+    openedAt: record.openedAt,
+  };
+  // §4.2.1: the position's own equity percentage, annualized against the entry U. The RETURN figure
+  // itself comes from the full snapshot (/nav); this one is position-scoped, evaluated only when the
+  // caller was able to value the legs this round.
+  let apr: { ratio: number; indicative: boolean } | null = null;
+  if (currentEquityUsd !== null && baseline.entryEquityUsd !== null) {
+    const ratio =
+      baseline.entryEquityUsd > 0 ? (currentEquityUsd - baseline.entryEquityUsd) / baseline.entryEquityUsd : null;
+    const annual = computeAnnualizedApr(ratio, baseline.openedAt, new Date().toISOString());
+    apr = annual === null ? null : { ratio: annual.aprRatio, indicative: annual.indicative };
+  }
   return {
     poolId: record.poolId,
     positionTokenId: record.id,
@@ -771,6 +802,9 @@ function positionViewFrom(
     unclaimedFeesUsd,
     liquidityRaw: record.liquidity.toString(),
     openedAt: record.openedAt,
+    ...(lpValueUsd === null ? {} : { lpValueUsd }),
+    ...(currentEquityUsd === null ? {} : { positionEquityUsd: currentEquityUsd }),
+    ...(apr === null ? {} : { apr }),
   };
 }
 
@@ -1304,7 +1338,18 @@ export function buildCadences(runtime: StrategyRuntime): readonly SchedulerCaden
           at,
         );
         runtime.queryCache.setStatus(statusView(runtime, at), at);
-        runtime.queryCache.setPosition(positionViewFrom(runtime, round.snapshot?.unclaimedFeeValue ?? 0), at);
+        runtime.queryCache.setPosition(
+          positionViewFrom(
+            runtime,
+            round.snapshot?.unclaimedFeeValue ?? 0,
+            round.snapshot?.lpPositionValue ?? null,
+            // §4.2.1: the position's OWN equity = its legs + its fees (not the whole NAV).
+            round.snapshot === undefined
+              ? null
+              : (round.snapshot.lpPositionValue + round.snapshot.unclaimedFeeValue) as UsdAmount,
+          ),
+          at,
+        );
 
         await reportRiskRound(runtime, round, at);
       },
@@ -1413,33 +1458,20 @@ async function reportRiskRound(
       return;
     }
 
-    // §32/§69: a risk-driven exit goes straight back to pool selection. This is the closure the product
-    // needs — without it the bot closes on a risk event and then sits flat forever, which is the same
-    // capital being idle but now also unmanaged.
-    //
-    // Risk events are EXEMPT from the cooldown and the yield-improvement gates (§32 lists them explicitly),
-    // because those rules exist to stop the bot churning in search of yield. A risk exit is not churn.
-    if (runtime.buildOrchestrator !== null) {
-      await runtime.notifier.send(
-        ALERT_SEVERITIES.WARNING,
-        titleWithIcon('warning', '正在重新选池'),
-        renderMessage({
-          severity: 'warning',
-          title: '正在重新选池',
-          action: '撤回的资金正在重新挑选池子。有合格的会推给你确认。',
-        }),
-      );
-      const rebuilt = await runtime.openPositionFromLatestScan({ trigger: `risk switch (${plan.action})` });
-      await runtime.notifier.send(
-        rebuilt.ok ? ALERT_SEVERITIES.INFO : ALERT_SEVERITIES.WARNING,
-        titleWithIcon(rebuilt.ok ? 'info' : 'warning', rebuilt.ok ? '已找到替代池子' : '没有找到替代池子'),
-        renderMessage({
-          severity: rebuilt.ok ? 'info' : 'warning',
-          title: rebuilt.ok ? '已找到替代池子' : '没有找到替代池子',
-          note: rebuilt.message,
-        }),
-      );
-    }
+    /*
+     * 撤完停在 IDLE，等 /start（2026-10-02 用户决策：风控自动撤池也不自动重建）。
+     * 无人值守时的取舍：宁可资金闲置到 operator 醒来，也不让机器人在重大风险事件
+     * （往往伴随市场剧烈波动）里自行再进场。§32 的"风险事件豁免收益门槛"随之失效。
+     */
+    await runtime.notifier.send(
+      ALERT_SEVERITIES.INFO,
+      titleWithIcon('info', '已撤池，回到纯 U'),
+      renderMessage({
+        severity: 'info',
+        title: '已撤池，回到纯 U',
+        action: '两腿（含 fee）已换回 U，机器人停在 IDLE。想重新建仓时发 /start。',
+      }),
+    );
   }
   void at;
 }

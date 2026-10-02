@@ -1,0 +1,22 @@
+# Live valuation read (§4.2.1) — position 7605078, Pancake QQQB/USDT 0.01%
+# cycle: build (build tx 0xecb8394b… swap / 0xb31dcdab… mint; tokenId 7605078)
+#      → value read → exit → pure U (final USDT 19.546855, QQQB 0, NPM NFT 0)
+
+## The §4.2.1 table as printed live
+```text
+tokenId                  7605078
+legs raw                 8,775,872,881,431,474 QQQB / 7,142,849,395,548,977,434 USDT
+fees raw (collect-read)  167,443,183 QQQB / 0 USDT      ← static-call collect, the CURRENT unclaimed total
+leg0 value (U)           6.5471                          ← stock leg at the current pool price (746.0 U/QQQB)
+leg1 value (U)           7.1428
+fees value (U)           0.0000 (~0.000125 U, folds to 0.0000 at 4dp)
+position equity (U)      13.6899
+return vs entry U        +0.0028 (+0.021%)               ← entry = the budget 13.6871 U, §4.2.1 numerator/denominator
+APR (simple, live)       1088.06% (10 min holding)      ← indicative extrapolation, NOT a trade input
+```
+
+## What this proves (T7 acceptance)
+1. ①② leg + fee 折 U 全链可读（fee 用 collect 的 eth_call 读数，高于记账值口径）。
+2. ③ APR 年化数学落地并实盘打印。分母 = 建仓前 U ✓（入场即纯 U，由 §5.3.1 保证）。
+3. ④ /position 与 /nav 渲染行落地（Telegram 渲染经单测覆盖 + live-build 无通道）。
+4. 闭环自洽：13.6871 建入 → 13.6899 账面（+0.021% 费期内溢价）→ 撤池后 19.5468/19.548 尾差 ≈ 双向 swap 手续费。

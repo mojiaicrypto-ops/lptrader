@@ -190,6 +190,43 @@ export function isPoolContributionNegative(report: ReturnReport, thresholdUsd = 
   return report.poolContributionUsd !== null && report.poolContributionUsd < -Math.abs(thresholdUsd);
 }
 
+/** Holding periods shorter than this have no honest annualization — the number would explode. */
+export const APR_MIN_HOLDING_MS = 3_600_000;
+
+export interface AnnualizedApr {
+  /** Total return simple-annualized: `returnRatio / years`. Negative allowed. */
+  readonly aprRatio: Ratio;
+  /**
+   * True when the figure is extrapolated from a very short holding period.
+   *
+   * An APR over minutes says "what this pace WOULD compound to", not what was earned — it is shown
+   * indicative only, and no trade judgment may consume it.
+   */
+  readonly indicative: boolean;
+}
+
+/**
+ * §4.2.1 APR: the total return, annualized.
+ *
+ * SIMPLE annualization (linear in time), not compounded: the denominator is 建仓前的 U, the numerator
+ * the equity change — the pool earns fees roughly linearly in time, and compounding a sub-day figure
+ * is the kind of cosmetics that overstates nothing except optimism.
+ */
+export function computeAnnualizedApr(
+  returnRatio: Ratio | null,
+  openedAt: IsoTimestamp,
+  now: IsoTimestamp,
+): AnnualizedApr | null {
+  if (returnRatio === null) return null;
+  const heldMs = Date.parse(now) - Date.parse(openedAt);
+  if (heldMs <= 0) return null;
+  const years = heldMs / (86_400_000 * 365);
+  if (heldMs < APR_MIN_HOLDING_MS) {
+    return { aprRatio: returnRatio / Math.max(years, 1 / (86_400_000 * 365)), indicative: true };
+  }
+  return { aprRatio: returnRatio / years, indicative: false };
+}
+
 /** The current stock price for a pool, or `null` when it cannot be read (never a default). */
 export function stockPriceOf(pool: PoolSnapshot | undefined): UsdAmount | null {
   if (pool === undefined) return null;

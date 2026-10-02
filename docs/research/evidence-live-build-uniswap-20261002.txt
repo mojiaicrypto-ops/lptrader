@@ -1,0 +1,40 @@
+# Live full-flow build — Uniswap V3 (2026-10-02)
+
+## Command
+LIVE_PRIVATE_KEY=<test wallet key> node --experimental-strip-types scripts/live-build.ts \
+  --config-dir config-test --dex uniswap --pool 0x36c0fc3159eb8662a2e1b84a4df518d916bce0e1
+
+## DOCUMENTED DEVIATION: a test-scoped config dir was used.
+No Uniswap pool passes production §16 admission (the only candidate, AAPLB/USDT 0.05%,
+has TVL ≈ $108k vs min_tvl_usd $500k). To exercise the adapter end to end, config-test/
+lowered ONLY the §16 admission figures (min_tvl 500k→50k, volume 250k→20k). Product config
+was untouched; config-test/ was deleted after the run. The §40/§41 EXECUTION gates were NOT
+widened — the trade passed them on their own merits.
+
+## Failure found and fixed during this run (the run's value)
+First attempt reverted `STF` at the swap: UniswapV3Adapter had NO approve logic at all —
+the allowance machinery existed only in PancakeV3Adapter. Fixed: ensureAllowance added to
+src/dex/uniswapV3.ts (exact approval; BSC-USDT zero-then-max; each approve confirmed before
+the next tx), wired into executeSwap (swapRouter) and addLiquidity (positionManager, both legs).
+
+## Chain evidence (authoritative: hashes resolvable on bscscan)
+- idempotencyKey : build:56:uniswap-v3:0x36c0fc3159eb8662a2e1b84a4df518d916bce0e1:2026-10-02T04:59:46.095Z
+- capitalUsd     : 4.1030 (= navUsd 5.8614 × maxLpRatio 0.70)
+- swap tx        : 0x4098234385826184076c48366475dbe5c09ff3072f02aba59eca90a2eadbdfc5  (confirmed)
+- mint tx        : 0x7e8ceda8b3d12880f7f1e9de5046ebbce8b8d8a52de46da61c80a6b0a94f4e98  (confirmed)
+- tokenId        : 2808516
+- post-verify    : owner 0xb8147e5A…8719, liquidity 1.5057e18, pool matches, tokenId parsed from receipt
+- final USDT     : 1.759873  (= 5.8614 − 4.1030 budget)
+- gas            : BNB 0.00977 after the run
+
+## What this proves (T5 acceptance, second venue)
+1. The two-step build is DEX-INDEPENDENT: same executor path, per-venue adapters differ only
+   in encoding. fails-on-single-venue is eliminated as an acceptance argument.
+2. approvals: swapRouter approve landed before the swap; positionManager approves (both legs)
+   landed before the mint; each confirmed.
+
+## config-test contents (deleted after the run; preserved here verbatim-diff)
+config-test/ = copy of config/{strategy,stokens...}.yaml with ONLY:
+  pool.min_tvl_usd:            500000 → 50000
+  pool.min_avg_daily_volume_7d: 250000 →  20000
+Everything else identical to production config.

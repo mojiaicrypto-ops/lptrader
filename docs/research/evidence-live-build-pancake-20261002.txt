@@ -1,0 +1,31 @@
+# Live full-flow build — PancakeSwap V3 (2026-10-02)
+
+## Command
+LIVE_PRIVATE_KEY=<test wallet key> node --experimental-strip-types scripts/live-build.ts \
+  --dex pancake --pool 0xe531fcb1f5a195de7608b9f4f9518544c2cdb693
+
+NOTE: the originally-targeted AAPLB/USDT 0.25% pool (0xe9b9998b…) was REJECTED by §16
+(TVL $492,554 < min_tvl_usd $500,000 — the filter behaved correctly). The run therefore
+used the only pool that passes production admission: QQQB/USDT 0.01% (TVL $1.07M),
+which is also the pool listed in config/strategy.yaml pool_overrides.
+
+## Chain evidence (authoritative: hashes resolvable on bscscan)
+- idempotencyKey : build:56:pancakeswap-v3:0xe531fcb1f5a195de7608b9f4f9518544c2cdb693:2026-10-02T04:43:49.376Z
+- capitalUsd     : 13.6871 (= navUsd 19.5531 × maxLpRatio 0.70)
+- plan.amount0   : 8,776,069,563,898,637 (QQQB)
+- plan.amount1   : 7,151,205,662,001,897,145 (USDT)
+- swap.amountIn  : 6,548,621,662,137,860,321 (USDT)   [plan decides "how much to buy", §5.3.3]
+- swap gate      : impact 0.0100% ≤ 0.8%, slippage 0.3% ≤ 0.8% (per-pool override), TTL ok
+- swap tx        : 0x5188988ac592933e80eb9ba72cdfb136ca5ab6247b7660128aab9c4c8081b7da  (confirmed)
+- mint tx        : 0x2dc35be8f2f5630f87abdf54a4b34fa99a2edfe442ba45ded8a798bb4ca4385f  (confirmed)
+- tokenId        : 7604786
+- post-verify    : owner 0xb8147e5A…8719, liquidity 3.3506e18, pool matches, IncreaseLiquidity parsed
+- final USDT     : 5.861389  (= 19.5531 − 13.6871 budget; the 30% reserve stayed out of the position)
+- gas            : BNB 0.00985 → 0.00977 after approve+swap+mint
+
+## What this proves (T5 acceptance)
+1. swap → WAIT FOR CONFIRMATION → re-read wallet → mint with ACTUAL balances → confirmed.
+   No `Price slippage check` anywhere on the chain (the atomic-path failure mode, 2026-10-01 ×3).
+2. The approval gate ran and recorded the operator-session identity (notifier contract: the
+   notifier RETURNS the decision; the gate persists it).
+3. BuildOrchestrator quota/quote/gate chain executed against LIVE data end to end.
