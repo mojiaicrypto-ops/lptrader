@@ -380,6 +380,27 @@ describe('PortfolioMonitor valuation', () => {
     expect(withoutFees.snapshot.unclaimedFeeValue).toBe(0);
   });
 
+  it('prices the fee legs from the COLLECTABLE read, not the stale ledger value (§4.2.1)', async () => {
+    // tokensOwed only updates on decrease/collect; a live position accrues fees continuously. The
+    // monitor must show the CURRENT collectable (owed + accrued) or the fee line reads 0 while fees
+    // actually accumulate — the gap the real-asset audit caught (2026-10-02).
+    const { monitor } = monitorWith({
+      balances: [amountOf(USDC, fromFloat(1_000, 18), 10n ** 18n)],
+    });
+    const result = await monitor.monitor(
+      inputs({
+        pool: poolSnapshot(),
+        position: position({
+          tokensOwed0Raw: 0n,
+          tokensOwed1Raw: 0n,
+          collectable0Raw: fromFloat(2.5, 18),
+          collectable1Raw: fromFloat(30, 18),
+        } as Partial<LpPositionRead>),
+      }),
+    );
+    expect(result.snapshot.unclaimedFeeValue).toBeCloseTo(2.5 * 738.84 + 30, 2);
+  });
+
   it('distinguishes "cannot value the LP" from "flat" (§96)', async () => {
     // A position with liquidity but no pool price must not read as an empty position.
     const { monitor } = monitorWith();

@@ -29,6 +29,14 @@ export interface LpPositionRead extends LpPositionView {
   readonly dex: DexId;
   readonly positionManager: Address;
   /**
+   * The fee that is collectable RIGHT NOW for each leg — a static-call `collect` answer, which is
+   * `tokensOwed` PLUS the fees accrued since the last position-touch (§4.2.1: the fee a monitor
+   * shows must not be a stale ledger value). Absent when the caller did not make the extra read;
+   * consumers fall back to `tokensOwed`.
+   */
+  readonly collectable0Raw?: bigint;
+  readonly collectable1Raw?: bigint;
+  /**
    * The owner as reported by `ownerOf`. `positions().operator` is only the approved operator and is
    * `0x0` for a self-custodied position, so ownership must come from `ownerOf`.
    */

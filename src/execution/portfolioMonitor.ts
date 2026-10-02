@@ -315,13 +315,13 @@ export class PortfolioMonitor {
     readonly id: string;
     readonly poolAddress: Address;
     readonly poolId: PoolId;
-  }): Promise<{ readonly position: LpPositionRead | null; readonly sqrtPriceX96: bigint; readonly tick: number } | null> {
+  }): Promise<{ position: LpPositionRead | null; sqrtPriceX96: bigint; tick: number } | null> {
     const read = await this.options.positionReader.getPositionView({
       dex: record.poolId.split(':')[1] as DexId,
       tokenId: BigInt(record.id),
       poolAddress: record.poolAddress,
     });
-    const [slot0] = await Promise.all([
+    const [slot0, collectable] = await Promise.all([
       this.options.chain.readContract<readonly [bigint, number]>({
         address: record.poolAddress,
         abi: [
@@ -331,9 +331,39 @@ export class PortfolioMonitor {
         functionName: 'slot0',
         args: [],
       }),
+      // §4.2.1: the CURRENT collectable fee (owed + accrued since the last touch), read straight
+      // from the manager. A static call changes nothing; the value is what /position 显示为
+      // "未领手续费"，所以它不能是一个会在费期内读 0 的记账值。
+      this.options.chain.readContract<readonly [bigint, bigint]>({
+        address: this.options.positionReader.positionManagerFor(record.poolId.split(':')[1] as DexId),
+        abi: [
+          { type: 'function', name: 'collect', stateMutability: 'payable',
+            inputs: [
+              { name: 'recipient', type: 'address' },
+              { name: 'tokenId', type: 'uint256' },
+              { name: 'amount0Max', type: 'uint128' },
+              { name: 'amount1Max', type: 'uint128' },
+            ],
+            outputs: [{ name: 'amount0', type: 'uint256' }, { name: 'amount1', type: 'uint256' }] },
+        ],
+        functionName: 'collect',
+        args: [
+          {
+            recipient: PortfolioMonitor.FEE_READ_RECIPIENT,
+            tokenId: BigInt(record.id),
+            amount0Max: 2n ** 128n - 1n,
+            amount1Max: 2n ** 128n - 1n,
+          },
+        ],
+      }).catch(() => null),
     ]);
+    if (read === null) return null;
     return {
-      position: read === null ? null : { ...read, poolId: record.poolId },
+      position: {
+        ...read,
+        poolId: record.poolId,
+        ...(collectable === null ? {} : { collectable0Raw: collectable.value[0], collectable1Raw: collectable.value[1] }),
+      },
       sqrtPriceX96: slot0.value[0],
       tick: slot0.value[1],
     };
@@ -416,8 +446,10 @@ export class PortfolioMonitor {
       lpLeg0 = amountOf(meta0, amount0, multipliers);
       lpLeg1 = amountOf(meta1, amount1, multipliers);
       // §108 "unclaimed fees": tokensOwed0/1 are RA amounts the manager already owes.
-      feeLeg0 = amountOf(meta0, pos.tokensOwed0Raw, multipliers);
-      feeLeg1 = amountOf(meta1, pos.tokensOwed1Raw, multipliers);
+      // collectable ⊇ tokensOwed (it adds the fees accrued since the last touch). Falling back to the
+      // ledger value keeps the read working on endpoints that refuse static payable calls.
+      feeLeg0 = amountOf(meta0, pos.collectable0Raw ?? pos.tokensOwed0Raw, multipliers);
+      feeLeg1 = amountOf(meta1, pos.collectable1Raw ?? pos.tokensOwed1Raw, multipliers);
 
       const price0 = prices.get(meta0.id);
       const price1 = prices.get(meta1.id);
@@ -512,6 +544,10 @@ export class PortfolioMonitor {
   private tokenMeta(address: Address): TokenMeta | null {
     return this.options.whitelist.registry.getTokenByAddress(this.chainId, address);
   }
+
+  /** `collect` needs SOME recipient; the read's return values never move anything (static call). */
+  private static readonly FEE_READ_RECIPIENT =
+    '0x0000000000000000000000000000000000000001' as const;
 
   /** A pool leg must be whitelisted; §8 identity is the address, so a miss is a real inconsistency. */
   private requireToken(address: Address): TokenMeta {
