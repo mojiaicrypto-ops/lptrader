@@ -1,0 +1,24 @@
+# Live full-flow exit — both venues back to pure U (2026-10-02)
+
+## PancakeSwap V3 — tokenId 7604786 (burned)
+- remove tx      : (confirmed; decrease+collect+burn in ONE NPM multicall — liquidity 3.3506e18 removed)
+- conversion     : aborted on run 1 (legs cached after the burn — BUG, fixed in the same session:
+                   the legs are now read from the position BEFORE the burn and cached);
+                   QQQB residual 0.0088 completed via the recovery path:
+                   tx 0x50dd5d56dfa07b9701c1e1eddb164e819f544dcf2e39b87ef9beb9a085bf2c50
+                   (8803584966798467 QQQB → 6.56 USDT, impact 0.010%, CONFIRMED)
+- dust rule fix  : resid threshold tightened 0.01 → 0.0001 of a unit (a 0.0088 QQQB residual ≈ $6.5
+                   is NOT dust; the 0.01-unit rule would have abandoned real money)
+- burn           : decreaseLiquidity burned the NFT in the same multicall (NPM balanceOf → 0)
+
+## Uniswap V3 — tokenId 2808516 (burned)
+- remove tx      : decrease + collect + increase→ NO — decrease + collect + burn; converted live:
+                   5,880,533,816,468,550 AAPLB → 1.949 USDT (impact 0.050%, CONFIRMED)
+- reason         : 'liquidity removed and proceeds converted to U (§5.3.2)' — first-run green path
+- shell cleanup  : a zero-liquidity shell NFT previously refused burn; now collect+burn multicall;
+                   Uniswap NPM balanceOf → 0
+
+## Final wallet state (authoritative on-chain)
+- AAPLB 0 · QQQB 0 · Uniswap NPM NFT 0 · Pancake NPM NFT 0
+- USDT 19,548,064,824,104,388,227 (19.548065) ← the whole round trip returned to PURE U (§5.3.1)
+- journey: 19.5531 (start) → 13.6871 built → 19.5480 exited (Gas ≈ 0.0004 BNB + swap fees ≈ $0.03)
