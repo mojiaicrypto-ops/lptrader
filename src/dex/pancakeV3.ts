@@ -33,29 +33,17 @@
  * whitelist registry (`TokenRegistry`), never assumed — BSC USDC/USDT are 18 decimals, not 6
  * (research §1).
  */
-import { CurrencyAmount, Percent, Token, TradeType } from '@pancakeswap/sdk';
 import {
-  NoTickDataProvider,
-  Pool as PancakePool,
-  Position as PancakePosition,
   nonfungiblePositionManagerABI,
   quoterV2ABI,
   swapRouterABI,
 } from '@pancakeswap/v3-sdk';
-import {
-  PoolType,
-  RouteType,
-  SMART_ROUTER_ADDRESSES,
-  SwapRouter,
-  type Route,
-  type SmartRouterTrade,
-  type V3Pool,
-} from '@pancakeswap/smart-router';
+
 import { encodeFunctionData, getAddress } from 'viem';
 import type { BscChainAdapter } from '../chain/adapter.ts';
-import { CLMM_FACTORY_ABI, CLMM_POOL_ABI, POSITION_MANAGER_ABI } from '../chain/abis.ts';
+import { CLMM_FACTORY_ABI, CLMM_POOL_ABI, ERC20_ABI, POSITION_MANAGER_ABI } from '../chain/abis.ts';
 import { CHAIN_ERROR_CODES, ChainError, TxGuardError } from '../chain/errors.ts';
-import { PoolReader, type PoolState, type PoolTarget } from '../chain/poolReader.ts';
+import { PoolReader, type PoolTarget } from '../chain/poolReader.ts';
 import type { RpcReadResult } from '../chain/rpc.ts';
 import { PositionReader, type RawPositionTuple } from '../chain/positionReader.ts';
 import { BSC_ADDRESSES, BSC_DEX_CONTRACTS, type DexContracts } from '../config/builtins.ts';
@@ -99,14 +87,18 @@ const PANCAKE_DEX: DexId = DEX_IDS.PANCAKESWAP_V3;
 /** §40 default slippage; overridden per adapter instance from `StrategyConfig.swap.maxSlippage`. */
 const DEFAULT_SLIPPAGE_TOLERANCE = 0.003;
 
-/** `applyFloorRatio`'s scale, reused so a slippage ratio converts to a `Percent` losslessly. */
-const RATIO_SCALE = 1_000_000_000n;
-
 /**
  * Max per-leg amount a `collect`/`decreaseLiquidity` pull may take; this is what every v3 periphery
  * front-end passes to mean "send me whatever is owed".
  */
 const MAX_UINT128 = 2n ** 128n - 1n;
+
+/** Unlimited approval, as every router expects. */
+const MAX_UINT256 = 2n ** 256n - 1n;
+
+/** `keccak256("IncreaseLiquidity(uint256,uint128,uint256,uint256)")` — the NPM mint's own event. */
+const INCREASE_LIQUIDITY_EVENT_TOPIC =
+  '0x3067048beee31b25b2f1681f88dac838c8bba36af25bfb2b7cf7473a5847e35f' as const;
 
 /**
  * BSC USDT reverts an `approve` from a non-zero allowance, so the router must clear it first
@@ -118,13 +110,11 @@ const ZERO_THEN_MAX_TOKENS: Readonly<Record<string, true>> = {
 };
 
 /** `IApproveAndCall.ApprovalType`, as the SDK's `ApprovalTypes` enum spells it (values 0..4). */
-const SDK_APPROVAL_MAX = 1;
-const SDK_APPROVAL_ZERO_THEN_MAX = 3;
 
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 
 /** Which write path is running, used only to make a refusal name the caller. */
-type WriteAction = 'executeSwap' | 'addLiquidity' | 'removeLiquidity' | 'collectFees';
+type WriteAction = 'executeSwap' | 'addLiquidity' | 'removeLiquidity' | 'collectFees' | 'approve';
 
 /**
  * An unset recipient (`0x0`) would burn the proceeds instead of transferring them, so it is refused
@@ -382,6 +372,10 @@ export class PancakeV3Adapter implements DexAdapter {
    * `addLiquidity({ swapForDeficit })` through the SmartRouter, and why this method must not grow a
    * "mint too" branch.
    */
+  async getTokenBalance(token: Address, holder: Address): Promise<bigint> {
+    return this.#chain.getTokenBalanceOf(token, holder);
+  }
+
   async executeSwap(request: SwapExecutionRequest): Promise<SwapExecutionResult> {
     this.#assertGuardOk(request.guard, 'executeSwap');
     const recipient = this.#requireSigner('executeSwap');
@@ -401,10 +395,28 @@ export class PancakeV3Adapter implements DexAdapter {
       amountOutMinimum: quote.amountOutMinimumRaw,
     });
 
-    const txHash = await this.#send(this.#contracts().swapRouter, data, 0n, request.guard);
+    const spender = this.#contracts().swapRouter;
+
+    /*
+     * Grant the allowance the swap is about to spend.
+     *
+     * Nothing in this codebase ever called ERC-20 `approve`, and `exactInputSingle` performs a
+     * `transferFrom` from the caller: with a zero allowance the pool's `STF` (SafeTransferFrom) revert is
+     * the only possible outcome. Measured on a live chain — the swap failed for exactly this reason.
+     *
+     * `approve(0)` first for the tokens that require it (BSC USDT reverts on a non-zero → non-zero
+     * change), which is the same rule `ZERO_THEN_MAX_TOKENS` encodes.
+     */
+    await this.#ensureAllowance(quote.tokenIn, spender, quote.amountInRaw, request.guard);
+
+    const txHash = await this.#send(spender, data, 0n, request.guard);
+    // §5.3.5: the swap's outcome must be a settled fact before the caller reads any balance — the
+    // executor sizes the mint from exactly this balance, so a pending swap would mean sizing from a
+    // state that is about to change.
+    await this.#confirm(txHash, 'swap');
     return {
       txHash,
-      state: TX_STATES.SUBMITTED,
+      state: TX_STATES.CONFIRMED,
       amountInRaw: quote.amountInRaw,
       amountOutRaw: quote.amountOutRaw,
       approvalType: this.#requiredApprovalType(quote.tokenIn),
@@ -412,17 +424,12 @@ export class PancakeV3Adapter implements DexAdapter {
   }
 
   /**
-   * §33-§38 add liquidity, in one of two shapes:
+   * §33-§38 add liquidity: a plain `mint` on the `NonfungiblePositionManager`, using the request's
+   * own amounts. The EXECUTOR owns the amounts (§5.3.3/D3.7): it reads the wallet after the funding
+   * swap has landed and passes those figures; this method never caps or re-derives them.
    *
-   * - **without `swapForDeficit`** — a plain `mint` on the `NonfungiblePositionManager`, using the
-   *   request's own `amount0Desired`/`amount0Min`. The executor derived those from the §40 tolerance,
-   *   and the request carries no `slippageTolerance` field, so re-deriving them here would mean
-   *   inventing a bound;
-   * - **with `swapForDeficit`** — ONE transaction to the Pancake **SmartRouter** built by
-   *   `SwapRouter.swapAndAddCallParameters`, which contains the swap legs, the pulls that top the
-   *   position up, the router→NPM approvals and the `mint`/`increaseLiquidity`, all inside one
-   *   `multicall`. If that composition cannot be built for any reason this method throws: falling back
-   *   to two transactions would be a silent downgrade of §42's all-or-nothing guarantee.
+   * §5.3.5: the mint is confirmed on chain before returning — and the minted `tokenId` is parsed
+   * from the receipt, because the mint call's simulation cannot provide it.
    */
   async addLiquidity(request: AddLiquidityRequest): Promise<LiquidityExecutionResult> {
     this.#assertGuardOk(request.guard, 'addLiquidity');
@@ -445,10 +452,16 @@ export class PancakeV3Adapter implements DexAdapter {
       );
     }
 
-    if (request.swapForDeficit !== undefined) {
-      return this.#addLiquidityAtomic(request, target);
-    }
-
+    /*
+     * The amounts are the caller's, read by the caller from the wallet AFTER the funding swap landed
+     * (§5.3.3).
+     *
+     * They are deliberately NOT capped against the balance here. The caller's figures already reflect
+     * what the wallet holds; a cap at this point would compare them against the same balance a second
+     * time, and re-deriving the minimums from that cap would apply a tolerance the caller never asked
+     * for. The chain is the authority: an insufficient balance must surface as a revert, not as a
+     * silently smaller position the operator never authorised.
+     */
     const data = this.#encodeMint({
       token0: target.token0.address,
       token1: target.token1.address,
@@ -457,14 +470,49 @@ export class PancakeV3Adapter implements DexAdapter {
       tickUpper: request.tickRange.upperTick,
       amount0Desired: request.amount0DesiredRaw,
       amount1Desired: request.amount1DesiredRaw,
+      // The caller's minimums encode the §40 tolerance and must not be weakened here.
       amount0Min: request.amount0MinRaw,
       amount1Min: request.amount1MinRaw,
       recipient: request.recipient,
       deadline: this.#unixDeadline(request.deadline, 'addLiquidity'),
     });
 
-    const txHash = await this.#send(this.#contracts().positionManager, data, 0n, request.guard);
-    return { txHash, state: TX_STATES.SUBMITTED };
+    /*
+     * The mint pulls BOTH legs from the wallet, so both need an allowance to the position manager.
+     * Granting only for the swap left every build failing here with `STF` — the same revert as the
+     * unapproved swap, on a different contract.
+     */
+    const npm = this.#contracts().positionManager;
+    await this.#ensureAllowance(target.token0.address, npm, request.amount0DesiredRaw, request.guard);
+    await this.#ensureAllowance(target.token1.address, npm, request.amount1DesiredRaw, request.guard);
+
+    const txHash = await this.#send(npm, data, 0n, request.guard);
+    await this.#confirm(txHash, 'addLiquidity');
+    return { txHash, state: TX_STATES.CONFIRMED, ...await this.#mintedTokenId(txHash) };
+  }
+
+  /**
+   * The minted position's `tokenId`, parsed from the receipt's `IncreaseLiquidity` log.
+   *
+   * The mint call's own return values describe a simulation that never existed on chain; only the
+   * receipt is authoritative. `null` fields are omitted so the caller cannot mistake absence for 0.
+   */
+  async #mintedTokenId(
+    txHash: Hash,
+  ): Promise<{ readonly positionTokenId?: bigint } | {}> {
+    const logs = await this.#chain.getReceiptLogs(txHash);
+    if (logs === null) return {};
+    for (const log of logs) {
+      const topic0 = log.topics[0];
+      const tokenIdTopic = log.topics[1];
+      if (topic0 === undefined || tokenIdTopic === undefined) continue;
+      // `IncreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)`
+      if (topic0 === INCREASE_LIQUIDITY_EVENT_TOPIC) {
+        return { positionTokenId: BigInt(tokenIdTopic) };
+      }
+    }
+    this.#log.warn('execute', 'the mint confirmed but no IncreaseLiquidity event was found', { txHash });
+    return {};
   }
 
   /**
@@ -539,7 +587,9 @@ export class PancakeV3Adapter implements DexAdapter {
       0n,
       request.guard,
     );
-    return { txHash, state: TX_STATES.SUBMITTED, ...(requested === null ? {} : { liquidity: requested }) };
+    // §5.3.5: the exit's next step re-reads the wallet, so the removal must be a settled fact.
+    await this.#confirm(txHash, 'removeLiquidity');
+    return { txHash, state: TX_STATES.CONFIRMED, ...(requested === null ? {} : { liquidity: requested }) };
   }
 
   /**
@@ -555,7 +605,8 @@ export class PancakeV3Adapter implements DexAdapter {
     await this.#assertPositionMatchesPool(request.poolId, position, 'collectFees');
     const data = this.#encodeCollect(request.positionTokenId, getAddress(request.recipient));
     const txHash = await this.#send(this.#contracts().positionManager, data, 0n, request.guard);
-    return { txHash, state: TX_STATES.SUBMITTED, positionTokenId: request.positionTokenId };
+    await this.#confirm(txHash, 'collectFees');
+    return { txHash, state: TX_STATES.CONFIRMED, positionTokenId: request.positionTokenId };
   }
 
   /**
@@ -611,161 +662,6 @@ export class PancakeV3Adapter implements DexAdapter {
   // -------------------------------------------------------------------------------------------
   // §42 atomic build
   // -------------------------------------------------------------------------------------------
-
-  /**
-   * The single-transaction swap+add-liquidity build.
-   *
-   * The SmartRouter is the only contract that can do this: `SwapRouter.swapAndAddCallParameters`
-   * encodes the swap legs (with `routerMustCustody`, so each leg's output goes to the router), the
-   * pulls that top the position up to its mint amounts, the router→NPM approvals, the `mint`
-   * (`ApproveAndCall.mint`, selector `0x11ed56c9`) and two sweeps, all inside one
-   * `multicall(bytes32 previousBlockhash, bytes[])` (selector `0x1f0464d1`).
-   *
-   * Slippage is enforced on chain: `options.slippageTolerance` becomes each swap leg's
-   * `amountOutMinimum`/`amountInMaximum` and, through `minimalPosition`, the mint's
-   * `amount0Min`/`amount1Min` — the SDK takes the *tighter* of the two, so the encoded bound never
-   * exceeds what was approved. Price impact is not encodable and was gated before this point (§40).
-   */
-  async #addLiquidityAtomic(
-    request: AddLiquidityRequest,
-    target: PoolTarget,
-  ): Promise<LiquidityExecutionResult> {
-    const swapForDeficit = request.swapForDeficit;
-    if (swapForDeficit === undefined) {
-      throw new ChainError(
-        CHAIN_ERROR_CODES.INVALID_ARGUMENT,
-        'internal: the atomic path was entered without swapForDeficit',
-      );
-    }
-    const quote = swapForDeficit.quote;
-    // The trade and the position MUST be the same pool: swapping in one pool and minting in another
-    // would still be atomic but would not be the build that was approved.
-    if (quote.poolId !== request.poolId) {
-      throw new ChainError(
-        CHAIN_ERROR_CODES.INVALID_ARGUMENT,
-        `atomic build refused: the deficit swap is quoted on ${quote.poolId} but the position is on ` +
-          `${request.poolId}; the swap and the mint must target one pool (${PANCAKE_DEX})`,
-        { quotePoolId: quote.poolId, positionPoolId: request.poolId },
-      );
-    }
-    this.#assertPoolLegsMatchTokenPair(
-      target.token0.address,
-      target.token1.address,
-      getAddress(quote.tokenIn),
-      getAddress(quote.tokenOut),
-    );
-    if (quote.amountInRaw <= 0n || quote.amountOutRaw <= 0n) {
-      throw new ChainError(
-        CHAIN_ERROR_CODES.INVALID_ARGUMENT,
-        'atomic build refused: the deficit swap has non-positive amounts ' +
-          `(${quote.amountInRaw.toString()} in / ${quote.amountOutRaw.toString()} out)`,
-        { poolId: request.poolId },
-      );
-    }
-
-    const state: PoolState = await this.#pools.readPool(target);
-    const sdkPool = this.#sdkPool(target, state);
-    const tokenIn = this.#sdkToken(target, quote.tokenIn);
-    const tokenOut = this.#sdkToken(target, quote.tokenOut);
-    const inputAmount = CurrencyAmount.fromRawAmount(tokenIn, quote.amountInRaw);
-    const outputAmount = CurrencyAmount.fromRawAmount(tokenOut, quote.amountOutRaw);
-    const route: Route = {
-      type: RouteType.V3,
-      percent: 100,
-      path: [tokenIn, tokenOut],
-      pools: [this.#sdkRoutePool(target, state, target.poolAddress)],
-      inputAmount,
-      outputAmount,
-    };
-    const trade: SmartRouterTrade<typeof TradeType.EXACT_INPUT> = {
-      tradeType: TradeType.EXACT_INPUT,
-      inputAmount,
-      outputAmount,
-      routes: [route],
-      gasEstimate: 190_000n,
-    };
-
-    // Router-compatible rounding (`useFullPrecision: false`): the router computes the mintable `L`
-    // the same way, so the position encoded here cannot ask for more liquidity than the NPM accepts.
-    const position = PancakePosition.fromAmounts({
-      pool: sdkPool,
-      tickLower: request.tickRange.lowerTick,
-      tickUpper: request.tickRange.upperTick,
-      amount0: request.amount0DesiredRaw,
-      amount1: request.amount1DesiredRaw,
-      useFullPrecision: false,
-    });
-    if (position.liquidity <= 0n) {
-      throw new ChainError(
-        CHAIN_ERROR_CODES.INVALID_ARGUMENT,
-        `atomic build refused: the desired amounts yield zero liquidity for ` +
-          `[${request.tickRange.lowerTick}, ${request.tickRange.upperTick}] at tick ${state.tick}; the ` +
-          'mint would revert with ZERO_LIQUIDITY',
-        { poolId: request.poolId, tick: state.tick, amount0: request.amount0DesiredRaw.toString() },
-      );
-    }
-
-    const params = SwapRouter.swapAndAddCallParameters(
-      trade,
-      {
-        slippageTolerance: this.#ratioToPercent(quote.slippageTolerance),
-        recipient: request.recipient,
-        // research §4.2: the `previousBlockhash` variant avoids a clock-drift revert on unattended runs.
-        deadlineOrPreviousBlockhash: this.#atomicDeadline(request.deadline),
-      },
-      position,
-      { recipient: request.recipient },
-      this.#sdkApprovalType(quote.tokenIn),
-      this.#sdkApprovalType(quote.tokenOut),
-    );
-
-    /*
-     * Everything needed to diagnose a revert, BEFORE the send attempt.
-     *
-     * A failed `eth_estimateGas` never reaches the chain, so no hash exists and nothing is recorded
-     * anywhere: the calldata that caused it is the only artefact, and it existed solely in memory. Logging
-     * it here means the next failure is readable directly rather than reconstructed from a pasted error.
-     */
-    this.#log.info('execute', 'atomic build (swap + mint in one transaction)', {
-      router: this.#smartRouterAddress(),
-      value: params.value,
-      approvalTokenIn: quote.tokenIn,
-      approvalTokenOut: quote.tokenOut,
-      approvalTypeIn: this.#sdkApprovalType(quote.tokenIn),
-      approvalTypeOut: this.#sdkApprovalType(quote.tokenOut),
-      amount0Desired: request.amount0DesiredRaw,
-      amount1Desired: request.amount1DesiredRaw,
-      liquidity: position.liquidity,
-      calldataBytes: (params.calldata.length - 2) / 2,
-    });
-    // The calldata itself at debug: it is long, and only needed once something has failed.
-    this.#log.debug('execute', 'calldata', { data: params.calldata });
-
-    let txHash: Hash;
-    try {
-      txHash = await this.#send(
-        this.#smartRouterAddress(),
-        params.calldata,
-        BigInt(params.value),
-        request.guard,
-      );
-    } catch (error) {
-      // The failure branch: report the encoded call alongside the reason, so the two can be read together.
-      this.#log.error('execute', 'atomic build FAILED', {
-        reason: errorMessage(error),
-        revertData: revertDataOf(error),
-        to: this.#smartRouterAddress(),
-        calldata: params.calldata,
-      });
-      throw error;
-    }
-    this.#log.info('execute', 'atomic build submitted', { txHash });
-    return {
-      txHash,
-      state: TX_STATES.SUBMITTED,
-      liquidity: position.liquidity,
-    };
-  }
 
   // -------------------------------------------------------------------------------------------
   // Encoding helpers
@@ -1029,27 +925,6 @@ export class PancakeV3Adapter implements DexAdapter {
     );
   }
 
-  /** The SmartRouter accepts both deadline forms; the blockhash variant is the drift-immune one. */
-  #atomicDeadline(deadline: DeadlineSpec): bigint | string {
-    if (deadline.kind === 'previous-blockhash') {
-      if (!/^0x[0-9a-fA-F]{64}$/u.test(deadline.blockhash)) {
-        throw new ChainError(
-          CHAIN_ERROR_CODES.INVALID_ARGUMENT,
-          `atomic build refused: ${deadline.blockhash} is not a 32-byte block hash`,
-          { blockhash: deadline.blockhash },
-        );
-      }
-      return deadline.blockhash;
-    }
-    if (!Number.isInteger(deadline.unixSeconds) || deadline.unixSeconds <= 0) {
-      throw new ChainError(
-        CHAIN_ERROR_CODES.INVALID_ARGUMENT,
-        `atomic build refused: timestamp deadline ${String(deadline.unixSeconds)} is not a unix second`,
-      );
-    }
-    return BigInt(deadline.unixSeconds);
-  }
-
   /**
    * §34/§108: both ticks must sit on the pool's grid. The request's `tickSpacing` is asserted against
    * the pool's own `tickSpacing()` and against the per-DEX fee→spacing table, so a caller that planned
@@ -1111,79 +986,6 @@ export class PancakeV3Adapter implements DexAdapter {
     }
   }
 
-  // -------------------------------------------------------------------------------------------
-  // SDK bridging
-  // -------------------------------------------------------------------------------------------
-
-  #sdkToken(target: PoolTarget, address: Address): Token {
-    const lower = address.toLowerCase();
-    if (target.token0.address.toLowerCase() === lower) {
-      return new Token(this.chainId, target.token0.address, target.token0.decimals, target.token0.symbol);
-    }
-    if (target.token1.address.toLowerCase() === lower) {
-      return new Token(this.chainId, target.token1.address, target.token1.decimals, target.token1.symbol);
-    }
-    throw new ChainError(
-      CHAIN_ERROR_CODES.INVALID_ARGUMENT,
-      `${address} is not a leg of pool ${target.poolAddress}`,
-      { poolAddress: target.poolAddress, address },
-    );
-  }
-
-  #sdkPool(target: PoolTarget, state: PoolState): PancakePool {
-    return new PancakePool(
-      this.#sdkToken(target, target.token0.address),
-      this.#sdkToken(target, target.token1.address),
-      target.feeTier,
-      state.sqrtPriceX96,
-      state.liquidity,
-      state.tick,
-      // Mint amounts depend only on `sqrtRatioX96`; a tick-crossing provider is not needed, and its
-      // absence is explicit rather than a silently empty tick list.
-      new NoTickDataProvider(),
-    );
-  }
-
-  /**
-   * The SmartRouter's own `V3Pool` view of the pool. It must be built from the same on-chain state as
-   * the position's pool, or the encoded swap and the encoded mint would disagree about the pool they
-   * are acting on.
-   */
-  #sdkRoutePool(target: PoolTarget, state: PoolState, poolAddress: Address): V3Pool {
-    return {
-      type: PoolType.V3,
-      address: poolAddress,
-      token0: this.#sdkToken(target, target.token0.address),
-      token1: this.#sdkToken(target, target.token1.address),
-      fee: target.feeTier,
-      liquidity: state.liquidity,
-      sqrtRatioX96: state.sqrtPriceX96,
-      tick: state.tick,
-      // `slot0().feeProtocol` packs the two protocol-fee shares, and `PoolReader` does not surface the
-      // packed word, so zero is used here. Measured, not assumed: `swapAndAddCallParameters` produces
-      // byte-identical calldata for a zero and for a non-zero share (it feeds only the router's
-      // mid-price maths, never an encoded parameter), so this cannot change what is signed. Wiring the
-      // real shares is listed as an open item in the report.
-      token0ProtocolFee: new Percent(0, 1),
-      token1ProtocolFee: new Percent(0, 1),
-    };
-  }
-
-  #ratioToPercent(ratio: number): Percent {
-    if (!Number.isFinite(ratio) || ratio < 0 || ratio > 1) {
-      throw new ChainError(
-        CHAIN_ERROR_CODES.INVALID_ARGUMENT,
-        `slippage tolerance ${String(ratio)} is not a ratio in [0, 1]`,
-        { ratio },
-      );
-    }
-    return new Percent(BigInt(Math.round(ratio * Number(RATIO_SCALE))), RATIO_SCALE);
-  }
-
-  // -------------------------------------------------------------------------------------------
-  // Misc
-  // -------------------------------------------------------------------------------------------
-
   #contracts(): DexContracts {
     const contracts = BSC_DEX_CONTRACTS[PANCAKE_DEX];
     if (contracts === undefined) {
@@ -1194,19 +996,6 @@ export class PancakeV3Adapter implements DexAdapter {
       );
     }
     return contracts;
-  }
-
-  #smartRouterAddress(): Address {
-    const address = SMART_ROUTER_ADDRESSES[this.chainId as keyof typeof SMART_ROUTER_ADDRESSES];
-    if (address === undefined || address === '0x') {
-      throw new ChainError(
-        CHAIN_ERROR_CODES.INVALID_ARGUMENT,
-        `no Pancake SmartRouter deployment is known for chain ${this.chainId}; the §42 atomic build ` +
-          'cannot be encoded (refusing to guess an address)',
-        { chainId: this.chainId },
-      );
-    }
-    return getAddress(address);
   }
 
   /** §13 identity → address. The pool id is `${chainId}:${dex}:${poolAddress}`. */
@@ -1283,28 +1072,100 @@ export class PancakeV3Adapter implements DexAdapter {
       : APPROVAL_TYPES.EXACT;
   }
 
-  /** The SDK's `IApproveAndCall.ApprovalType` for the router→NPM approval of one leg. */
-  #sdkApprovalType(token: Address): number {
-    return ZERO_THEN_MAX_TOKENS[token.toLowerCase()] === true
-      ? SDK_APPROVAL_ZERO_THEN_MAX
-      : SDK_APPROVAL_MAX;
+  /** §81: the only write path in the system, always through the injected chain layer. */
+  /**
+   * Ensure `spender` may move at least `required` of `token`, sending an `approve` only when it cannot.
+   *
+   * Skipping the write when the allowance already suffices keeps a repeated build from paying for an
+   * approval it does not need — and, for a token like USDT, from taking the zero-detour on every run.
+   *
+   * The allowance is granted at `MAX_UINT256` rather than the exact amount: this is a router that pulls
+   * the precise input, the operator can revoke at will, and an exact-amount approval would need re-granting
+   * on every build (including the zero-detour for USDT, which costs an extra transaction each time).
+   */
+  async #ensureAllowance(
+    token: Address,
+    spender: Address,
+    required: bigint,
+    guard: TxGuardChecks,
+  ): Promise<void> {
+    const owner = this.#requireSigner('approve');
+    const current = await this.#chain.getAllowance(token, owner, spender);
+    if (current >= required) {
+      this.#log.debug('execute', 'allowance already sufficient', {
+        token,
+        spender,
+        current,
+        required,
+      });
+      return;
+    }
+
+    this.#log.info('execute', 'granting an allowance before the swap', {
+      token,
+      spender,
+      current,
+      required,
+      zeroThenMax: ZERO_THEN_MAX_TOKENS[token.toLowerCase()] === true,
+    });
+
+    /*
+     * Each approval is WAITED FOR before the next step.
+     *
+     * `#send` returns a hash as soon as the transaction is broadcast. Proceeding immediately means the
+     * following transaction is estimated against a chain where the allowance is still zero, and it fails
+     * with `STF` — which reads like "no approval at all" and sends the investigation in the wrong
+     * direction. The order of operations only holds if each one has actually landed.
+     *
+     * BSC USDT refuses a non-zero → non-zero change; clear it first.
+     */
+    if (ZERO_THEN_MAX_TOKENS[token.toLowerCase()] === true && current > 0n) {
+      const zeroed = await this.#send(
+        token,
+        encodeFunctionData({ abi: ERC20_ABI, functionName: 'approve', args: [spender, 0n] }),
+        0n,
+        guard,
+      );
+      await this.#confirm(zeroed, 'approve(0)');
+    }
+    const granted = await this.#send(
+      token,
+      encodeFunctionData({ abi: ERC20_ABI, functionName: 'approve', args: [spender, MAX_UINT256] }),
+      0n,
+      guard,
+    );
+    await this.#confirm(granted, 'approve(max)');
+    this.#log.info('execute', 'allowance granted', { token, spender });
   }
 
-  /** §81: the only write path in the system, always through the injected chain layer. */
+  /**
+   * Wait for a broadcast transaction to be mined, and refuse to continue if it did not succeed.
+   *
+   * A reverted approval would otherwise be invisible: the hash exists, the next step runs against an
+   * unchanged allowance, and the failure surfaces one call later as an unrelated `STF`.
+   */
+  async #confirm(hash: Hash, what: string): Promise<void> {
+    const info = await this.#chain.waitForTransaction(hash);
+    if (info.state === TX_STATES.REVERTED || info.state === TX_STATES.FAILED) {
+      throw new ChainError(
+        CHAIN_ERROR_CODES.TX_GUARD_FAILED,
+        `${what} did not succeed on chain (${info.state}, hash ${hash}); refusing to continue`,
+        { hash, state: info.state },
+      );
+    }
+    this.#log.debug('execute', `${what} confirmed`, { hash, state: info.state });
+  }
+
   async #send(to: Address, data: Hex, value: bigint, guard: TxGuardChecks): Promise<Hash> {
+    /*
+     * The calldata, logged BEFORE the send attempt: a failed `eth_estimateGas` never reaches the
+     * chain, so no hash exists and nothing is recorded anywhere — the encoded call is the only
+     * artefact and it lives solely in memory unless it is written down first. At debug so runs stay
+     * quiet; it is needed once something has failed.
+     */
+    this.#log.debug('execute', 'sending calldata', { to, value, calldataBytes: (data.length - 2) / 2, data });
     return this.#chain.sendTransaction({ to, data, value, guard });
   }
-}
-
-/** The revert payload a viem error carries, when there is one. Separated so it logs as a short field. */
-function revertDataOf(error: unknown): string {
-  const carrier = error as { readonly data?: unknown; readonly cause?: { readonly data?: unknown } };
-  const data = carrier.data ?? carrier.cause?.data;
-  return typeof data === 'string' ? data : 'none';
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 /** §82 factory: build the Pancake adapter from runtime options. */

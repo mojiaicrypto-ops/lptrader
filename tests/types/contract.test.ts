@@ -367,17 +367,7 @@ describe('type-level guarantees (compiled by tsc, asserted here for documentatio
       idempotencyKey: 'k',
       guard,
     };
-    // §42: the atomic path expresses swap+add in ONE request; the flag can only be literal true.
-    const atomicAddRequest: AddLiquidityRequest = {
-      ...addRequest,
-      swapForDeficit: { quote: swapQuote, atomic: true },
-    };
-    const ambiguousAtomic: AddLiquidityRequest = {
-      ...addRequest,
-      // @ts-expect-error — `atomic: false` is unrepresentable: it would mean "maybe atomic".
-      swapForDeficit: { quote: swapQuote, atomic: false },
-    };
-    void ambiguousAtomic;
+
     const plainSwapRequest: SwapExecutionRequest = {
       quote: swapQuote,
       deadline,
@@ -385,10 +375,6 @@ describe('type-level guarantees (compiled by tsc, asserted here for documentatio
       idempotencyKey: 'k',
       guard,
     };
-    // @ts-expect-error — `executeSwap` carries no atomicity flag; atomicity lives on addLiquidity.
-    const swapWithAtomic: SwapExecutionRequest = { ...plainSwapRequest, atomic: true };
-    void swapWithAtomic;
-    void atomicAddRequest;
     void plainSwapRequest;
     const removeRequest: RemoveLiquidityRequest = {
       poolId,

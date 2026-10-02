@@ -7,7 +7,7 @@
  * decode or orientation regression shows up as a wrong number rather than as a green test.
  */
 import { describe, expect, it } from 'vitest';
-import { decodeFunctionData, type Abi, type Hex } from 'viem';
+import { decodeFunctionData, parseTransaction, type Abi, type Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { BscChainAdapter } from '../../src/chain/adapter.ts';
 import { CLMM_POOL_ABI, ERC20_ABI, POSITION_MANAGER_ABI } from '../../src/chain/abis.ts';
@@ -31,8 +31,8 @@ import {
 } from '../../src/dex/uniswapV3.ts';
 import { applyFloorRatio } from '../../src/util/decimal.ts';
 import { TX_STATES, type AddLiquidityRequest, type DeadlineSpec, type SwapQuote, type TxGuardChecks } from '../../src/types/adapters.ts';
-import { DEX_IDS } from '../../src/types/primitives.ts';
-import { callEntry, createMockNode, entry, type MockNodeOptions } from '../chain/mockNode.ts';
+import { DEX_IDS, type Address } from '../../src/types/primitives.ts';
+import { callEntry, createMockNode, encodeResult, entry, type MockNodeOptions } from '../chain/mockNode.ts';
 
 const QQQB = '0x205812cdbed920aff76c6580abd681a46d11efc7' as const;
 const USDC = BSC_ADDRESSES.USDC;
@@ -143,15 +143,72 @@ interface HarnessOptions {
  */
 function harness(options: HarnessOptions = {}) {
   const sent: { to: string; data: Hex; value: string }[] = [];
+
+  /*
+   * Every broadcast is served back as a MINED success carrying a mint's `IncreaseLiquidity` event:
+   * §5.3.5 confirmation reads the transaction by hash (ByHash first, receipt to settle the state),
+   * and §5.3.3 parses the minted tokenId from the receipt logs. A harness that returns only a hash
+   * leaves every confirm-wait spinning to its timeout.
+   */
+  const receipts: NonNullable<MockNodeOptions['receipts']> = {};
+  const transactions: NonNullable<MockNodeOptions['transactions']> = {};
+  const broadcast = (params: readonly unknown[]): Hex => {
+    // Raw broadcasts carry a SIGNED serialised transaction, not a call object — decode it so `sent`
+    // records the same shape for both entry points.
+    const first = params[0];
+    const request =
+      typeof first === 'string'
+        ? parseTransaction(first as Hex)
+        : (first as { to?: string; data?: string; value?: string });
+    sent.push({
+      to: String(request.to),
+      data: (request.data ?? '0x') as Hex,
+      value: (request.value ?? 0n).toString(),
+    });
+    const hash = `0x${'11'.repeat(32)}` as Hex;
+    transactions[hash.toLowerCase()] = {
+      blockNumber: 1_000n,
+      from: SIGNER.address,
+      to: (request.to ?? '0x') as Address,
+      value: typeof request.value === 'bigint' ? request.value : BigInt(request.value ?? '0x0'),
+      gasPrice: 1_000_000_000n,
+    } as NonNullable<MockNodeOptions['transactions']>[string];
+    receipts[hash.toLowerCase()] = {
+      blockNumber: 1_000n,
+      from: SIGNER.address,
+      to: (request.to ?? '0x') as Address,
+      status: 'success',
+      gasUsed: 100_000n,
+      effectiveGasPrice: 1_000_000_000n,
+      logs: [
+        {
+          address: MANAGER as Address,
+          topics: [
+            '0x3067048beee31b25b2f1681f88dac838c8bba36af25bfb2b7cf7473a5847e35f',
+            '0x' + 7001n.toString(16).padStart(64, '0'),
+          ],
+          data: '0x' + '0'.repeat(128),
+        },
+      ],
+    } as NonNullable<MockNodeOptions['receipts']>[string];
+    return hash;
+  };
   const node = createMockNode({
-    contracts: options.contracts ?? {},
+    contracts:
+      options.contracts ??
+      ({
+        // ensureAllowance pre-reads the spender's allowance; the default answers "already approved"
+        // so calldata tests keep counting only the multicall. A zero allowance is set explicitly by
+        // the approval-semantics tests.
+        [QQQB.toLowerCase()]: { 'allowance(address,address)': encodeResult(ERC20_ABI, 'allowance', 2n ** 255n) },
+        [USDC.toLowerCase()]: { 'allowance(address,address)': encodeResult(ERC20_ABI, 'allowance', 2n ** 255n) },
+      } as NonNullable<MockNodeOptions['contracts']>),
+    receipts,
+    transactions,
     extra: {
       eth_getTransactionCount: () => '0x0',
-      eth_sendTransaction: (params) => {
-        const request = (params as readonly { to?: string; data?: string; value?: string }[])[0]!;
-        sent.push({ to: String(request.to), data: (request.data ?? '0x') as Hex, value: String(request.value) });
-        return `0x${'11'.repeat(32)}`;
-      },
+      eth_sendTransaction: broadcast,
+      eth_sendRawTransaction: broadcast,
       ...options.extra,
     },
   });
@@ -186,8 +243,13 @@ function liveContracts(extra: NonNullable<MockNodeOptions['contracts']> = {}) {
   // (1200 QQQB + 890k USDC). No test asserts them: they exist so the batched `readPool` completes.
   const qqqbCard: Record<string, Hex | 'revert'> = {};
   callEntry(qqqbCard, 'balanceOf(address)', [POOL], 1_200_000_000_000_000_000_000n, ERC20_ABI);
+  // ensureAllowance pre-reads the allowance; "already approved" keeps calldata tests send-only.
+  callEntry(qqqbCard, 'allowance(address,address)', [SIGNER.address, CONTRACTS.swapRouter], 2n ** 255n, ERC20_ABI);
+  callEntry(qqqbCard, 'allowance(address,address)', [SIGNER.address, CONTRACTS.positionManager], 2n ** 255n, ERC20_ABI);
   const usdcCard: Record<string, Hex | 'revert'> = {};
   callEntry(usdcCard, 'balanceOf(address)', [POOL], 890_000_000_000_000_000_000_000n, ERC20_ABI);
+  callEntry(usdcCard, 'allowance(address,address)', [SIGNER.address, CONTRACTS.swapRouter], 2n ** 255n, ERC20_ABI);
+  callEntry(usdcCard, 'allowance(address,address)', [SIGNER.address, CONTRACTS.positionManager], 2n ** 255n, ERC20_ABI);
   return {
     [FACTORY]: factoryCard(),
     [POOL]: poolCard(),
@@ -668,28 +730,13 @@ describe('§42 addLiquidity', () => {
     };
   }
 
-  it('refuses swapForDeficit and sends nothing — the venue cannot be atomic', async () => {
-    const { adapter, sent } = harness({ contracts: liveContracts() });
-    const error = await adapter
-      .addLiquidity(add({ swapForDeficit: { quote: quote(), atomic: true } }))
-      .catch((thrown: unknown) => thrown);
-
-    expect(error).toBeInstanceOf(Error);
-    expect((error as Error).message).toMatch(/swapForDeficit/);
-    expect((error as Error).message).toMatch(/multicall|self-delegatecall/);
-    expect((error as Error).message).toMatch(/supportsAtomicBuild/);
-    // The critical assertion: a refusal, not a silent two-transaction downgrade.
-    expect(sent).toEqual([]);
-  });
-
   it('encodes mint with the pool’s own token order, the aligned range and the raw amounts', async () => {
     const { adapter, sent } = harness({ contracts: liveContracts() });
     const result = await adapter.addLiquidity(add());
 
-    expect(result.state).toBe(TX_STATES.SUBMITTED);
-    // The mint return values need a receipt, so they are absent rather than assumed.
-    expect(result.positionTokenId).toBeUndefined();
-    expect(result.liquidity).toBeUndefined();
+    expect(result.state).toBe(TX_STATES.CONFIRMED);
+    // The minted tokenId is parsed from the receipt's IncreaseLiquidity event — not assumed.
+    expect(result.positionTokenId).toBe(7001n);
 
     expect(sent).toHaveLength(1);
     expect(sent[0]!.to.toLowerCase()).toBe(MANAGER);
@@ -782,7 +829,7 @@ describe('executeSwap calldata', () => {
       guard: GUARD,
     });
 
-    expect(result.state).toBe(TX_STATES.SUBMITTED);
+    expect(result.state).toBe(TX_STATES.CONFIRMED);
     expect(result.txHash).toBe(`0x${'11'.repeat(32)}`);
     expect(result.amountInRaw).toBe(1_000_000_000_000_000_000n);
     expect(result.amountOutRaw).toBe(QUOTED_OUT);
@@ -940,7 +987,7 @@ describe('removeLiquidity and collectFees', () => {
       guard: GUARD,
     });
 
-    expect(result.state).toBe(TX_STATES.SUBMITTED);
+    expect(result.state).toBe(TX_STATES.CONFIRMED);
     expect(sent).toHaveLength(1);
     expect(sent[0]!.to.toLowerCase()).toBe(MANAGER);
     expect(BigInt(sent[0]!.value)).toBe(0n);
@@ -949,8 +996,11 @@ describe('removeLiquidity and collectFees', () => {
     const outer = decodeFunctionData({ abi: UNISWAP_V3_POSITION_MANAGER_ABI, data: sent[0]!.data });
     expect(outer.functionName).toBe('multicall');
     const [inner] = outer.args as readonly [readonly Hex[]];
-    // Both calls in one transaction: a bare decrease would leave the principal inside the manager.
-    expect(inner).toHaveLength(2);
+    // Three calls on a full exit: decrease + collect + burn (an unburned shell would surface on
+    // `balanceOf` as a position that does not exist). A bare decrease would leave the principal
+    // inside the manager.
+    expect(inner).toHaveLength(3);
+    expect(decodeFunctionData({ abi: UNISWAP_V3_POSITION_MANAGER_ABI, data: inner[2]! }).functionName).toBe('burn');
 
     const decrease = decodeFunctionData({ abi: UNISWAP_V3_POSITION_MANAGER_ABI, data: inner[0]! });
     expect(decrease.functionName).toBe('decreaseLiquidity');
@@ -1007,12 +1057,17 @@ describe('removeLiquidity and collectFees', () => {
       /holds 100 liquidity but 101 was requested/,
     );
 
+    // A zero-liquidity NFT is an emptied shell: removeLiquidity(null) now BURNS it (collect+burn
+    // multicall) instead of refusing for ever — the measured live behaviour.
     const empty = positionHarness(0n);
-    await expect(empty.adapter.removeLiquidity({ ...base, liquidityRaw: null })).rejects.toThrowError(
-      /no liquidity to burn/,
-    );
+    const shell = await empty.adapter.removeLiquidity({ ...base, liquidityRaw: null });
+    expect(shell.state).toBe(TX_STATES.CONFIRMED);
+    expect(empty.sent).toHaveLength(1);
+    const shellOuter = decodeFunctionData({ abi: UNISWAP_V3_POSITION_MANAGER_ABI, data: empty.sent[0]!.data });
+    const [shellInner] = shellOuter.args as readonly [readonly Hex[]];
+    expect(shellInner).toHaveLength(2);
+    expect(decodeFunctionData({ abi: UNISWAP_V3_POSITION_MANAGER_ABI, data: shellInner[1]! }).functionName).toBe('burn');
     expect(sent).toEqual([]);
-    expect(empty.sent).toEqual([]);
   });
 
   it('refuses a poolId that does not name the position’s own pool', async () => {
@@ -1078,7 +1133,7 @@ describe('removeLiquidity and collectFees', () => {
       guard: GUARD,
     });
 
-    expect(result.state).toBe(TX_STATES.SUBMITTED);
+    expect(result.state).toBe(TX_STATES.CONFIRMED);
     expect(sent).toHaveLength(1);
     expect(sent[0]!.to.toLowerCase()).toBe(MANAGER);
     expect(selectorOf(sent[0]!.data)).toBe('0xfc6f7865');

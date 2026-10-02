@@ -42,6 +42,8 @@ export interface MockReceipt {
   readonly status: 'success' | 'reverted';
   readonly gasUsed: bigint;
   readonly effectiveGasPrice: bigint;
+  /** Raw event logs the receipt carries; a mint must carry its `IncreaseLiquidity`. */
+  readonly logs?: readonly { readonly address: Address; readonly topics: readonly string[]; readonly data: string }[];
 }
 
 export interface MockTransaction {
@@ -234,6 +236,12 @@ export function createMockNode(options: MockNodeOptions = {}): MockNode {
         }
         return dispatchCall(to, call.data);
       }
+      case 'eth_getBlockByNumber': {
+        // §98 confirmation reads the head to compare against a receipt's block. The mock answers with a
+        // fixed height, which is all the confirmation logic needs to decide a receipt is buried.
+        calls.push({ method: request.method });
+        return { number: toQuantity(options.blockNumber ?? 1_000n), hash: `0x${'ab'.repeat(32)}`, transactions: [] };
+      }
       case 'eth_getTransactionReceipt': {
         const hash = String(params[0]).toLowerCase();
         calls.push({ method: request.method });
@@ -247,7 +255,11 @@ export function createMockNode(options: MockNodeOptions = {}): MockNode {
           gasUsed: toQuantity(receipt.gasUsed),
           effectiveGasPrice: toQuantity(receipt.effectiveGasPrice),
           transactionHash: hash,
-          logs: [],
+          logs: (receipt.logs ?? []).map((log) => ({
+            address: log.address,
+            topics: log.topics,
+            data: log.data,
+          })),
         };
       }
       case 'eth_getTransactionByHash': {

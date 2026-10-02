@@ -98,11 +98,12 @@ describe('the build path is instrumented end to end', () => {
 
   it('the adapter logs the calldata before attempting a send', async () => {
     // The only artefact of a failed `eth_estimateGas`: it never reaches the chain, so no hash exists and
-    // the calldata lives solely in memory unless it is written down first.
+    // the calldata lives solely in memory unless it is written down first. The single `#send` helper
+    // is the one write exit in the adapter, so one log call covers every write path.
     const { readFileSync } = await import('node:fs');
     const source = readFileSync('src/dex/pancakeV3.ts', 'utf8');
-    const atomic = source.slice(source.indexOf('atomic build (swap + mint in one transaction)'));
-    expect(atomic).toMatch(/calldata/);
-    expect(atomic).toMatch(/atomic build FAILED/);
+    const send = source.slice(source.indexOf('async #send('));
+    expect(send).toMatch(/sending calldata/);
+    expect(send).toMatch(/data /);
   });
 });

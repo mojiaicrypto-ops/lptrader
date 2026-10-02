@@ -148,12 +148,19 @@ export class BscChainAdapter implements ChainAdapter {
   /**
    * Independently verify a write target (§95, §8, §12, §91).
    *
-   * The target must be one of the contracts this system is allowed to touch on this chain: a
-   * whitelisted DEX's deployed contracts, or Multicall3. §91 forbids "Approve Unknown Contract" and
-   * "Interact With Unknown DEX", and §95 requires the contract address to be verified before every
-   * transaction — so it is enforced here rather than left to the guard's self-reported
-   * `toWhitelisted`, which `assertTxGuard` cannot verify (measured: a forged all-true guard aimed at
-   * the known impostor address `0xb904108b…` passes `assertTxGuard`).
+   * The target must be one of the addresses this system is allowed to touch on this chain: a whitelisted
+   * DEX's deployed contracts, Multicall3, or a whitelisted TOKEN.
+   *
+   * ## Why tokens are included
+   *
+   * The rule exists to stop a transaction reaching an unknown or impostor contract — measured once, when a
+   * forged all-true guard aimed at the known impostor address `0xb904108b…` passed `assertTxGuard`. A
+   * whitelisted token is not that: §8 has already vetted its address, and §91's "Approve Unknown Contract"
+   * is about UNKNOWN contracts.
+   *
+   * It is also unavoidable: an ERC-20 allowance is granted by calling the token itself, so `approve` has
+   * `to = <token>` by definition. Omitting tokens did not make the system safer; it made every swap fail
+   * with `STF`, because the allowance the swap depends on could never be granted.
    *
    * ## Why there is no selector check here
    * An earlier version also required the calldata selector to appear in `KNOWN_SELECTORS`, and that was
@@ -172,6 +179,13 @@ export class BscChainAdapter implements ChainAdapter {
       for (const address of Object.values(contracts)) {
         if (typeof address === 'string') allowed.add(address.toLowerCase());
       }
+    }
+    // §8: whitelisted tokens, because granting an allowance means calling the token contract itself.
+    for (const token of this.whitelist.registry.listStockTokens({})) {
+      allowed.add(token.address.toLowerCase());
+    }
+    for (const token of this.whitelist.registry.listStablecoins()) {
+      allowed.add(token.address.toLowerCase());
     }
     if (!allowed.has(to.toLowerCase())) {
       throw new ChainError(
@@ -488,6 +502,32 @@ export class BscChainAdapter implements ChainAdapter {
    * `null` is returned only when the node answered that it has never seen the hash — which the
    * contract models as `UNKNOWN`, never as `FAILED` (see `interpretTransaction`).
    */
+  /**
+   * Raw receipt logs for a MINED transaction.
+   *
+   * Callers decode them with their own ABI (e.g. the position manager's `IncreaseLiquidity` to learn
+   * the minted `tokenId` — a value the mint call's simulation cannot provide, because it returns
+   * before the transaction exists). `null` when the node has not seen the hash yet.
+   */
+  async getReceiptLogs(txHash: Hash): Promise<
+    readonly { readonly address: Address; readonly topics: readonly Hex[]; readonly data: Hex }[] | null
+  > {
+    const receipt = await this.rpc.call(async (client) => {
+      try {
+        return await client.getTransactionReceipt({ hash: txHash });
+      } catch (error) {
+        if (error instanceof TransactionReceiptNotFoundError) return null;
+        throw error;
+      }
+    }, 'eth_getTransactionReceipt');
+    if (receipt === null || receipt.value === null) return null;
+    return receipt.value.logs.map((log) => ({
+      address: log.address as Address,
+      topics: log.topics as readonly Hex[],
+      data: log.data as Hex,
+    }));
+  }
+
   async getTransaction(txHash: Hash): Promise<TransactionInfo | null> {
     const receipt = await this.rpc.call(async (client) => {
       try {
@@ -553,8 +593,27 @@ export class BscChainAdapter implements ChainAdapter {
     // and the calldata, so trusting a self-reported boolean here would leave the most catastrophic
     // failure mode (signing to the wrong contract) protected only by the caller's honesty.
     this.assertWhitelistedWriteTarget(tx.to);
-    const account = this.requireSigner('sendTransaction');
+    this.requireSigner('sendTransaction');
     const client = this.requireWalletClient();
+    /*
+     * The ACCOUNT OBJECT, not its address.
+     *
+     * `requireSigner` returns an `Address` (a string). Passing a string as viem's `account` means "the node
+     * holds this key", so viem emits `eth_sendTransaction` — which every public RPC refuses, and which
+     * would delegate signing to a node we do not control even where it does exist. Measured: the adaptor
+     * sent `eth_sendTransaction` and failed, while the same call with the account object signed locally and
+     * used `eth_sendRawTransaction`.
+     *
+     * `privateKeyToAccount` yields a `local` account, so viem signs in-process and the key never leaves it.
+     */
+    const account = client.account;
+    if (account === undefined) {
+      throw new ChainError(
+        CHAIN_ERROR_CODES.INVALID_ARGUMENT,
+        'the wallet client has no account attached; refusing to send',
+        { to: tx.to },
+      );
+    }
 
     const gasLimit = tx.gasLimit ?? (await this.estimateGas(tx));
     if (gasLimit <= 0n) {

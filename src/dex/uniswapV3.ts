@@ -34,12 +34,12 @@
  */
 import { encodeFunctionData, getAddress } from 'viem';
 import { BscChainAdapter } from '../chain/adapter.ts';
-import { POSITION_MANAGER_ABI } from '../chain/abis.ts';
+import { ERC20_ABI, POSITION_MANAGER_ABI } from '../chain/abis.ts';
 import { ChainError, CHAIN_ERROR_CODES } from '../chain/errors.ts';
 import { MAX_TICK, MIN_TICK, PoolReader } from '../chain/poolReader.ts';
 import { PositionReader } from '../chain/positionReader.ts';
 import { assertTxGuard } from '../chain/txState.ts';
-import { BSC_DEX_CONTRACTS, type DexContracts } from '../config/builtins.ts';
+import { BSC_ADDRESSES, BSC_DEX_CONTRACTS, type DexContracts } from '../config/builtins.ts';
 import { tickSpacingFor } from './index.ts';
 import { applyFloorRatio, toFloat } from '../util/decimal.ts';
 import { computePriceImpact } from '../strategy/swapPlanner.ts';
@@ -59,8 +59,8 @@ import type {
   SwapQuoteRequest,
   TickRangeRef,
 } from '../types/adapters.ts';
-import { TX_STATES } from '../types/adapters.ts';
-import { DEX_IDS, TOKEN_KINDS, type Address, type ChainId, type FeeTier, type Hex, type PoolId, type Ratio, type Tick } from '../types/primitives.ts';
+import { TX_STATES, type TxGuardChecks } from '../types/adapters.ts';
+import { DEX_IDS, TOKEN_KINDS, type Address, type ChainId, type FeeTier, type Hash, type Hex, type PoolId, type Ratio, type Tick } from '../types/primitives.ts';
 import type { Whitelist } from '../types/registry.ts';
 import type { TokenMeta } from '../types/token.ts';
 
@@ -247,6 +247,13 @@ export const UNISWAP_V3_POSITION_MANAGER_ABI = [
   },
   {
     type: 'function',
+    name: 'burn',
+    stateMutability: 'payable',
+    inputs: [{ name: 'tokenId', type: 'uint256' }],
+    outputs: [],
+  },
+  {
+    type: 'function',
     name: 'multicall',
     stateMutability: 'payable',
     inputs: [{ name: 'data', type: 'bytes[]' }],
@@ -263,6 +270,17 @@ export const UNISWAP_V3_POSITION_MANAGER_ABI = [
  * quoting can never be *more* permissive than the configured gate. Overridable per adapter.
  */
 export const DEFAULT_SLIPPAGE_TOLERANCE = 0.003;
+
+/** BSC USDT refuses a non-zero → non-zero `approve`; such tokens must be cleared first (§93). */
+const ZERO_THEN_MAX_TOKENS: Readonly<Record<string, true>> = {
+  [BSC_ADDRESSES.USDT.toLowerCase()]: true,
+};
+
+const MAX_UINT256 = 2n ** 256n - 1n;
+
+/** `keccak256("IncreaseLiquidity(uint256,uint128,uint256,uint256)")` — the NPM mint's own event. */
+const INCREASE_LIQUIDITY_EVENT_TOPIC =
+  '0x3067048beee31b25b2f1681f88dac838c8bba36af25bfb2b7cf7473a5847e35f' as const;
 
 /** `type(uint128).max` — "collect everything the position is owed" for `collect`. */
 export const MAX_UINT128 = (1n << 128n) - 1n;
@@ -643,6 +661,58 @@ export class UniswapV3Adapter implements DexAdapter {
    * address this adapter can honestly name is the one the chain layer will sign with. With no signer
    * attached the call refuses — it could not be broadcast anyway, and it must not name someone else.
    */
+  async getTokenBalance(token: Address, holder: Address): Promise<bigint> {
+    return this.chain.getTokenBalanceOf(token, holder);
+  }
+
+  /**
+   * Ensure `spender` may move at least `required` of `token`, approving exactly that much (§93: exact is
+   * the default; a router pulls the precise input, the operator can revoke at will, and re-granting on a
+   * later build is one cheap transaction). BSC USDT refuses a non-zero → non-zero change, so such tokens
+   * are cleared first.
+   *
+   * Each approval is waited for (§5.3.5) before the next transaction runs — an allowance still pending is
+   * the same `STF` revert as no allowance at all.
+   */
+  async ensureAllowance(
+    token: Address,
+    spender: Address,
+    required: bigint,
+    guard: TxGuardChecks,
+  ): Promise<void> {
+    const owner = this.requireSigner('approve');
+    const current = await this.chain.getAllowance(token, owner, spender);
+    if (current >= required) return;
+
+    if (ZERO_THEN_MAX_TOKENS[token.toLowerCase()] === true && current > 0n) {
+      const zeroed = await this.chain.sendTransaction({
+        to: token,
+        data: encodeFunctionData({ abi: ERC20_ABI, functionName: 'approve', args: [spender, 0n] }),
+        value: 0n,
+        guard,
+      });
+      await this.awaitMined(zeroed, 'approve(0)');
+    }
+    const granted = await this.chain.sendTransaction({
+      to: token,
+      data: encodeFunctionData({ abi: ERC20_ABI, functionName: 'approve', args: [spender, MAX_UINT256] }),
+      value: 0n,
+      guard,
+    });
+    await this.awaitMined(granted, 'approve(max)');
+  }
+
+  async awaitMined(hash: Hash, what: string): Promise<void> {
+    const info = await this.chain.waitForTransaction(hash);
+    if (info.state !== TX_STATES.CONFIRMED) {
+      throw new ChainError(
+        CHAIN_ERROR_CODES.TX_GUARD_FAILED,
+        `${what} did not succeed on chain (${info.state}, hash ${hash}); refusing to continue`,
+        { hash, state: info.state },
+      );
+    }
+  }
+
   async executeSwap(request: SwapExecutionRequest): Promise<SwapExecutionResult> {
     assertTxGuard(request.guard, { to: this.contracts.swapRouter });
 
@@ -701,6 +771,9 @@ export class UniswapV3Adapter implements DexAdapter {
     });
 
     const data = this.routerMulticall(request.deadline, inner, 'executeSwap');
+    // The swap does a `transferFrom` of `amountInRaw` — without an allowance its only outcome is `STF`
+    // (measured live, 2026-10-02).
+    await this.ensureAllowance(quote.tokenIn, this.contracts.swapRouter, quote.amountInRaw, request.guard);
     const txHash = await this.chain.sendTransaction({
       to: this.contracts.swapRouter,
       data,
@@ -710,40 +783,33 @@ export class UniswapV3Adapter implements DexAdapter {
       guard: request.guard,
     });
 
+    // §5.3.5: the swap's outcome must be a settled fact before the caller reads any balance — the
+    // executor sizes the mint from exactly this balance.
+    const info = await this.chain.waitForTransaction(txHash);
+    if (info.state !== TX_STATES.CONFIRMED) {
+      throw new ChainError(
+        CHAIN_ERROR_CODES.TX_GUARD_FAILED,
+        `swap did not succeed on chain (${info.state}, hash ${txHash}); refusing to continue`,
+        { poolId: quote.poolId },
+      );
+    }
     return {
       txHash,
-      state: TX_STATES.SUBMITTED,
-      // `state` is SUBMITTED — these are the SIGNED amounts from the quote, not a receipt-verified
-      // result. Confirmation is the caller's (a receipt query), never this adapter's assumption.
+      state: TX_STATES.CONFIRMED,
       amountInRaw: quote.amountInRaw,
       amountOutRaw: quote.amountOutRaw,
     };
   }
 
   /**
-   * §33-§38 `NonfungiblePositionManager.mint`.
-   *
-   * §42: `swapForDeficit` is **refused**, not downgraded. This venue cannot put a swap and a mint in
-   * one transaction (see the file header), and quietly splitting the build into two sends would
-   * destroy the all-or-nothing guarantee the field exists to request — the caller would see a
-   * "successful" atomic build that is really a swap the operator never approved under that shape.
+   * §33-§38 `NonfungiblePositionManager.mint`. The amounts are the executor's, read from the wallet
+   * after the funding swap landed (§5.3.3/D3.7). The mint is confirmed on chain and the minted
+   * `tokenId` is parsed from the receipt's `IncreaseLiquidity` log.
    */
   async addLiquidity(request: AddLiquidityRequest): Promise<LiquidityExecutionResult> {
     // §95 first, before anything is encoded or sent — and before any read, so a failed guard costs
     // no RPC and cannot depend on chain state.
     assertTxGuard(request.guard, { to: this.contracts.positionManager });
-
-    if (request.swapForDeficit !== undefined) {
-      throw new ChainError(
-        CHAIN_ERROR_CODES.INVALID_ARGUMENT,
-        `addLiquidity refuses swapForDeficit on ${UNISWAP_V3}: this venue cannot swap and mint in ` +
-          'one transaction — SwapRouter02 has no add-liquidity entry point, and the position ' +
-          "manager's multicall is a self-delegatecall into its own selectors, so it can neither swap " +
-          'nor reach the router. This DEX reports supportsAtomicBuild=false, so the executor must ' +
-          'build it as swap-then-add (§42); silently splitting here would break that guarantee.',
-        { poolId: request.poolId, dex: UNISWAP_V3, supportsAtomicBuild: false },
-      );
-    }
 
     const poolAddress = addressFromPoolId(request.poolId, this.chainId, UNISWAP_V3);
     const target = await this.poolReader.resolvePool(poolAddress, UNISWAP_V3);
@@ -781,6 +847,10 @@ export class UniswapV3Adapter implements DexAdapter {
       ],
     });
 
+    // The mint pulls BOTH legs from the wallet to the position manager.
+    await this.ensureAllowance(target.token0.address, this.contracts.positionManager, request.amount0DesiredRaw, request.guard);
+    await this.ensureAllowance(target.token1.address, this.contracts.positionManager, request.amount1DesiredRaw, request.guard);
+
     const txHash = await this.chain.sendTransaction({
       to: this.contracts.positionManager,
       data,
@@ -788,10 +858,31 @@ export class UniswapV3Adapter implements DexAdapter {
       guard: request.guard,
     });
 
-    // The `mint` return values (tokenId, liquidity, amounts) are the *simulated* result of a call that
-    // has only been broadcast. Reading them would require a receipt, which this layer does not wait
-    // for, so the optional fields are left absent rather than filled with the plan's expectations.
-    return { txHash, state: TX_STATES.SUBMITTED };
+    const info = await this.chain.waitForTransaction(txHash);
+    if (info.state !== TX_STATES.CONFIRMED) {
+      throw new ChainError(
+        CHAIN_ERROR_CODES.TX_GUARD_FAILED,
+        `addLiquidity did not succeed on chain (${info.state}, hash ${txHash}); refusing to continue`,
+        { poolId: request.poolId },
+      );
+    }
+
+    // The minted `tokenId` comes from the receipt, not from the mint call's simulation.
+    const logs = await this.chain.getReceiptLogs(txHash);
+    let positionTokenId: bigint | undefined;
+    if (logs !== null) {
+      for (const log of logs) {
+        const topic0 = log.topics[0];
+        const tokenIdTopic = log.topics[1];
+        if (topic0 === undefined || tokenIdTopic === undefined) continue;
+        // `IncreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)`
+        if (topic0 === INCREASE_LIQUIDITY_EVENT_TOPIC) {
+          positionTokenId = BigInt(tokenIdTopic);
+          break;
+        }
+      }
+    }
+    return { txHash, state: TX_STATES.CONFIRMED, ...(positionTokenId === undefined ? {} : { positionTokenId }) };
   }
 
   /**
@@ -821,13 +912,29 @@ export class UniswapV3Adapter implements DexAdapter {
     assertNotZeroAddress(request.recipient, 'removeLiquidity', 'recipient');
 
     const burn = request.liquidityRaw ?? raw.liquidity;
+
+    // A zero-liquidity NFT is an emptied shell (a previous run already paid its principal out via
+    // decrease+collect): the right action is a plain burn, not a refusal that leaves the shell on
+    // `balanceOf` forever.
     if (burn <= 0n) {
-      throw new ChainError(
-        CHAIN_ERROR_CODES.INVALID_ARGUMENT,
-        `position ${request.positionTokenId} has no liquidity to burn (requested ` +
-          `${burn.toString()}, on chain ${raw.liquidity.toString()})`,
-        { positionTokenId: request.positionTokenId.toString(), liquidity: burn.toString() },
-      );
+      const data = encodeFunctionData({
+        abi: UNISWAP_V3_POSITION_MANAGER_ABI,
+        functionName: 'multicall',
+        args: [[this.collectCalldata(request.positionTokenId, request.recipient),
+                encodeFunctionData({
+                  abi: UNISWAP_V3_POSITION_MANAGER_ABI,
+                  functionName: 'burn',
+                  args: [request.positionTokenId],
+                })]],
+      });
+      const txHash = await this.chain.sendTransaction({
+        to: positionManager,
+        data,
+        value: 0n,
+        guard: request.guard,
+      });
+      await this.awaitMined(txHash, 'removeLiquidity(burn shell)');
+      return { txHash, state: TX_STATES.CONFIRMED };
     }
     if (burn > raw.liquidity) {
       throw new ChainError(
@@ -857,10 +964,24 @@ export class UniswapV3Adapter implements DexAdapter {
       ],
     });
     const collect = this.collectCalldata(request.positionTokenId, request.recipient);
+    // A full exit (null liquidity = everything) also burns the emptied NFT, mirroring the Pancake
+    // path: an unburned shell would surface on `balanceOf` as a position that does not exist.
+    const calls =
+      request.liquidityRaw === null
+        ? [
+            decrease,
+            collect,
+            encodeFunctionData({
+              abi: UNISWAP_V3_POSITION_MANAGER_ABI,
+              functionName: 'burn',
+              args: [request.positionTokenId],
+            }),
+          ]
+        : [decrease, collect];
     const data = encodeFunctionData({
       abi: UNISWAP_V3_POSITION_MANAGER_ABI,
       functionName: 'multicall',
-      args: [[decrease, collect]],
+      args: [calls],
     });
 
     const txHash = await this.chain.sendTransaction({
@@ -869,7 +990,9 @@ export class UniswapV3Adapter implements DexAdapter {
       value: 0n,
       guard: request.guard,
     });
-    return { txHash, state: TX_STATES.SUBMITTED };
+    // §5.3.5: the exit's next step re-reads the wallet, so the removal must be a settled fact.
+    await this.awaitMined(txHash, 'removeLiquidity');
+    return { txHash, state: TX_STATES.CONFIRMED };
   }
 
   /**
@@ -902,7 +1025,8 @@ export class UniswapV3Adapter implements DexAdapter {
       value: 0n,
       guard: request.guard,
     });
-    return { txHash, state: TX_STATES.SUBMITTED };
+    await this.awaitMined(txHash, 'collectFees');
+    return { txHash, state: TX_STATES.CONFIRMED };
   }
 
   // -----------------------------------------------------------------------------------------------

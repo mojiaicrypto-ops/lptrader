@@ -22,8 +22,9 @@ import type {
   TxGuardChecks,
 } from '../../src/types/adapters.ts';
 import type { PoolSnapshot } from '../../src/types/market.ts';
+import type { SwapLimits } from '../../src/strategy/swapPlanner.ts';
 import type { PositionPlan } from '../../src/strategy/positionPlanner.ts';
-import type { Address, Hash, Tick, FeeTier } from '../../src/types/primitives.ts';
+import type { Address, Hash, Tick, FeeTier, PoolId } from '../../src/types/primitives.ts';
 import { DEX_IDS } from '../../src/types/primitives.ts';
 
 const USDC = '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d' as Address;
@@ -159,6 +160,9 @@ class RecordingDex implements DexAdapter {
 
   readonly supportsAtomicBuild: boolean;
 
+  /** RAW balances by token, as the post-swap wallet read returns them. */
+  readonly balances: Map<Address, bigint> = new Map();
+
   private readonly behaviour: {
     swap?: SwapExecutionResult | Error;
     add?: LiquidityExecutionResult | Error;
@@ -192,14 +196,33 @@ class RecordingDex implements DexAdapter {
   async getTick(_pool: Address): Promise<Tick> {
     return 0;
   }
-  async quoteSwap(): Promise<SwapQuote> {
-    return quote();
+  async getTokenBalance(token: Address, _holder: Address): Promise<bigint> {
+    return this.balances.get(token.toLowerCase() as Address) ?? 10n ** 21n;
+  }
+  async quoteSwap(request: SwapExecutionRequest extends never ? never : { readonly tokenIn: Address; readonly tokenOut: Address; readonly amountIn: bigint; readonly poolId: PoolId; readonly ttlSeconds: number }): Promise<SwapQuote> {
+    return quote({
+      poolId: request.poolId,
+      tokenIn: request.tokenIn,
+      tokenOut: request.tokenOut,
+      amountInRaw: request.amountIn,
+      amountOutRaw: request.amountIn,
+      amountOutMinimumRaw: request.amountIn,
+      amountInUsd: Number(request.amountIn) / 1e18,
+      quotedAt: REAL_NOW(),
+      expiresAt: new Date(Date.now() + 30_000).toISOString(),
+      priceImpact: 0.0001,
+      slippageTolerance: LIMITS.maxSlippage,
+    });
   }
   async executeSwap(request: SwapExecutionRequest): Promise<SwapExecutionResult> {
     this.calls.push('executeSwap');
     this.swapRequests.push(request);
     const behaviour = this.behaviour.swap;
     if (behaviour instanceof Error) throw behaviour;
+    // The swap SPENDS its `amountIn` from the wallet: the exit converter re-reads this balance to
+    // verify the wallet is back to pure U (§5.3.2), so a fake that never updated would look unfixed.
+    const tokenIn = request.quote.tokenIn.toLowerCase() as Address;
+    if (this.balances.has(tokenIn)) this.balances.set(tokenIn, 0n);
     return behaviour ?? { txHash: this.nextHash('swap'), state: 'CONFIRMED', amountInRaw: 1n, amountOutRaw: 2n };
   }
   async addLiquidity(request: AddLiquidityRequest): Promise<LiquidityExecutionResult> {
@@ -223,10 +246,15 @@ class RecordingDex implements DexAdapter {
     if (behaviour instanceof Error) throw behaviour;
     return behaviour ?? { txHash: '0xcollect' as Hash, state: 'CONFIRMED' };
   }
+  /** Position legs served to the exit path (a full exit reads them BEFORE the burn). */
+  positionRecord: LpPositionView | null = null;
   async getPosition(_tokenId: bigint): Promise<LpPositionView | null> {
-    return null;
+    return this.positionRecord;
   }
 }
+
+/** Wall-clock now, so TTL checks on live-quoted fakes always pass. */
+const REAL_NOW = (): string => new Date().toISOString();
 
 /** Approves everything, so these tests exercise the executor rather than the gate. */
 const alwaysApprove: Notifier = {
@@ -240,7 +268,14 @@ const alwaysApprove: Notifier = {
   query: async () => '',
 };
 
-function harness(options: { dex: DexAdapter; notifier?: Notifier; state?: BotState; now?: string }) {
+function harness(options: {
+  dex: DexAdapter;
+  notifier?: Notifier;
+  state?: BotState;
+  now?: string;
+  swapLimits?: (poolId: PoolId) => SwapLimits;
+  quoteTtlSeconds?: number;
+}) {
   // Plain `:memory:` is private per open since the store owner fixed the singleton-map aliasing
   // (KI-16), so no unique URI or closeDatabase pairing is needed for isolation.
   const db = openDatabase(':memory:');
@@ -257,6 +292,8 @@ function harness(options: { dex: DexAdapter; notifier?: Notifier; state?: BotSta
     dex: options.dex,
     txStore,
     stateMachine,
+    ...(options.swapLimits === undefined ? {} : { swapLimits: options.swapLimits }),
+    ...(options.quoteTtlSeconds === undefined ? {} : { quoteTtlSeconds: options.quoteTtlSeconds }),
     approvalGate: gate,
     currentState: () => state,
   });
@@ -361,55 +398,6 @@ describe('§40/§41 swap gate runs before encoding', () => {
   });
 });
 
-describe('§42 atomic build', () => {
-  it('produces exactly ONE adapter send and carries the trade in the add-liquidity call', async () => {
-    const dex = new RecordingDex(true);
-    const h = harness({ dex });
-
-    const outcome = await h.executor.buildPosition(buildInput());
-
-    expect(outcome.ok).toBe(true);
-    expect(dex.calls).toEqual(['addLiquidity']);
-    expect(dex.swapRequests).toEqual([]);
-    expect(dex.addRequests).toHaveLength(1);
-    const request = dex.addRequests[0];
-    expect(request?.swapForDeficit).toBeDefined();
-    expect(request?.swapForDeficit?.quote.tokenIn).toBe(USDC);
-    expect(request?.swapForDeficit?.atomic).toBe(true);
-  });
-
-  it('does NOT fall back to the two-transaction path when the atomic build throws', async () => {
-    // A venue advertising atomic support that then fails is an unexpected state. Retrying as
-    // swap-then-add would send a swap the operator never approved under that shape.
-    const dex = new RecordingDex(true, { add: new Error('smart router reverted: TICK_ORDER') });
-    const h = harness({ dex });
-
-    const outcome = await h.executor.buildPosition(buildInput());
-
-    expect(outcome.ok).toBe(false);
-    expect(outcome.refusal).toBe(BUILD_REFUSALS.ADAPTER_FAILED);
-    expect(dex.calls).toEqual(['addLiquidity']);
-    expect(dex.swapRequests).toEqual([]);
-  });
-
-  it('parks in a partial outcome when the atomic call reports one', async () => {
-    const dex = new RecordingDex(true, {
-      add: {
-        txHash: '0xpartial' as Hash,
-        state: 'CONFIRMED',
-        partial: { completedSteps: ['swap'], failedStep: 'addLiquidity', reason: 'slippage', requiresManualReview: true },
-      },
-    });
-    const h = harness({ dex });
-
-    const outcome = await h.executor.buildPosition(buildInput());
-
-    expect(outcome.ok).toBe(false);
-    expect(outcome.partial?.failedStep).toBe('addLiquidity');
-    expect(outcome.partial?.completedSteps).toEqual(['swap']);
-  });
-});
-
 describe('§42/§43 two-transaction build', () => {
   it('sends swap then addLiquidity when the venue cannot combine', async () => {
     const dex = new RecordingDex(false);
@@ -419,7 +407,6 @@ describe('§42/§43 two-transaction build', () => {
 
     expect(outcome.ok).toBe(true);
     expect(dex.calls).toEqual(['executeSwap', 'addLiquidity']);
-    expect(dex.addRequests[0]?.swapForDeficit).toBeUndefined();
   });
 
   it('reports a §43 partial when the swap lands but the mint fails, and never retries', async () => {
@@ -458,12 +445,11 @@ describe('§42/§43 two-transaction build', () => {
 });
 
 describe('§98 the recorded transaction reflects what actually went out', () => {
-  it('records the atomic build on the PRIMARY key, so recovery can resolve it', async () => {
-    // A bug found in independent review: the atomic path recorded the hash under a derived `#add` key and
-    // left the primary row in CREATED with no hash. Consequences: `findUnresolved` reported a transaction
-    // that can never be resolved by a chain query (there is no hash to query), and the audit trail claimed
-    // the build never went out while a transaction had confirmed.
-    const dex = new RecordingDex(true);
+  it('records the swap on the PRIMARY key, so recovery can resolve the primary intent', async () => {
+    // A bug found in independent review (on the old atomic shape): recording under a derived key alone
+    // left the primary row in CREATED with no hash, so `findUnresolved` reported a transaction that can
+    // never be resolved by a chain query. The primary intent must own the hash it actually sent.
+    const dex = new RecordingDex(false);
     const h = harness({ dex });
 
     const outcome = await h.executor.buildPosition(buildInput());
@@ -471,12 +457,13 @@ describe('§98 the recorded transaction reflects what actually went out', () => 
 
     const primary = h.txStore.latestAttempt('build-1');
     expect(primary?.state).toBe('SUBMITTED');
-    expect(primary?.txHash).toBe('0xadd1');
-    expect(primary?.purpose).toBe('atomic_build');
+    expect(primary?.txHash).toBe('0xswap1');
+    expect(primary?.purpose).toBe('swap');
+    expect(h.txStore.latestAttempt(addKey('build-1'))?.txHash).toBe('0xadd1');
 
-    // The recorded hash resolves the record, and nothing is left claiming to be in flight.
+    // Resolving the recorded hash clears it from the unresolved set; the mint leg resolves on its own key.
+    h.txStore.applyChainObservation('0xswap1' as Hash, { state: 'CONFIRMED', reason: 'mined' });
     h.txStore.applyChainObservation('0xadd1' as Hash, { state: 'CONFIRMED', reason: 'mined' });
-    expect(h.txStore.latestAttempt('build-1')?.state).toBe('CONFIRMED');
     expect(h.txStore.findUnresolved()).toEqual([]);
   });
 
@@ -495,17 +482,16 @@ describe('§98 the recorded transaction reflects what actually went out', () => 
     // The second bug from review: the intent was recorded with attempt 1 unconditionally, so after a
     // REVERTED observation the retry's row was the OLD one (returned unchanged) and `markSubmitted` then
     // refused the REVERTED row — the documented §98 retry path was unusable.
-    //
-    // Tested on the atomic venue, where one build is one transaction on one key, so this isolates the
-    // attempt-numbering fix. (For a two-transaction build the mint has its own key, and a retry while that
-    // key's previous attempt is unresolved is separately refused — see the test below.)
-    const dex = new RecordingDex(true);
+    const dex = new RecordingDex(false);
     const h = harness({ dex });
 
     const first = await h.executor.buildPosition(buildInput());
     expect(first.ok).toBe(true);
-    expect(h.txStore.latestAttempt('build-1')?.txHash).toBe('0xadd1');
+    expect(h.txStore.latestAttempt('build-1')?.txHash).toBe('0xswap1');
 
+    // Both legs are observed as definitely failed before a retry is legitimate: a SUBMITTED leg is
+    // unresolved (§96), and only definite failures may open a new attempt (§97).
+    h.txStore.applyChainObservation('0xswap1' as Hash, { state: 'REVERTED', reason: 'reverted on chain' });
     h.txStore.applyChainObservation('0xadd1' as Hash, { state: 'REVERTED', reason: 'reverted on chain' });
     expect(h.txStore.latestAttempt('build-1')?.state).toBe('REVERTED');
 
@@ -514,14 +500,14 @@ describe('§98 the recorded transaction reflects what actually went out', () => 
 
     const attempts = h.txStore.listAttempts('build-1');
     expect(attempts.map((record) => record.attempt)).toEqual([1, 2]);
-    expect(attempts[1]?.txHash).toBe('0xadd2');
+    expect(attempts[1]?.txHash).toBe('0xswap2');
     expect(attempts[1]?.state).toBe('SUBMITTED');
   });
 
   it('refuses to open a new attempt while the previous one is still unresolved (§96)', async () => {
     // The boundary of the fix above: a new attempt is only legitimate after a DEFINITE failure. While the
     // prior attempt is SUBMITTED, the store refuses — because re-sending could double-execute.
-    const dex = new RecordingDex(true);
+    const dex = new RecordingDex(false);
     const h = harness({ dex });
 
     await h.executor.buildPosition(buildInput());
@@ -529,7 +515,7 @@ describe('§98 the recorded transaction reflects what actually went out', () => 
 
     expect(second.ok).toBe(false);
     expect(second.refusal).toBe(BUILD_REFUSALS.ALREADY_EXECUTED);
-    expect(dex.calls).toEqual(['addLiquidity']);
+    expect(dex.calls).toEqual(['executeSwap', 'addLiquidity']);
   });
 });
 
@@ -603,14 +589,14 @@ describe('§97 idempotency', () => {
 
     const first = await h.executor.buildPosition(input);
     expect(first.ok).toBe(true);
-    expect(dex.calls).toEqual(['addLiquidity']);
+    expect(dex.calls).toEqual(['executeSwap', 'addLiquidity']);
 
     const second = await h.executor.buildPosition(input);
 
     expect(second.ok).toBe(false);
     expect(second.refusal).toBe(BUILD_REFUSALS.ALREADY_EXECUTED);
     // The key thing: the adapter was not called a second time.
-    expect(dex.calls).toEqual(['addLiquidity']);
+    expect(dex.calls).toEqual(['executeSwap', 'addLiquidity']);
   });
 });
 
@@ -631,9 +617,36 @@ describe('automatic operations need no approval (§91/D2)', () => {
     expect(dex.calls).toEqual(['collectFees']);
   });
 
-  it('exits a position automatically from RISK_REVIEW (§51 — risk work is not blocked on a human)', async () => {
-    const dex = new RecordingDex(true);
-    const h = harness({ dex, notifier: noopNotifier, state: BOT_STATES.RISK_REVIEW });
+  it('exits a position automatically from RISK_REVIEW and converts the legs to U (§5.3.2)', async () => {
+    const dex = new RecordingDex(false);
+    // The exit quotes and swaps REAL balances: provision the fake with a wallet holding only the
+    // two legs (0 stock + more than a dust-level quote token habit will vary by leg names).
+    const LEG0 = '0x1111222233334444555566667777888899990000' as Address; // stock leg (not U)
+    const LEG1 = '0x55d398326f99059ff775485246999027b3197955' as Address;  // USDT (U)
+    dex.positionRecord = {
+      poolId: POOL,
+      positionTokenId: 1n,
+      owner: '0x1111111111111111111111111111111111111111' as Address,
+      token0: LEG0,
+      token1: LEG1,
+      feeTier: 100,
+      tickLower: 0,
+      tickUpper: 100,
+      liquidity: 1n,
+      feeGrowthInside0LastX128: 0n,
+      feeGrowthInside1LastX128: 0n,
+      tokensOwed0Raw: 0n,
+      tokensOwed1Raw: 0n,
+    };
+        dex.balances.set(LEG0.toLowerCase() as Address, 0n); // §5.3.1: wallet held no stock before build
+    dex.balances.set(LEG1.toLowerCase() as Address, 10n ** 18n);
+    const h = harness({
+      dex,
+      notifier: noopNotifier,
+      state: BOT_STATES.RISK_REVIEW,
+      swapLimits: () => LIMITS,
+      quoteTtlSeconds: 30,
+    });
 
     const outcome = await h.executor.exitPosition({
       poolId: POOL,
@@ -642,13 +655,63 @@ describe('automatic operations need no approval (§91/D2)', () => {
       amount0MinRaw: 0n,
       amount1MinRaw: 0n,
       recipient: '0x1111111111111111111111111111111111111111' as Address,
-      deadline: { kind: 'previous-blockhash', blockhash: ('0x' + 'ab'.repeat(32)) as Hash },
+      deadline: { kind: 'timestamp', unixSeconds: 1_758_159_999 + 600 },
       guard: guard(),
       idempotencyKey: 'exit-1',
     });
 
     expect(outcome.ok).toBe(true);
+    expect(outcome.reason).toContain('already pure U');
+    // Leg0 was dust (skipped); leg1 IS the U leg (skipped) — so no conversion swap was needed.
     expect(dex.calls).toEqual(['removeLiquidity']);
+  });
+
+  it('converts a non-U exit leg by quoting and swapping the ACTUAL balance (§5.3.2)', async () => {
+    const dex = new RecordingDex(false);
+    const LEG0 = '0x1111222233334444555566667777888899990000' as Address;
+    const LEG1 = '0x55d398326f99059ff775485246999027b3197955' as Address;
+    dex.positionRecord = {
+      poolId: POOL,
+      positionTokenId: 1n,
+      owner: '0x1111111111111111111111111111111111111111' as Address,
+      token0: LEG0,
+      token1: LEG1,
+      feeTier: 100,
+      tickLower: 0,
+      tickUpper: 100,
+      liquidity: 1n,
+      feeGrowthInside0LastX128: 0n,
+      feeGrowthInside1LastX128: 0n,
+      tokensOwed0Raw: 0n,
+      tokensOwed1Raw: 0n,
+    };
+    dex.balances.set(LEG0.toLowerCase() as Address, 5n * 10n ** 18n); // a real residual → must swap
+    dex.balances.set(LEG1.toLowerCase() as Address, 10n ** 18n);
+    const h = harness({
+      dex,
+      notifier: noopNotifier,
+      state: BOT_STATES.RISK_REVIEW,
+      swapLimits: () => LIMITS,
+      quoteTtlSeconds: 30,
+    });
+
+    const outcome = await h.executor.exitPosition({
+      poolId: POOL,
+      positionTokenId: 1n,
+      liquidityRaw: null,
+      amount0MinRaw: 0n,
+      amount1MinRaw: 0n,
+      recipient: '0x1111111111111111111111111111111111111111' as Address,
+      deadline: { kind: 'timestamp', unixSeconds: 1_758_159_999 + 600 },
+      guard: guard(),
+      idempotencyKey: 'exit-1',
+    });
+
+    expect(outcome.ok).toBe(true);
+    expect(dex.calls).toEqual(['removeLiquidity', 'executeSwap']);
+    expect(dex.swapRequests[0]?.quote.tokenIn).toBe(LEG0);
+    expect(dex.swapRequests[0]?.quote.tokenOut).toBe(LEG1); // the U leg (BSC USDT)
+    expect(dex.swapRequests[0]?.quote.amountInRaw).toBe(5n * 10n ** 18n);
   });
 
   it('blocks collection while halted (§58/§66 read-only states)', async () => {

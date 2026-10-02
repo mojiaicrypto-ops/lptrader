@@ -128,13 +128,11 @@ export interface DexAdapter {
    * §42 capability of the DEPLOYED contracts — a static property, not a runtime query, so it is a
    * field rather than a method (a method would only add a way to get it wrong).
    *
-   * `true`  — this venue can swap and mint in a single transaction (PancakeSwap SmartRouter
-   *           `swapAndAddCallParameters`); the adapter MUST honour `swapForDeficit`.
-   * `false` — a build must be swap-then-add across two transactions (plain Uniswap V3: its
-   *           `multicall` is a self-delegatecall and cannot swap — research §4.2); the adapter
-   *           MUST throw if `swapForDeficit` is passed rather than silently splitting the build.
-   *
-   * The executor reads this to choose the build shape and must never branch on `dex` directly.
+   * D3.7 (2026-10-02): builds are uniformly TWO transactions — swap → wait for confirmation →
+   * read the wallet → mint — because §5.3.3 (mint from post-swap ACTUAL balances) requires the
+   * swap outcome to be a settled fact, which a pre-encoded combined call cannot provide. The
+   * executor no longer branches on this flag; it is retained only as a description of the deployed
+   * contracts' capability.
    */
   readonly supportsAtomicBuild: boolean;
   /** §12 whitelist check; throws when the DEX is not whitelisted for this chain. */
@@ -144,6 +142,9 @@ export interface DexAdapter {
   getPoolPrice(poolAddress: Address): Promise<PoolPriceView>;
   getLiquidity(poolAddress: Address): Promise<bigint>;
   getTick(poolAddress: Address): Promise<Tick>;
+
+  /** RAW balance of a token for a holder, read at call time (§5.3.3 mint sizing). */
+  getTokenBalance(token: Address, holder: Address): Promise<bigint>;
 
   /** §39/§40 quote with an explicit sender so allowance/permit paths are realistic. */
   quoteSwap(request: SwapQuoteRequest): Promise<SwapQuote>;
@@ -242,12 +243,6 @@ export interface SwapExecutionRequest {
  * combine (plain Uniswap V3 SwapRouter / NonfungiblePositionManager cannot — research §4.2) MUST
  * throw instead of sending anything.
  */
-export interface AtomicSwapForDeficit {
-  /** The deficit swap. Its `amountInRaw` is the swap leg of the combined call. */
-  readonly quote: SwapQuote;
-  readonly atomic: true;
-}
-
 /**
  * §42 deadline. The `previousBlockhash` variant is preferred for unattended runs: it is immune
  * to clock drift, whereas a timestamp deadline can revert when the local clock is off.
@@ -284,9 +279,9 @@ export interface PartialExecutionInfo {
 /**
  * §33-§38 add liquidity. Amounts are RAW; the adapter converts to the SDK's expectations.
  *
- * `swapForDeficit` is what makes the §42 atomic build expressible: the combined calldata needs the
- * trade AND the position in one call, and the adapter that builds that calldata is the only place
- * that can decide how. Without it, `DexAdapter` could only offer swap-then-add as two transactions.
+ * The amounts are the CALLER's responsibility (D3.7): the executor reads the wallet AFTER the
+ * funding swap has landed and passes those figures here. The adapter mints `L = min(L0, L1)` and
+ * the pool refunds whatever the smaller leg leaves over.
  */
 export interface AddLiquidityRequest {
   readonly poolId: PoolId;
@@ -301,16 +296,6 @@ export interface AddLiquidityRequest {
   readonly deadline: DeadlineSpec;
   readonly idempotencyKey: string;
   readonly guard: TxGuardChecks;
-  /**
-   * When present, the adapter MUST swap `quote.amountInRaw` and mint the position in a single
-   * transaction on venues that support it (PancakeSwap SmartRouter `swapAndAddCallParameters`), and
-   * MUST throw — never silently split into swap + addLiquidity — when the venue cannot.
-   *
-   * The executor sets this on the atomic path only. On the plain path it calls `executeSwap` first
-   * and then `addLiquidity` without this field, accepting two transactions plus the §43 partial
-   * state that follows from them.
-   */
-  readonly swapForDeficit?: AtomicSwapForDeficit;
 }
 
 export interface TickRangeRef {

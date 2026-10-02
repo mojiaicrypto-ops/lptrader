@@ -36,14 +36,18 @@ import type { ApprovalGate, GateOutcome } from './approvalGate.ts';
 import type { TxStore } from '../store/txStore.ts';
 import type { StateMachine } from '../strategy/stateMachine.ts';
 import { APPROVAL_KINDS } from '../types/notifier.ts';
-import { SWAP_PURPOSES } from '../types/adapters.ts';
+import { SWAP_PURPOSES, type LpPositionView } from '../types/adapters.ts';
 import { silentLogger, type Logger } from '../util/logger.ts';
+import { BSC_ADDRESSES } from '../config/builtins.ts';
 import { renderRows, usd } from '../notify/messageFormat.ts';
 import { checkBuildAllocation, type AllocationLimits } from '../strategy/allocation.ts';
 import { checkWriteAllowed, WRITE_ACTIONS } from '../strategy/stateMachine.ts';
 import { evaluateSwapQuote, planSwapIntent, type SwapLimits } from '../strategy/swapPlanner.ts';
 import type { PositionPlan } from '../strategy/positionPlanner.ts';
 import { canOpenNewAttempt, RAW_TX_FORMATS, TX_PURPOSES } from '../store/txStore.ts';
+
+/** §5.3.1: the stablecoin the strategy settles into. U = USDT (§10 preferred reserve). */
+const DEFAULT_U_TOKEN = BSC_ADDRESSES.USDT as Address;
 
 /** A build refuses for a named reason; it never throws for a business refusal. */
 export const BUILD_REFUSALS = {
@@ -54,6 +58,8 @@ export const BUILD_REFUSALS = {
   APPROVAL_DENIED: 'approval_denied',
   ALREADY_EXECUTED: 'idempotency_key_already_used',
   ADAPTER_FAILED: 'adapter_failed',
+  /** The post-swap wallet cannot fund the mint (§5.3.3 refusal path). */
+  POST_SWAP_SHORTFALL: 'post_swap_shortfall',
 } as const;
 export type BuildRefusal = (typeof BUILD_REFUSALS)[keyof typeof BUILD_REFUSALS];
 
@@ -113,6 +119,14 @@ export interface PositionExecutorDeps {
   readonly approvalGate: ApprovalGate;
   /** Current bot state; injected so the executor never caches a stale gate verdict. */
   readonly currentState: () => BotState;
+  /**
+   * §40 limits for the exit-conversion swaps. Absent (legacy wiring / read-only builds) the exit
+   * still removes liquidity but CANNOT convert the legs — the outcome then says so explicitly with
+   * the residual balances, instead of silently violating §5.3.2.
+   */
+  readonly swapLimits?: (poolId: PoolId) => SwapLimits;
+  /** §41 TTL for the exit-conversion quotes. */
+  readonly quoteTtlSeconds?: number;
   /** Where the build narrates its steps. Silent unless the composition root supplies one. */
   readonly logger?: Logger;
 }
@@ -127,6 +141,8 @@ export interface PositionExecutorDeps {
  * to be visible.
  */
 export class PositionExecutor {
+  /** Legs cached from the position read at the START of an exit — the burn erases them. */
+  private exitLegs: LpPositionView | null = null;
   private readonly deps: PositionExecutorDeps;
   private readonly log: Logger;
 
@@ -250,6 +266,10 @@ export class PositionExecutor {
 
     const duplicate = this.checkIdempotencyKey(input.idempotencyKey);
     if (duplicate !== null) return duplicate;
+    // The legs are read while the position still exists — after a full exit the NFT is burned and
+    // nothing on chain remembers which tokens it held.
+    this.exitLegs = await this.deps.dex.getPosition(input.positionTokenId).catch(() => null);
+
 
     this.deps.txStore.recordIntended(
       {
@@ -291,10 +311,181 @@ export class PositionExecutor {
           },
         };
       }
-      return { ok: true, reason: 'liquidity removed', addLiquidityTxHash: result.txHash };
+
+      /*
+       * 撤池后必须回到纯 U (§5.3.2): the removal credited token0 + token1 + fees to the wallet;
+       * every non-U leg is converted here, each swap confirmed before the next read.
+       */
+      return this.convertProceedsToU(input);
     } catch (error) {
       return this.adapterFailure(input.idempotencyKey, error);
     }
+  }
+
+  /**
+   * The second act of an exit: sell whatever is not U (§5.3.2), in the position's own pool — the
+   * market that just priced the legs is the market to unwind them in.
+   *
+   * Each conversion is an independently idempotent swap (`<exitKey>#convert<n>`): a crash between
+   * leg conversions must not re-sell a leg that already sold (§97). When the composition root did
+   * not wire §40 limits, this is not a silent skip — the outcome reports the residual balances.
+   */
+  private async convertProceedsToU(input: {
+    readonly poolId: PoolId;
+    readonly positionTokenId: bigint;
+    readonly idempotencyKey: string;
+    readonly guard: TxGuardChecks;
+    readonly deadline: RemoveLiquidityRequest['deadline'];
+    readonly recipient: Address;
+  }): Promise<ExecutionOutcome> {
+    const legs = await this.poolLegs(input);
+    if (legs === null) {
+      return {
+        ok: false,
+        reason:
+          'liquidity removed, but the proceeds could not be identified (the position record was ' +
+          'already burned and no leg metadata was supplied); the wallet is NOT back to pure U',
+        partial: {
+          completedSteps: ['removeLiquidity'],
+          failedStep: 'convertToU',
+          reason: 'position metadata unavailable after the burn; legs unknown',
+        },
+      };
+    }
+
+    const limits = this.deps.swapLimits?.(input.poolId);
+    const convertTo = DEFAULT_U_TOKEN;
+    const ttl = this.deps.quoteTtlSeconds ?? 30;
+    let convertIndex = 0;
+    const converted: Address[] = [];
+
+    for (const leg of legs) {
+      if (leg.address.toLowerCase() === convertTo.toLowerCase()) continue;
+      const held = await this.deps.dex.getTokenBalance(leg.address, input.recipient);
+      // Dust below a hundredth of a whole unit is not worth a swap; a larger residual violates §5.3.2.
+      const DUST = 10n ** BigInt(Math.max(leg.decimals - 4, 0)); // 0.0001 units (for a ~$300 token, ≈$0.03)
+      if (held <= DUST) continue;
+
+      if (limits === undefined) {
+        return {
+          ok: false,
+          reason:
+            `liquidity removed, but no swap limits were wired for the exit conversion, so the ` +
+            `${leg.address} proceeds (${held.toString()} raw) were NOT converted to ${convertTo}; ` +
+            'the wallet is NOT back to pure U (§5.3.2)',
+          partial: {
+            completedSteps: ['removeLiquidity'],
+            failedStep: 'convertToU',
+            reason: 'swapLimits not injected into PositionExecutor',
+          },
+        };
+      }
+
+      const quote = await this.deps.dex.quoteSwap({
+        poolId: input.poolId,
+        tokenIn: leg.address,
+        tokenOut: convertTo,
+        amountIn: held,
+        ttlSeconds: ttl,
+      });
+      this.log.info('exit', 'quoting the exit conversion', {
+        token: leg.address,
+        amountIn: held.toString(),
+        out: quote.amountOutRaw.toString(),
+        impact: quote.priceImpact,
+      });
+      const gate = evaluateSwapQuote(quote, limits, new Date().toISOString());
+      if (!gate.ok) {
+        return {
+          ok: false,
+          reason:
+            `exit conversion quote rejected (§40/§41): ${gate.reasons.join('; ')} — the ` +
+            `${leg.address} proceeds are still in the wallet`,
+          partial: {
+            completedSteps: ['removeLiquidity'],
+            failedStep: 'convertToU',
+            reason: gate.reasons.join('; '),
+          },
+        };
+      }
+
+      const convertKey = `${input.idempotencyKey}#convert${convertIndex}`;
+      convertIndex += 1;
+      this.deps.txStore.recordIntended(
+        {
+          idempotencyKey: convertKey,
+          chainId: this.deps.dex.chainId,
+          purpose: TX_PURPOSES.SWAP,
+          rawTx: JSON.stringify({
+            kind: 'convertToU',
+            poolId: input.poolId,
+            tokenIn: leg.address,
+            tokenOut: convertTo,
+            amountInRaw: held.toString(),
+            amountOutMinimumRaw: quote.amountOutMinimumRaw.toString(),
+          }),
+          rawTxFormat: RAW_TX_FORMATS.CALL_REQUEST,
+          attempt: 1,
+        },
+        input.guard,
+      );
+
+      const swap = await this.deps.dex.executeSwap({
+        quote,
+        deadline: input.deadline,
+        purpose: SWAP_PURPOSES.EXIT_POSITION,
+        idempotencyKey: convertKey,
+        guard: input.guard,
+      });
+      this.deps.txStore.markSubmitted(convertKey, swap.txHash);
+      converted.push(leg.address);
+    }
+
+    // Post-verify: non-U balances must be dust (§5.3.2 is a state, not a claim).
+    const leftovers: Array<{ readonly token: Address; readonly balanceRaw: bigint }> = [];
+    for (const leg of legs) {
+      if (leg.address.toLowerCase() === convertTo.toLowerCase()) continue;
+      const held = await this.deps.dex.getTokenBalance(leg.address, input.recipient);
+      const DUST = 10n ** BigInt(Math.max(leg.decimals - 4, 0)); // 0.0001 units (for a ~$300 token, ≈$0.03)
+      if (held > DUST) leftovers.push({ token: leg.address, balanceRaw: held });
+    }
+    if (leftovers.length > 0) {
+      return {
+        ok: false,
+        reason:
+          `liquidity removed and conversions were sent, but the wallet still holds non-U legs: ` +
+          leftovers.map((l) => `${l.token} ${l.balanceRaw.toString()}`).join(', '),
+        partial: {
+          completedSteps: ['removeLiquidity', ...converted.map(() => 'convertToU')],
+          failedStep: 'verifyPureU',
+          reason: leftovers.map((l) => `${l.token} ${l.balanceRaw.toString()}`).join(', '),
+        },
+      };
+    }
+
+    return {
+      ok: true,
+      reason:
+        converted.length === 0
+          ? 'liquidity removed; proceeds were already pure U'
+          : 'liquidity removed and proceeds converted to U (§5.3.2)',
+    };
+  }
+
+  /**
+   * Legs of the position's pool, cached from the position read at the START of the exit — a full
+   * exit burns the NFT, and afterwards nothing on chain remembers which tokens it held.
+   */
+  private async poolLegs(input: {
+    readonly poolId: PoolId;
+    readonly positionTokenId: bigint;
+  }): Promise<readonly { readonly address: Address; readonly decimals: number }[] | null> {
+    const position = this.exitLegs ?? (await this.deps.dex.getPosition(input.positionTokenId).catch(() => null));
+    if (position === null) return null;
+    return [
+      { address: position.token0, decimals: 18 },
+      { address: position.token1, decimals: 18 },
+    ];
   }
 
   /**
@@ -374,9 +565,8 @@ export class PositionExecutor {
     // would then refuse the REVERTED row — i.e. the documented retry path would be broken.
     this.recordIntent(input);
 
-    return this.deps.dex.supportsAtomicBuild
-      ? this.runAtomicBuild(input)
-      : this.runTwoStepBuild(input);
+    // D3.7: the two-transaction build is the ONLY shape, on every venue.
+    return this.runTwoStepBuild(input);
   }
 
   /**
@@ -399,56 +589,13 @@ export class PositionExecutor {
   }
 
   /**
-   * §42 atomic: exactly ONE adapter send.
+   * The build, uniformly as TWO transactions on every venue (§5.4/D3.7):
+   *   swap → (adapter confirms on chain) → re-read the wallet → mint with the ACTUAL balances
    *
-   * The `swapForDeficit` field is what carries the trade into the add-liquidity calldata; passing it
-   * makes combining mandatory, so a venue that cannot must throw rather than quietly return to the
-   * two-step path (which the executor would then misinterpret as a completed atomic build).
-   */
-  /**
-   * §42 atomic: exactly ONE adapter send, and that send IS the primary intent's transaction.
-   *
-   * The record is updated on the PRIMARY key rather than a derived `#add` key. That matters for §98
-   * recovery: a derived row would leave the primary sitting in `CREATED` with no hash, so `findUnresolved`
-   * would report a transaction that can never be resolved by a chain query (there is no hash to query),
-   * and the audit trail would claim the build never went out while a transaction had confirmed.
-   */
-  private async runAtomicBuild(input: BuildPositionInput): Promise<ExecutionOutcome> {
-    try {
-      const result = await this.deps.dex.addLiquidity({
-        ...this.addLiquidityRequest(input),
-        swapForDeficit: { quote: input.quote, atomic: true },
-      });
-
-      // The single transaction is both the swap and the mint, so it belongs to the primary intent.
-      this.deps.txStore.markSubmitted(input.idempotencyKey, result.txHash);
-
-      if (result.partial !== undefined) {
-        return this.partialOutcome('atomic build', result.txHash, result.partial);
-      }
-
-      return {
-        ok: true,
-        reason: 'position built atomically (swap + add liquidity in one transaction)',
-        addLiquidityTxHash: result.txHash,
-        ...(result.positionTokenId === undefined
-          ? {}
-          : { positionTokenId: result.positionTokenId }),
-      };
-    } catch (error) {
-      // Deliberately NOT retried on the two-step path: a venue advertising atomic support that then
-      // fails is an unexpected-state condition, and silently splitting the build would send a swap the
-      // operator never approved under that shape.
-      return this.adapterFailure(input.idempotencyKey, error);
-    }
-  }
-
-  /**
-   * Two-transaction build (§42 fallback for venues whose router cannot combine).
-   *
-   * The window between the two sends is exactly why this path is worse, and why the swap result must
-   * be checked before the mint: once the swap has landed, the planned ratio is stale and the mint
-   * has to be derived from live balances rather than the pre-swap plan.
+   * The window between the two sends is not a hazard to be closed with atomicity but a state to be
+   * read correctly: the swap never fills at the mid price the plan used (fees + slippage), so the
+   * planned ratio is stale by the time the mint runs. The mint sizes from the wallet AFTER the
+   * swap (§5.3.3), and the 30% reserve is kept by capping the quote leg at the plan.
    */
   private async runTwoStepBuild(input: BuildPositionInput): Promise<ExecutionOutcome> {
     const swapRequest: SwapExecutionRequest = {
@@ -469,35 +616,93 @@ export class PositionExecutor {
       if (swap.partial !== undefined) {
         return this.partialOutcome('swap', swap.txHash, swap.partial);
       }
+      // The adapter has already confirmed the swap on chain (§5.3.5) — the wallet read below is
+      // a settled fact, not an in-flight intent.
     } catch (error) {
       return this.adapterFailure(input.idempotencyKey, error);
     }
 
+    /*
+     * Re-read the wallet (§5.3.3): the plan's figures are stale by exactly the swap's fee+slippage.
+     *
+     * Stock leg: the whole holding goes in — by §5.3.1 the wallet held none before the build, so
+     * this is what the swap produced. Quote leg: capped at the PLAN, not the wallet, so the 30%
+     * reserve stays out of the position; the pool refunds whatever the tighter leg leaves.
+     */
+    const held0 = await this.deps.dex.getTokenBalance(input.pool.token0, input.walletAddress);
+    const held1 = await this.deps.dex.getTokenBalance(input.pool.token1, input.walletAddress);
+    if (held0 <= 0n || held1 <= 0n) {
+      return {
+        ok: false,
+        refusal: BUILD_REFUSALS.POST_SWAP_SHORTFALL,
+        reason:
+          `after the swap (${swapTxHash}) the wallet holds ${held0.toString()} of ${input.pool.token0} ` +
+          `and ${held1.toString()} of ${input.pool.token1}; nothing can be minted from that`,
+        swapTxHash,
+        partial: {
+          completedSteps: ['swap'],
+          failedStep: 'addLiquidity',
+          reason: 'post-swap wallet read returned a zero balance on at least one leg',
+        },
+      };
+    }
+    const desired0 = held0;
+    const desired1 = input.plan.amount1 < held1 ? input.plan.amount1 : held1;
+    if (desired1 <= 0n) {
+      return {
+        ok: false,
+        refusal: BUILD_REFUSALS.POST_SWAP_SHORTFALL,
+        reason: `the plan's quote leg (${input.plan.amount1.toString()}) exceeds the post-swap wallet (${held1.toString()})`,
+        swapTxHash,
+        partial: {
+          completedSteps: ['swap'],
+          failedStep: 'addLiquidity',
+          reason: 'quote leg underfunded after the swap',
+        },
+      };
+    }
+
+    /*
+     * Minimums, re-derived from the ACTUAL amounts (§5.3.3) at the tolerance the gate approved.
+     * The approved intent's ratios (min/desired of the PLAN) are applied to the actual figures —
+     * NOT the plan's raw minimums, which no longer correspond to anything.
+     *
+     * The stock leg binds L (the swap pays fees, yielding slightly less stock than planned), so
+     * the mint consumes quote proportionally: used1 ≈ plan.amount1 × desired0/plan.amount0.
+     * Bounding min1 by that estimate keeps the check honest without asking the pool to accept
+     * more than it will actually spend.
+     */
+    const ratioOf = (min: bigint, desired: bigint): bigint => (desired <= 0n ? 10_000n : (min * 10_000n) / desired);
+    const r0 = ratioOf(input.amount0MinRaw, input.plan.amount0);
+    const r1 = ratioOf(input.amount1MinRaw, input.plan.amount1);
+    const used1Estimate =
+      input.plan.amount0 > 0n ? (input.plan.amount1 * desired0) / input.plan.amount0 : desired1;
+    const bounded1 = used1Estimate < desired1 ? used1Estimate : desired1;
+
+    const liquidityRequest = this.addLiquidityRequest(input, {
+      amount0DesiredRaw: desired0,
+      amount1DesiredRaw: desired1,
+      amount0MinRaw: (desired0 * r0) / 10_000n,
+      amount1MinRaw: (bounded1 * r1) / 10_000n,
+    });
+
     try {
-      const liquidity = await this.deps.dex.addLiquidity(this.addLiquidityRequest(input));
+      const liquidity = await this.deps.dex.addLiquidity(liquidityRequest);
       this.recordSubmitted(addKey(input.idempotencyKey), liquidity.txHash, TX_PURPOSES.ADD_LIQUIDITY);
 
       if (liquidity.partial !== undefined) {
-        return this.partialOutcome(
-          'add liquidity',
-          liquidity.txHash,
-          liquidity.partial,
-          swapTxHash,
-        );
+        return this.partialOutcome('add liquidity', liquidity.txHash, liquidity.partial, swapTxHash);
       }
 
       return {
         ok: true,
-        reason: 'position built (swap then add liquidity, two transactions)',
+        reason: 'position built (swap confirmed, wallet re-read, mint confirmed — §5.3.3/§5.3.5)',
         swapTxHash,
         addLiquidityTxHash: liquidity.txHash,
-        ...(liquidity.positionTokenId === undefined
-          ? {}
-          : { positionTokenId: liquidity.positionTokenId }),
+        ...(liquidity.positionTokenId === undefined ? {} : { positionTokenId: liquidity.positionTokenId }),
       };
     } catch (error) {
-      // The swap already landed. This is the §43 partial: the operator must re-derive the position
-      // from live balances, and the bot must not auto-retry the mint.
+      // The swap already landed: the §43 partial, never an auto-retry of the mint.
       const failure = this.adapterFailure(input.idempotencyKey, error);
       return {
         ...failure,
@@ -546,11 +751,10 @@ export class PositionExecutor {
       {
         idempotencyKey: input.idempotencyKey,
         chainId: this.deps.dex.chainId,
-        purpose: this.deps.dex.supportsAtomicBuild ? TX_PURPOSES.ATOMIC_BUILD : TX_PURPOSES.SWAP,
+        purpose: TX_PURPOSES.SWAP,
         rawTx: JSON.stringify({
           kind: 'buildPosition',
           poolId: input.pool.poolId,
-          atomic: this.deps.dex.supportsAtomicBuild,
           capitalUsd: input.capitalUsd,
           amount0Raw: input.plan.amount0.toString(),
           amount1Raw: input.plan.amount1.toString(),
@@ -581,7 +785,15 @@ export class PositionExecutor {
     });
   }
 
-  private addLiquidityRequest(input: BuildPositionInput): AddLiquidityRequest {
+  private addLiquidityRequest(
+    input: BuildPositionInput,
+    amounts?: {
+      readonly amount0DesiredRaw: bigint;
+      readonly amount1DesiredRaw: bigint;
+      readonly amount0MinRaw: bigint;
+      readonly amount1MinRaw: bigint;
+    },
+  ): AddLiquidityRequest {
     return {
       poolId: input.pool.poolId,
       tickRange: {
@@ -589,13 +801,12 @@ export class PositionExecutor {
         upperTick: input.tickRange.upperTick,
         tickSpacing: input.tickRange.tickSpacing,
       },
-      // §37: the amounts come from the plan solved against live balances, not from a fixed split.
-      // On an atomic venue the router tops up the deficit itself; on a two-step venue the caller
-      // must have re-derived these from the post-swap wallet.
-      amount0DesiredRaw: input.plan.amount0,
-      amount1DesiredRaw: input.plan.amount1,
-      amount0MinRaw: input.amount0MinRaw,
-      amount1MinRaw: input.amount1MinRaw,
+      // §5.3.3/D3.7: the amounts are the post-swap wallet, re-read by the executor; the plan's
+      // figures remain available through `input.plan` for attribution only.
+      amount0DesiredRaw: amounts?.amount0DesiredRaw ?? input.plan.amount0,
+      amount1DesiredRaw: amounts?.amount1DesiredRaw ?? input.plan.amount1,
+      amount0MinRaw: amounts?.amount0MinRaw ?? input.amount0MinRaw,
+      amount1MinRaw: amounts?.amount1MinRaw ?? input.amount1MinRaw,
       recipient: input.walletAddress,
       deadline: input.deadline,
       idempotencyKey: addKey(input.idempotencyKey),

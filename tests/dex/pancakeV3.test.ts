@@ -18,7 +18,6 @@ import { describe, expect, it } from 'vitest';
 import { decodeFunctionData, encodeFunctionData, parseTransaction } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { nonfungiblePositionManagerABI, quoterV2ABI, swapRouterABI } from '@pancakeswap/v3-sdk';
-import { SMART_ROUTER_ADDRESSES, SwapRouter } from '@pancakeswap/smart-router';
 import { BscChainAdapter } from '../../src/chain/adapter.ts';
 import { CLMM_FACTORY_ABI, POSITION_MANAGER_ABI } from '../../src/chain/abis.ts';
 import { CHAIN_ERROR_CODES, TxGuardError } from '../../src/chain/errors.ts';
@@ -45,6 +44,7 @@ import {
 } from '../../src/types/primitives.ts';
 import { WhitelistError } from '../../src/types/registry.ts';
 import { callEntry, createMockNode, entry, type MockNodeOptions } from '../chain/mockNode.ts';
+import { ERC20_ABI } from '../../src/chain/abis.ts';
 
 const QQQB = '0x205812cdbed920aff76c6580abd681a46d11efc7' as Address;
 const USDT = BSC_ADDRESSES.USDT as Address;
@@ -52,7 +52,6 @@ const USDT = BSC_ADDRESSES.USDT as Address;
 const POOL = '0xe531fcb1f5a195de7608b9f4f9518544c2cdb693' as Address;
 const POOL_ID: PoolId = `56:${DEX_IDS.PANCAKESWAP_V3}:${POOL}`;
 const PANCAKE = BSC_DEX_CONTRACTS[DEX_IDS.PANCAKESWAP_V3]!;
-const SMART_ROUTER = SMART_ROUTER_ADDRESSES[56]!;
 /** A dedicated strategy wallet; used only as an address, never as real key material. */
 const SIGNER = privateKeyToAccount('0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d');
 
@@ -189,9 +188,36 @@ function chainContracts(
       amountOut: options.amountOut ?? AMOUNT_OUT,
       ...(options.quote ?? {}),
     }),
-    [QQQB]: callEntry({}, 'balanceOf(address)', [POOL], RESERVE0),
-    [USDT]: callEntry({}, 'balanceOf(address)', [POOL], RESERVE1),
+    // The swap checks the allowance before spending, and the mint caps against the wallet balance, so the
+    // mock answers both — for the pool AND for the signer, which is the holder that matters.
+    [QQQB]: callEntry(
+      callEntry(
+        callEntry({}, 'balanceOf(address)', [POOL], RESERVE0),
+        'balanceOf(address)',
+        [SIGNER.address],
+        1_000n * 10n ** 18n,
+      ),
+      'allowance(address,address)',
+      [SIGNER.address, PANCAKE.swapRouter],
+      0n,
+    ),
+    [USDT]: callEntry(
+      callEntry(
+        callEntry({}, 'balanceOf(address)', [POOL], RESERVE1),
+        'balanceOf(address)',
+        [SIGNER.address],
+        1_000n * 10n ** 18n,
+      ),
+      'allowance(address,address)',
+      [SIGNER.address, PANCAKE.swapRouter],
+      0n,
+    ),
   };
+
+  // The mint reads its allowances too, and against the NPM rather than the router.
+  for (const card of [contracts[QQQB]!, contracts[USDT]!]) {
+    callEntry(card, 'allowance(address,address)', [SIGNER.address, PANCAKE.positionManager], 0n);
+  }
 
   if (options.positionManager !== undefined) {
     const manager: Record<string, Hex | 'revert'> = {};
@@ -247,13 +273,57 @@ function harness(
     return `0x${'22'.repeat(32)}`;
   };
 
+  /*
+   * Every broadcast this harness records is served back as a MINED success.
+   *
+   * The adapter now waits for an approval to land before using it — broadcasting and proceeding
+   * immediately is what produced `STF` on the following call, because the allowance had not been mined
+   * yet. A harness that returns a hash but never a receipt makes every such test fail on confirmation.
+   */
+  const receipts: NonNullable<MockNodeOptions['receipts']> = {};
+  const transactions: NonNullable<MockNodeOptions['transactions']> = {};
+  const recordWithReceipt = (params: readonly unknown[]): Hex => {
+    const hash = record(params);
+    // Both halves are needed: §98 confirmation looks the transaction up first and only then reads its
+    // receipt, so serving one without the other leaves the wait spinning until its timeout.
+    transactions[hash.toLowerCase()] = {
+      blockNumber: 1_000n,
+      from: SIGNER.address,
+      to: PANCAKE.swapRouter,
+      value: 0n,
+      gasPrice: 1_000_000_000n,
+    } as NonNullable<MockNodeOptions['transactions']>[string];
+    receipts[hash.toLowerCase()] = {
+      blockNumber: 1_000n,
+      from: SIGNER.address,
+      to: PANCAKE.swapRouter,
+      status: 'success',
+      gasUsed: 100_000n,
+      effectiveGasPrice: 1_000_000_000n,
+      // A position-manager mint emits its tokenId; §5.3.3/§5.3.5 parse it from the receipt.
+      logs: [
+        {
+          address: PANCAKE.positionManager as Address,
+          topics: [
+            '0x3067048beee31b25b2f1681f88dac838c8bba36af25bfb2b7cf7473a5847e35f',
+            '0x' + 1094n.toString(16).padStart(64, '0'),
+          ],
+          data: '0x' + '0'.repeat(128),
+        },
+      ],
+    } as NonNullable<MockNodeOptions['receipts']>[string];
+    return hash;
+  };
+
   const node = createMockNode({
     contracts: options.contracts ?? chainContracts(),
+    receipts,
+    transactions,
     extra: {
       // viem's wallet client needs a nonce before it can broadcast.
       eth_getTransactionCount: () => '0x0',
-      eth_sendRawTransaction: record,
-      eth_sendTransaction: record,
+      eth_sendRawTransaction: recordWithReceipt,
+      eth_sendTransaction: recordWithReceipt,
     },
   });
   const whitelist =
@@ -514,22 +584,6 @@ describe('§95 the guard is the first thing every write checks', () => {
     expect(sent).toHaveLength(0);
   });
 
-  it('refuses an atomic addLiquidity with zero encoding and zero sends', async () => {
-    const { dex, node, sent } = harness();
-    const quote = await quoteFor(dex);
-    const before = node.calls.length;
-    await expect(
-      dex.addLiquidity({
-        ...ADD_LIQUIDITY_BASE,
-        deadline: BLOCKHASH_DEADLINE,
-        guard: closed,
-        swapForDeficit: { quote, atomic: true },
-      }),
-    ).rejects.toBeInstanceOf(TxGuardError);
-    expect(node.calls.length).toBe(before);
-    expect(sent).toHaveLength(0);
-  });
-
   it('refuses removeLiquidity with zero encoding and zero sends', async () => {
     const { dex, node, sent } = harness();
     const before = node.calls.length;
@@ -577,139 +631,26 @@ describe('§95 the guard is the first thing every write checks', () => {
   });
 });
 
-describe('§42 the atomic build is exactly one send', () => {
-  it('combines swap + addLiquidity into ONE SmartRouter transaction', async () => {
-    const { dex, sent } = harness();
-    const quote = await quoteFor(dex);
-
-    const result = await dex.addLiquidity({
-      ...ADD_LIQUIDITY_BASE,
-      deadline: BLOCKHASH_DEADLINE,
-      guard: guard(),
-      swapForDeficit: { quote, atomic: true },
-    });
-
-    expect(result.state).toBe(TX_STATES.SUBMITTED);
-    expect(result.liquidity).toBeGreaterThan(0n);
-    // The §42 guarantee: one transaction. A second send would mean the build was split.
-    expect(sent).toHaveLength(1);
-    expect(sent[0]!.to).toBe(SMART_ROUTER.toLowerCase());
-    expect(sent[0]!.value).toBe(0n);
-  });
-
-  it('encodes the atomic call as multicall(bytes32 previousBlockhash, bytes[]) with the expected legs', async () => {
-    const { dex, sent } = harness();
-    const quote = await quoteFor(dex);
-    await dex.addLiquidity({
-      ...ADD_LIQUIDITY_BASE,
-      deadline: BLOCKHASH_DEADLINE,
-      guard: guard(),
-      swapForDeficit: { quote, atomic: true },
-    });
-
-    const data = sent[0]!.data;
-    // `multicall(bytes32,bytes[])` — the drift-immune overload, present in the deployed SmartRouter.
-    expect(data.slice(0, 10)).toBe('0x1f0464d1');
-
-    const decoded = decodeFunctionData({ abi: SwapRouter.ABI, data });
-    expect(decoded.functionName).toBe('multicall');
-    const inner = (decoded.args as readonly (readonly Hex[])[])[1]!;
-    expect(inner.map((call) => call.slice(0, 10))).toEqual([
-      '0x04e45aaf', // exactInputSingle, router-must-custody variant
-      '0xf2d5d56b', // pull(address,uint256) — top the position up
-      '0x639d71a9', // approveZeroThenMax(address) — USDT
-      '0x571ac8b0', // approveMax(address) — QQQB
-      '0x11ed56c9', // IApproveAndCall.mint
-      '0xe90a182f', // sweepToken(address,uint256)
-      '0xe90a182f',
-    ]);
-    // The swap leg carries the on-chain slippage bound; that is the one §40 constraint the SDK can
-    // express, and the impact bound must have been applied separately before encoding.
-    expect(inner[0]!.length).toBeGreaterThan(200);
-  });
-
-  it('targets the SmartRouter address the SDK itself reports for chain 56 (no invented address)', () => {
-    expect(SMART_ROUTER.toLowerCase()).toBe('0x13f4ea83d0bd40e75c8222255bc855a974568dd4');
-  });
-
-  it('refuses an atomic build whose deficit swap is quoted on a different pool', async () => {
-    const { dex, sent } = harness();
-    const quote = await quoteFor(dex);
-    await expect(
-      dex.addLiquidity({
-        ...ADD_LIQUIDITY_BASE,
-        deadline: BLOCKHASH_DEADLINE,
-        guard: guard(),
-        swapForDeficit: {
-          quote: {
-            ...quote,
-            poolId: `56:${DEX_IDS.PANCAKESWAP_V3}:0x47bc06722295ac316a569eef87ac32faa455f441`,
-          },
-          atomic: true,
-        },
-      }),
-    ).rejects.toMatchObject({ code: CHAIN_ERROR_CODES.INVALID_ARGUMENT });
-    expect(sent).toHaveLength(0);
-  });
-
-  it('refuses an atomic build with a non-positive swap amount instead of encoding it', async () => {
-    const { dex, sent } = harness();
-    const quote = await quoteFor(dex);
-    await expect(
-      dex.addLiquidity({
-        ...ADD_LIQUIDITY_BASE,
-        deadline: BLOCKHASH_DEADLINE,
-        guard: guard(),
-        swapForDeficit: { quote: { ...quote, amountInRaw: 0n }, atomic: true },
-      }),
-    ).rejects.toMatchObject({ code: CHAIN_ERROR_CODES.INVALID_ARGUMENT });
-    expect(sent).toHaveLength(0);
-  });
-
-  it('refuses an atomic build whose desired amounts yield zero liquidity', async () => {
-    const { dex, sent } = harness();
-    const quote = await quoteFor(dex);
-    await expect(
-      dex.addLiquidity({
-        ...ADD_LIQUIDITY_BASE,
-        deadline: BLOCKHASH_DEADLINE,
-        // The range sits entirely below the current tick (66_066), so the position is all token1 and one
-        // wei of each leg cannot fund a single unit of liquidity: `L` is zero and the mint would revert
-        // with ZERO_LIQUIDITY.
-        tickRange: { lowerTick: 100, upperTick: 50_000, tickSpacing: 1 },
-        amount0DesiredRaw: 1n,
-        amount1DesiredRaw: 1n,
-        guard: guard(),
-        swapForDeficit: { quote, atomic: true },
-      }),
-    ).rejects.toMatchObject({ code: CHAIN_ERROR_CODES.INVALID_ARGUMENT });
-    expect(sent).toHaveLength(0);
-  });
-
-  it('refuses a blockhash deadline that is not 32 bytes', async () => {
-    const { dex, sent } = harness();
-    const quote = await quoteFor(dex);
-    await expect(
-      dex.addLiquidity({
-        ...ADD_LIQUIDITY_BASE,
-        deadline: { kind: 'previous-blockhash', blockhash: '0xdead' as Hex },
-        guard: guard(),
-        swapForDeficit: { quote, atomic: true },
-      }),
-    ).rejects.toMatchObject({ code: CHAIN_ERROR_CODES.INVALID_ARGUMENT });
-    expect(sent).toHaveLength(0);
-  });
-});
-
 describe('§33-§38 plain add liquidity', () => {
   it('mints on the NPM with the request’s own minimums, in one send', async () => {
     const { dex, sent } = harness();
     const result = await dex.addLiquidity({ ...ADD_LIQUIDITY_BASE, guard: guard() });
-    expect(result.state).toBe(TX_STATES.SUBMITTED);
-    expect(sent).toHaveLength(1);
-    expect(sent[0]!.to).toBe(PANCAKE.positionManager.toLowerCase());
+    expect(result.state).toBe(TX_STATES.CONFIRMED);
+    /*
+     * Three sends: one `approve` per leg to the POSITION MANAGER (the mint pulls both legs — granting
+     * only for the swap left every build failing here with `STF`), then the `mint` itself.
+     */
+    expect(sent).toHaveLength(3);
+    for (const approve of sent.slice(0, 2)) {
+      const approveCall = decodeFunctionData({ abi: ERC20_ABI, data: approve.data });
+      expect(approveCall.functionName).toBe('approve');
+      expect(String((approveCall.args as readonly unknown[])[0]).toLowerCase()).toBe(
+        PANCAKE.positionManager.toLowerCase(),
+      );
+    }
+    expect(sent[2]!.to).toBe(PANCAKE.positionManager.toLowerCase());
 
-    const decoded = decodeFunctionData({ abi: V3_POSITION_MANAGER_ABI, data: sent[0]!.data });
+    const decoded = decodeFunctionData({ abi: V3_POSITION_MANAGER_ABI, data: sent[2]!.data });
     expect(decoded.functionName).toBe('mint');
     const params = (decoded.args as readonly Record<string, unknown>[])[0]!;
     expect(params['amount0Min']).toBe(ADD_LIQUIDITY_BASE.amount0MinRaw);
@@ -718,6 +659,8 @@ describe('§33-§38 plain add liquidity', () => {
     expect(params['recipient']).toBe(SIGNER.address);
     expect(params['tickLower']).toBe(65_600);
     expect(params['tickUpper']).toBe(66_400);
+    // The minted tokenId is parsed from the receipt's IncreaseLiquidity event.
+    expect(result.positionTokenId).toBeDefined();
   });
 
   it('rejects a range whose ticks are not aligned to the pool’s tick spacing', async () => {
@@ -789,11 +732,25 @@ describe('§93 approval semantics and the non-atomic swap', () => {
       guard: guard(),
     });
     expect(result.approvalType).toBe(APPROVAL_TYPES.ZERO_THEN_MAX);
-    expect(result.state).toBe(TX_STATES.SUBMITTED);
-    expect(sent).toHaveLength(1);
-    expect(sent[0]!.to).toBe(PANCAKE.swapRouter.toLowerCase());
+    expect(result.state).toBe(TX_STATES.CONFIRMED);
 
-    const decoded = decodeFunctionData({ abi: V3_SWAP_ROUTER_ABI, data: sent[0]!.data });
+    /*
+     * Two transactions, approve before the swap.
+     *
+     * The swap is an `exactInputSingle` that does a `transferFrom` from the caller, so with a zero allowance
+     * its only possible outcome is the pool's `STF` revert — measured on a live chain, which is what led
+     * here. Nothing in this codebase had ever granted an allowance.
+     */
+    expect(sent).toHaveLength(2);
+    expect(sent[0]!.to).toBe(USDT.toLowerCase());
+    const approveCall = decodeFunctionData({ abi: ERC20_ABI, data: sent[0]!.data });
+    expect(approveCall.functionName).toBe('approve');
+    expect(String((approveCall.args as readonly unknown[])[0]).toLowerCase()).toBe(
+      PANCAKE.swapRouter.toLowerCase(),
+    );
+
+    expect(sent[1]!.to).toBe(PANCAKE.swapRouter.toLowerCase());
+    const decoded = decodeFunctionData({ abi: V3_SWAP_ROUTER_ABI, data: sent[1]!.data });
     expect(decoded.functionName).toBe('exactInputSingle');
     const params = (decoded.args as readonly Record<string, unknown>[])[0]!;
     expect(params['amountIn']).toBe(AMOUNT_IN);
@@ -825,7 +782,31 @@ describe('§93 approval semantics and the non-atomic swap', () => {
       guard: guard(),
     });
     expect(result.approvalType).toBe(APPROVAL_TYPES.EXACT);
+    // Approve then swap, for a non-USDT input too: the allowance is what makes the swap possible at all.
+    expect(sent).toHaveLength(2);
+    expect(sent[0]!.to).toBe(QQQB.toLowerCase());
+    expect(sent[1]!.to).toBe(PANCAKE.swapRouter.toLowerCase());
+  });
+
+  it('skips the approve when the allowance is already sufficient', async () => {
+    // A repeated build must not pay for an approval it does not need.
+    const { dex, sent } = harness({
+      contracts: (() => {
+        const c = chainContracts();
+        c[USDT] = callEntry(c[USDT]!, 'allowance(address,address)', [SIGNER.address, PANCAKE.swapRouter], 2n ** 255n);
+        return c;
+      })(),
+    });
+    const quote = await quoteFor(dex);
+    await dex.executeSwap({
+      quote,
+      deadline: TIMESTAMP_DEADLINE,
+      purpose: 'BUILD_POSITION',
+      idempotencyKey: 'swap#already-approved',
+      guard: guard(),
+    });
     expect(sent).toHaveLength(1);
+    expect(sent[0]!.to).toBe(PANCAKE.swapRouter.toLowerCase());
   });
 });
 

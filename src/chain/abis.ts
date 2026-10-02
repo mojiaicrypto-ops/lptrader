@@ -114,6 +114,18 @@ export const ERC20_ABI = [
     ],
     outputs: [{ type: 'uint256' }],
   },
+  {
+    type: 'function',
+    name: 'approve',
+    // 0x095ea7b3 — the write that every swap needs and that nothing in this codebase performed.
+    selector: '0x095ea7b3',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'spender', type: 'address' },
+      { name: 'amount', type: 'uint256' },
+    ],
+    outputs: [{ type: 'bool' }],
+  },
 ] as const;
 
 /**
