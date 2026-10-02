@@ -237,6 +237,10 @@ export const BSC_DEX_CONTRACTS: Readonly<Record<string, DexContracts>> = {
   [DEX_IDS.PANCAKESWAP_V3]: {
     factory: '0x0bfbcf9fa4f9c56b0f40a671ad40e0805a091865',
     positionManager: '0x46a15b0b27311cedf172ab29e4f4766fbe7f4364',
+    // PancakeSwap's classic V3 SwapRouter (NOT the SmartRouter, NOT the UniversalRouter).
+    // Exposes direct exactInputSingle/exactOutputSingle (struct forms) on the v3 pool — which is what
+    // #encodeExactInputSingle encodes. Misread once as a "Uniswap UniversalRouter" during a live log
+    // review (2026-10-02); the correct UniversalRouter is `universalRouter:` below.
     swapRouter: '0x1b81d678ffb9c0263b24a97847620c99d213eb14',
     quoterV2: '0xb048bbc1ee6b733fffcfb9e9cef7375518e25997',
     tickLens: '0x9a489505a00ce272eaa5e07dba6491314cae3796',
