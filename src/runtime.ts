@@ -513,12 +513,11 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
     openPosition: async () => {
       const record = stateStore.openPosition(chainId);
       if (record === null) return null;
-      const pool = latestPoolByAddress.get(record.poolAddress.toLowerCase());
-      if (pool === undefined) {
-        // Without the pool snapshot there is no price, no range position and no TVL history, so the
-        // verdict would be built from nothing. Reporting it as a missing input is the honest answer.
-        return null;
-      }
+      // The pool snapshot comes from the last scan and MAY be missing (§16 TVL/impact drifts —
+      // measured live: the AAPLB pool fell out and the first wiring folded the whole position into
+      // "no position", which priced the wallet at raw U and tripped the §66 line on a healthy LP).
+      // `pool: null` now reaches the monitor and it values the position from its own chain reads.
+      const pool = latestPoolByAddress.get(record.poolAddress.toLowerCase()) ?? null;
       return {
         record,
         pool,

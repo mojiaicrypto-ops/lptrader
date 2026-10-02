@@ -131,6 +131,8 @@ function monitorDouble(result: {
       complete: (result.problems ?? []).length === 0,
       problems: result.problems ?? [],
     })),
+    // §4.2.1 live read: the double serves a zero-leg read so the wiring round proceeds unchanged.
+    readOpenPosition: vi.fn(async () => null),
     lpLegs: vi.fn(),
     lpPositionValue: vi.fn(),
     buildPriceTable: vi.fn(),

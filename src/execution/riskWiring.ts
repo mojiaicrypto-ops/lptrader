@@ -61,7 +61,9 @@ import type { PortfolioMonitor, MonitorInputs } from './portfolioMonitor.ts';
  */
 export interface OpenPositionView {
   readonly record: Position;
-  readonly pool: PoolSnapshot;
+  /** The last scan's snapshot for this pool. `null` when the pool is not in the scan (§16 drifts) —
+   *  the position still exists on chain and MUST NOT be folded into "no position". */
+  readonly pool: PoolSnapshot | null;
   readonly positionTokenId: bigint;
   readonly liquidity: bigint;
   readonly owner: string;
@@ -174,7 +176,7 @@ export class RiskWiring {
     const funded = this.deps.hasCommittedCapital?.() ?? true;
     const unfunded = !funded && valuation.snapshot.totalNAV === 0;
 
-    const tvlSeries = open === null ? null : this.deps.tvlSeries(open.pool.poolId);
+    const tvlSeries = open === null ? null : this.deps.tvlSeries(open.record.poolId);
 
     const report = evaluateRisk(
       {
@@ -184,7 +186,7 @@ export class RiskWiring {
         drawdown: unfunded ? null : valuation.drawdown,
         reserveRatio: valuation.snapshot.reserveRatio,
         range:
-          open === null || !Number.isFinite(open.pool.currentPrice.value)
+          open === null || open.pool === null || !Number.isFinite(open.pool.currentPrice.value)
             ? null
             : {
                 currentPrice: open.pool.currentPrice.value,
@@ -254,10 +256,13 @@ export class RiskWiring {
     readonly drawdown: ReturnType<typeof buildDrawdownState> | null;
     readonly problems: readonly string[];
   }> {
+    // §4.2.1: the position is READ LIVE from the chain by the monitor (this module owns no chain
+    // client). The scan snapshot enriches it when present; its ABSENCE never folds the position away.
+    const livePosition = open === null ? null : await this.deps.monitor.readOpenPosition(open.record);
     const inputs: MonitorInputs = {
       walletAddress: this.deps.monitor.walletAddress(),
       now: at,
-      position: null,
+      position: livePosition === null ? null : livePosition.position,
       pool: open?.pool ?? null,
       benchmark: null,
       /**

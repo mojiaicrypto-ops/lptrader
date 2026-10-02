@@ -19,6 +19,7 @@
  */
 import type { BscChainAdapter } from '../chain/adapter.ts';
 import type { LpPositionRead, PositionReader } from '../chain/positionReader.ts';
+import type { DexId, PoolId } from '../types/primitives.ts';
 import type { TokenReader } from '../chain/tokenReader.ts';
 import type { PoolSnapshot, Sourced } from '../types/market.ts';
 import type { DrawdownState, PortfolioSnapshot } from '../types/portfolio.ts';
@@ -303,6 +304,41 @@ export class PortfolioMonitor {
    * `complete` is the gate. Any unread or unpriced holding sets it false, and the caller must treat an
    * incomplete NAV as unusable for decisions rather than as merely a smaller NAV.
    */
+  /**
+   * The LIVE position (§4.2.1: read the chain, never a cache), plus the pool's current slot0.
+   *
+   * `null` when the position is gone (burned/owned elsewhere) — different from "the record exists but
+   * the read failed"; the caller distinguishes via the pool/position reads it still holds.
+   */
+  async readOpenPosition(record: {
+    readonly dex: string;
+    readonly id: string;
+    readonly poolAddress: Address;
+    readonly poolId: PoolId;
+  }): Promise<{ readonly position: LpPositionRead | null; readonly sqrtPriceX96: bigint; readonly tick: number } | null> {
+    const read = await this.options.positionReader.getPositionView({
+      dex: record.poolId.split(':')[1] as DexId,
+      tokenId: BigInt(record.id),
+      poolAddress: record.poolAddress,
+    });
+    const [slot0] = await Promise.all([
+      this.options.chain.readContract<readonly [bigint, number]>({
+        address: record.poolAddress,
+        abi: [
+          { type: 'function', name: 'slot0', stateMutability: 'view',
+            inputs: [], outputs: [{ name: 'sqrtPriceX96', type: 'uint160' }, { name: 'tick', type: 'int24' }] },
+        ],
+        functionName: 'slot0',
+        args: [],
+      }),
+    ]);
+    return {
+      position: read === null ? null : { ...read, poolId: record.poolId },
+      sqrtPriceX96: slot0.value[0],
+      tick: slot0.value[1],
+    };
+  }
+
   async monitor(inputs: MonitorInputs): Promise<MonitorResult> {
     const { balances, nativeBalanceWei } = await this.readWallet();
     // Which tokens actually have a balance decides which missing prices matter, so the wallet is read
@@ -320,9 +356,18 @@ export class PortfolioMonitor {
       }
     }
 
-    const lpValue = this.lpPositionValue(inputs.position, inputs.pool, prices);
-    if (lpValue === null) {
-      problems.push('LP position could not be valued (missing pool or leg price)');
+    /*
+     * 腿价 (§4.2.1): legs are priced from the POSITION when there is one — the scan snapshot is a
+     * bonus, not a precondition. A pool falling out of the §16 list at some round must never fold the
+     * LP into "no position" again: measured live, the wallet's U was counted and the LP counted as 0,
+     * which put NAV ~30% below the truth and tripped the §66 line on a healthy position.
+     */
+    const legTokens = new Set(balances.map((b) => b.tokenId as TokenId));
+    const hasLivePosition = inputs.position !== null;
+    if (hasLivePosition) {
+      legTokens.add(this.options.whitelist.registry.getTokenByAddress(this.chainId, inputs.position!.token0)?.id ?? '');
+      legTokens.add(this.options.whitelist.registry.getTokenByAddress(this.chainId, inputs.position!.token1)?.id ?? '');
+      legTokens.delete('');
     }
 
     // The multiplier is read once per token from the balance batch and reused for the LP and fee legs,
@@ -333,26 +378,74 @@ export class PortfolioMonitor {
     let lpLeg1: TokenAmount;
     let feeLeg0: TokenAmount;
     let feeLeg1: TokenAmount;
+    let lpValue: number | null = null;
 
-    if (inputs.pool === null || inputs.position === null) {
-      // Flat portfolio: the LP and fee legs are zero. The snapshot still needs `TokenAmount`s, and the
-      // amount is what carries meaning, so an explicit zero on the pool legs (or on an anchor token
-      // when there is no pool at all) is the honest representation.
-      const anchor0 = inputs.pool === null ? this.anchorToken() : this.requireToken(inputs.pool.token0);
-      const anchor1 = inputs.pool === null ? this.anchorToken() : this.requireToken(inputs.pool.token1);
+    // The legs now come from the LIVE position when there is one; the scan snapshot contributes only
+    // when it happens to be present. AND-ing them was what folded the LP out of NAV: a pool drifting
+    // out of the §16 list zeroed the position entirely while the tokens sat on chain (2026-10-02 live).
+    if (hasLivePosition && inputs.position !== null) {
+      const pos = inputs.position;
+      const meta0 = this.requireToken(pos.token0);
+      const meta1 = this.requireToken(pos.token1);
+
+      let sqrtPriceX96 = inputs.pool?.sqrtPriceX96;
+      let tick = inputs.pool?.currentTick;
+      if (sqrtPriceX96 === undefined || tick === undefined) {
+        // No scan snapshot: read the pool's own head from the chain — the position's raw truth.
+        const poolAddress = pos.poolId.split(':')[2] as Address; // §13 tail = pool address
+        const slot0 = await this.options.chain.readContract<readonly [bigint, number]>({
+          address: poolAddress,
+          abi: [
+            { type: 'function', name: 'slot0', stateMutability: 'view',
+              inputs: [], outputs: [{ name: 'sqrtPriceX96', type: 'uint160' }, { name: 'tick', type: 'int24' }] },
+          ],
+          functionName: 'slot0',
+          args: [],
+        });
+        sqrtPriceX96 = slot0.value[0];
+        tick = slot0.value[1];
+      }
+
+      const { amount0, amount1 } = liquidityToAmounts({
+        tick,
+        lowerTick: pos.tickLower,
+        upperTick: pos.tickUpper,
+        sqrtPriceX96,
+        liquidity: pos.liquidity,
+      });
+      lpLeg0 = amountOf(meta0, amount0, multipliers);
+      lpLeg1 = amountOf(meta1, amount1, multipliers);
+      // §108 "unclaimed fees": tokensOwed0/1 are RA amounts the manager already owes.
+      feeLeg0 = amountOf(meta0, pos.tokensOwed0Raw, multipliers);
+      feeLeg1 = amountOf(meta1, pos.tokensOwed1Raw, multipliers);
+
+      const price0 = prices.get(meta0.id);
+      const price1 = prices.get(meta1.id);
+      lpValue =
+        price0 === undefined || price1 === undefined
+          ? null
+          : toFloat(amount0, meta0.decimals) * price0 + toFloat(amount1, meta1.decimals) * price1;
+      if (lpValue === null) {
+        problems.push(
+          `LP position could not be valued fully (missing ${meta0.symbol ?? meta0.id}/${meta1.symbol ?? meta1.id} price) — position equity excludes that leg`,
+        );
+      }
+    } else if (inputs.pool === null) {
+      // Flat portfolio: zero legs, anchor-token holders only.
+      const anchor0 = this.anchorToken();
+      const anchor1 = this.anchorToken();
       lpLeg0 = zeroAmount(anchor0, multipliers);
       lpLeg1 = zeroAmount(anchor1, multipliers);
       feeLeg0 = lpLeg0;
       feeLeg1 = lpLeg1;
     } else {
+      // DEAD shape retained for type completeness (pool without position), zeroed legs.
       const meta0 = this.requireToken(inputs.pool.token0);
       const meta1 = this.requireToken(inputs.pool.token1);
-      const { amount0, amount1 } = this.lpLegs(inputs.position, inputs.pool);
-      lpLeg0 = amountOf(meta0, amount0, multipliers);
-      lpLeg1 = amountOf(meta1, amount1, multipliers);
-      // §108 "unclaimed fees": `tokensOwed0/1` are base-unit amounts the manager already owes.
-      feeLeg0 = amountOf(meta0, inputs.position.tokensOwed0Raw, multipliers);
-      feeLeg1 = amountOf(meta1, inputs.position.tokensOwed1Raw, multipliers);
+      lpLeg0 = zeroAmount(meta0, multipliers);
+      lpLeg1 = zeroAmount(meta1, multipliers);
+      feeLeg0 = lpLeg0;
+      feeLeg1 = lpLeg1;
     }
 
     const result = buildPortfolioSnapshot({
