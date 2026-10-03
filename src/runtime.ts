@@ -622,6 +622,20 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
       }
     }
 
+    /*
+     * 入场基准，记在【开仓前】：§5.3.1 保证建仓签名之前钱包是纯 U，所以此刻把全部白名单
+     * 稳定币余额折成 USD 就是开仓前权益。之前实现取的是"最近 5 分钟拍的 NAV ?? 配置额"，
+     * 可能与要写入的数据库值差一个节拍 —— 用户指出的第一处偏差。
+     */
+    const stableAddrs = config.whitelist.registry
+      .listStablecoins()
+      .map((meta) => meta.address as Address);
+    const stableBalances = await chain.getTokenBalances(stableAddrs, walletAddress);
+    const entryEquityUsdUsd = stableBalances.reduce((sum, b) => {
+      const meta = config.whitelist.registry.getTokenByAddress(chainId, b.address);
+      return sum + (meta === null ? 0 : Number(b.raw) / 10 ** meta.decimals);
+    }, 0);
+
     const outcome = await executor.buildPosition(decision.request.input);
 
     /*
@@ -658,7 +672,6 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
       // The baseline is captured HERE, at the only moment it exists. `entryEquityUsd` cannot be
       // reconstructed afterwards: the wallet's composition changes with every trade, so a value derived
       // later would be a different quantity wearing the same name.
-      const equityNow = queryCache.nav?.value.totalNavUsd ?? navUsd;
       const tokenId = outcome.positionTokenId as bigint;
       stateStore.insertPosition({
         id: tokenId.toString(),
@@ -672,7 +685,7 @@ export function buildRuntime(options: BuildRuntimeOptions): StrategyRuntime {
         token1Id: decision.request.pool.token1Id,
         openedAt: decision.request.input.now,
         initialNAV: navUsd,
-        entryEquityUsd: equityNow,
+        entryEquityUsd: entryEquityUsdUsd as UsdAmount,
         // The stock price at entry — the divisor that later separates "the stock moved" from "the pool
         // structure cost us". Without it, a fall in equity cannot be attributed and so cannot be acted on.
         entryPrice: decision.request.pool.stockReferencePrice.value,
@@ -817,9 +830,10 @@ function positionViewFrom(
     entryStockPriceUsd: record.entryPrice,
     openedAt: record.openedAt,
   };
-  // §4.2.1: the position's own equity percentage, annualized against the entry U. The RETURN figure
-  // itself comes from the full snapshot (/nav); this one is position-scoped, evaluated only when the
-  // caller was able to value the legs this round.
+  // §4.2.1（2026-10-03 口径统一）: APR is annualized with the SAME baseline as /nav's 总收益 row —
+  // 开仓前全权益 vs 当前全权益. Mixing "仓位权益" with "全权益 baseline" is exactly the bug the
+  // server hit (盈利 $0.53 却显示 −21520% 年化). The position-scoped rows remain position-scoped;
+  // only the APR shares the portfolio denominator.
   let apr: { ratio: number; indicative: boolean } | null = null;
   if (currentEquityUsd !== null && baseline.entryEquityUsd !== null) {
     const ratio =
@@ -1376,10 +1390,10 @@ export function buildCadences(runtime: StrategyRuntime): readonly SchedulerCaden
             runtime,
             round.snapshot?.unclaimedFeeValue ?? 0,
             round.snapshot?.lpPositionValue ?? null,
-            // §4.2.1: the position's OWN equity = its legs + its fees (not the whole NAV).
-            round.snapshot === undefined
-              ? null
-              : (round.snapshot.lpPositionValue + round.snapshot.unclaimedFeeValue) as UsdAmount,
+            // §4.2.1（2026-10-03 口径统一）：APR 的分子分母都与 /nav 的"总收益"同源 ——
+            // 全权益（钱包U + LP + fee）对【开仓前权益】。之前传的是仓位自身权益(701.59)
+            // 而分母是入场全权益(1000) → +0.05% 的盈利年化成了 −21520%。实测教训。
+            round.snapshot === undefined ? null : (round.snapshot.totalNAV as UsdAmount),
           ),
           at,
         );
